@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+automod.db
+automod.db-wal
+automod.db-shm
+reports/
+backups/
+archives/
+*.zip
+.pytest_cache/
+.ruff_cache/

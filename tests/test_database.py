@@ -1,0 +1,81 @@
+import asyncio
+import os
+import tempfile
+import time
+import unittest
+
+import aiosqlite
+
+import database
+
+
+class DatabaseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        database.DB_PATH = os.path.join(self.temp_dir.name, "test.db")
+        await database.init_db()
+
+    async def asyncTearDown(self):
+        self.temp_dir.cleanup()
+
+    async def test_decay_is_not_reapplied_on_every_read(self):
+        old = time.time() - 31 * 86400
+        async with aiosqlite.connect(database.DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO strikes VALUES (?, ?, ?, ?, ?)",
+                (1, 2, 8, old, old),
+            )
+            await db.commit()
+
+        values = [await database.get_points(1, 2) for _ in range(3)]
+        self.assertEqual(values, [4.0, 4.0, 4.0])
+
+    async def test_concurrent_point_updates_are_not_lost(self):
+        await asyncio.gather(*(database.add_points(1, 3, 1) for _ in range(20)))
+        self.assertEqual(await database.get_points(1, 3), 20)
+
+    async def test_decay_read_cannot_overwrite_concurrent_add(self):
+        old = time.time() - 31 * 86400
+        async with aiosqlite.connect(database.DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO strikes VALUES (?, ?, ?, ?, ?)",
+                (1, 4, 8, old, old),
+            )
+            await db.commit()
+        await asyncio.gather(
+            database.get_points(1, 4),
+            database.add_points(1, 4, 1),
+        )
+        self.assertEqual(await database.get_points(1, 4), 5)
+
+    async def test_review_can_only_be_claimed_once_and_false_positive_is_hidden(self):
+        review_id = await database.log_violation(
+            1, 9, 10, "테스트", "MINOR", "테스트", "검토 대기",
+            review_status="pending", message_id=11,
+        )
+        first, second = await asyncio.gather(
+            database.claim_review(review_id, 1),
+            database.claim_review(review_id, 1),
+        )
+        self.assertEqual(sum((first, second)), 1)
+        await database.resolve_review(review_id, 1, "false_positive", 99, "정상 처리")
+        self.assertEqual(await database.get_recent_violations(1, 9), [])
+
+    async def test_false_positive_review_and_rule_are_saved_atomically(self):
+        review_id = await database.log_violation(
+            1, 9, 10, "safe message", "MODERATE", "wrong", "검수 대기",
+            review_status="pending", message_id=12,
+        )
+        self.assertTrue(await database.claim_review(review_id, 1))
+        result = await database.resolve_review_as_false_positive(
+            review_id, 1, 10, "hash", "safe message", 99, "정상 처리",
+        )
+        self.assertIsNotNone(result)
+        rules = await database.list_false_positive_rules(1)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0][1:3], (10, "safe message"))
+        self.assertFalse(await database.release_review(review_id, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()

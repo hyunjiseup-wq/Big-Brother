@@ -1,0 +1,575 @@
+"""유저별 위반 점수와 검수 이력을 관리하는 SQLite 저장소."""
+
+import os
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import aiosqlite
+from dotenv import load_dotenv
+
+from config import STRIKE_DECAY_DAYS, STRIKE_DECAY_RATIO
+
+
+load_dotenv()
+
+DB_PATH = os.path.expandvars(os.path.expanduser(os.environ.get(
+    "AUTOMOD_DB_PATH",
+    str(Path(__file__).resolve().parent / "automod.db"),
+)))
+_BUSY_TIMEOUT_MS = 10_000
+
+
+@asynccontextmanager
+async def _connect():
+    async with aiosqlite.connect(DB_PATH, timeout=_BUSY_TIMEOUT_MS / 1000) as db:
+        await db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS};")
+        yield db
+
+
+async def _ensure_column(db, table: str, column: str, declaration: str):
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if column not in columns:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+async def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    async with _connect() as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS strikes (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                points REAL NOT NULL DEFAULT 0,
+                last_violation_at REAL NOT NULL DEFAULT 0,
+                last_decay_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+        await _ensure_column(db, "strikes", "last_decay_at", "REAL NOT NULL DEFAULT 0")
+        await db.execute(
+            "UPDATE strikes SET last_decay_at = last_violation_at "
+            "WHERE last_decay_at = 0 AND last_violation_at > 0"
+        )
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS violation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER,
+                message_content TEXT,
+                level TEXT NOT NULL,
+                reason TEXT,
+                action_taken TEXT,
+                provider TEXT DEFAULT 'unknown',
+                needs_review INTEGER DEFAULT 0,
+                review_status TEXT NOT NULL DEFAULT 'not_required',
+                reviewed_at REAL,
+                reviewed_by INTEGER,
+                created_at REAL NOT NULL
+            )
+        """)
+        await _ensure_column(db, "violation_log", "provider", "TEXT DEFAULT 'unknown'")
+        await _ensure_column(db, "violation_log", "needs_review", "INTEGER DEFAULT 0")
+        await _ensure_column(db, "violation_log", "message_id", "INTEGER")
+        await _ensure_column(
+            db, "violation_log", "review_status", "TEXT NOT NULL DEFAULT 'not_required'"
+        )
+        await _ensure_column(db, "violation_log", "reviewed_at", "REAL")
+        await _ensure_column(db, "violation_log", "reviewed_by", "INTEGER")
+        # 프로세스가 검수 도중 종료된 경우 다음 시작에서 다시 처리할 수 있게 복구한다.
+        await db.execute(
+            "UPDATE violation_log SET review_status = 'pending', reviewed_at = NULL "
+            "WHERE review_status = 'processing' "
+            "AND (reviewed_at IS NULL OR reviewed_at < ?)",
+            (time.time() - 600,),
+        )
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS channel_checkpoints (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                last_message_id INTEGER,
+                last_run_at REAL,
+                PRIMARY KEY (guild_id, channel_id)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_violation_user_recent "
+            "ON violation_log(guild_id, user_id, created_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_violation_pending_review "
+            "ON violation_log(guild_id, needs_review, created_at DESC)"
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_violation_message_review "
+            "ON violation_log(guild_id, message_id, review_status) "
+            "WHERE message_id IS NOT NULL AND review_status IN ('pending', 'processing')"
+        )
+
+        # 관리자가 검수 카드에서 '정상(오탐)'으로 확정한 메시지 (오탐 학습용, learning.py)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS false_positives (
+                guild_id INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                content TEXT NOT NULL,
+                wrong_level TEXT,
+                wrong_reason TEXT,
+                channel_id INTEGER,
+                marked_by INTEGER,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (guild_id, content_hash)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_false_positive_recent "
+            "ON false_positives(guild_id, created_at DESC)"
+        )
+        # v2: 오탐 허용 범위를 채널(스레드는 부모 채널) 또는 서버 전체로 구분한다.
+        # scope_channel_id=0인 규칙만 서버 전체에 적용된다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS false_positive_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                scope_channel_id INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                content TEXT NOT NULL,
+                wrong_level TEXT,
+                wrong_reason TEXT,
+                source_channel_id INTEGER,
+                marked_by INTEGER,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE (guild_id, scope_channel_id, content_hash)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_false_positive_rule_lookup "
+            "ON false_positive_rules(guild_id, scope_channel_id, content_hash, active)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_false_positive_rule_recent "
+            "ON false_positive_rules(guild_id, updated_at DESC)"
+        )
+        await db.commit()
+
+
+async def _apply_decay(db, guild_id: int, user_id: int, row):
+    """경과한 감쇠 주기 수만큼 한 번만 점수를 감소시킨다."""
+    points, last_violation_at, last_decay_at = row
+    interval = STRIKE_DECAY_DAYS * 86400
+    base_at = max(last_violation_at or 0, last_decay_at or 0)
+    if not base_at:
+        return points
+
+    periods = int((time.time() - base_at) // interval)
+    if periods <= 0:
+        return points
+
+    points *= STRIKE_DECAY_RATIO ** periods
+    decay_at = base_at + periods * interval
+    await db.execute(
+        "UPDATE strikes SET points = ?, last_decay_at = ? "
+        "WHERE guild_id = ? AND user_id = ?",
+        (points, decay_at, guild_id, user_id),
+    )
+    return points
+
+
+async def get_points(guild_id: int, user_id: int) -> float:
+    async with _connect() as db:
+        # 감쇠가 필요한 경우 쓰기가 발생하므로 add_points와 같은 쓰기 잠금을 잡는다.
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            "SELECT points, last_violation_at, last_decay_at FROM strikes "
+            "WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            await db.commit()
+            return 0.0
+        points = await _apply_decay(db, guild_id, user_id, row)
+        await db.commit()
+        return points
+
+
+async def add_points(guild_id: int, user_id: int, points_to_add: float) -> float:
+    """직렬화된 트랜잭션 안에서 점수를 원자적으로 추가한다."""
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            "SELECT points, last_violation_at, last_decay_at FROM strikes "
+            "WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        row = await cursor.fetchone()
+        now = time.time()
+        if row is None:
+            new_points = points_to_add
+            await db.execute(
+                "INSERT INTO strikes "
+                "(guild_id, user_id, points, last_violation_at, last_decay_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (guild_id, user_id, new_points, now, now),
+            )
+        else:
+            current_points = await _apply_decay(db, guild_id, user_id, row)
+            new_points = current_points + points_to_add
+            await db.execute(
+                "UPDATE strikes SET points = ?, last_violation_at = ?, last_decay_at = ? "
+                "WHERE guild_id = ? AND user_id = ?",
+                (new_points, now, now, guild_id, user_id),
+            )
+        await db.commit()
+        return new_points
+
+
+async def reset_points(guild_id: int, user_id: int):
+    async with _connect() as db:
+        await db.execute(
+            "DELETE FROM strikes WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        )
+        await db.commit()
+
+
+async def log_violation(
+    guild_id,
+    user_id,
+    channel_id,
+    message_content,
+    level,
+    reason,
+    action_taken,
+    provider="unknown",
+    needs_review=False,
+    review_status="not_required",
+    message_id=None,
+):
+    async with _connect() as db:
+        cursor = await db.execute(
+            """INSERT INTO violation_log
+               (guild_id, user_id, channel_id, message_id, message_content, level, reason,
+                action_taken, provider, needs_review, review_status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                guild_id,
+                user_id,
+                channel_id,
+                message_id,
+                message_content,
+                level,
+                reason,
+                action_taken,
+                provider,
+                int(needs_review),
+                review_status,
+                time.time(),
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def claim_review(review_id: int, guild_id: int) -> bool:
+    """동일 검수 카드가 두 번 실행되지 않도록 pending 상태를 원자적으로 선점한다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "UPDATE violation_log SET review_status = 'processing', reviewed_at = ? "
+            "WHERE id = ? AND guild_id = ? AND review_status = 'pending'",
+            (time.time(), review_id, guild_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def release_review(review_id: int, guild_id: int):
+    async with _connect() as db:
+        await db.execute(
+            "UPDATE violation_log SET review_status = 'pending', reviewed_at = NULL "
+            "WHERE id = ? AND guild_id = ? AND review_status = 'processing'",
+            (review_id, guild_id),
+        )
+        await db.commit()
+
+
+async def resolve_review(
+    review_id: int,
+    guild_id: int,
+    status: str,
+    reviewer_id: int,
+    action_taken: str,
+):
+    if status not in {"confirmed", "false_positive"}:
+        raise ValueError(f"알 수 없는 검수 상태: {status}")
+    async with _connect() as db:
+        await db.execute(
+            """UPDATE violation_log
+               SET review_status = ?, reviewed_at = ?, reviewed_by = ?,
+                   action_taken = ?, needs_review = 0
+               WHERE id = ? AND guild_id = ? AND review_status = 'processing'""",
+            (status, time.time(), reviewer_id, action_taken, review_id, guild_id),
+        )
+        await db.commit()
+
+
+async def get_checkpoint(guild_id: int, channel_id: int):
+    async with _connect() as db:
+        cursor = await db.execute(
+            "SELECT last_message_id FROM channel_checkpoints WHERE guild_id = ? AND channel_id = ?",
+            (guild_id, channel_id),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_checkpoint(guild_id: int, channel_id: int, last_message_id: int):
+    async with _connect() as db:
+        await db.execute(
+            """INSERT INTO channel_checkpoints (guild_id, channel_id, last_message_id, last_run_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(guild_id, channel_id)
+               DO UPDATE SET last_message_id = excluded.last_message_id,
+                             last_run_at = excluded.last_run_at""",
+            (guild_id, channel_id, last_message_id, time.time()),
+        )
+        await db.commit()
+
+
+async def get_pending_reviews(guild_id: int, hours: int = 72, limit: int = 20):
+    since = time.time() - max(0, hours) * 3600
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT user_id, level, reason, action_taken, provider, created_at
+               FROM violation_log
+               WHERE guild_id = ? AND needs_review = 1
+                 AND created_at >= ? AND review_status != 'false_positive'
+               ORDER BY created_at DESC LIMIT ?""",
+            (guild_id, since, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def get_recent_violations(guild_id: int, user_id: int, limit: int = 10):
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT level, reason, action_taken, provider, created_at
+               FROM violation_log
+               WHERE guild_id = ? AND user_id = ? AND review_status != 'false_positive'
+               ORDER BY created_at DESC LIMIT ?""",
+            (guild_id, user_id, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def get_violation_content(review_id: int, guild_id: int):
+    """검수 카드가 가리키는 위반 로그의 원문 전체를 가져온다 (임베드는 500자 절단본)."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "SELECT message_content FROM violation_log WHERE id = ? AND guild_id = ?",
+            (review_id, guild_id),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+# ── 오탐 학습 (learning.py에서 사용) ─────────────────────────────────
+
+async def add_false_positive(guild_id, content_hash, content, wrong_level,
+                             wrong_reason, channel_id, marked_by):
+    """오탐 확정 메시지를 저장한다. 같은 내용이 다시 확정되면 최신 정보로 갱신."""
+    async with _connect() as db:
+        await db.execute(
+            """INSERT INTO false_positives
+               (guild_id, content_hash, content, wrong_level, wrong_reason,
+                channel_id, marked_by, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(guild_id, content_hash) DO UPDATE SET
+                   wrong_level = excluded.wrong_level,
+                   wrong_reason = excluded.wrong_reason,
+                   channel_id = excluded.channel_id,
+                   marked_by = excluded.marked_by,
+                   created_at = excluded.created_at""",
+            (guild_id, content_hash, content, wrong_level, wrong_reason,
+             channel_id, marked_by, time.time()),
+        )
+        await db.commit()
+
+
+async def get_recent_false_positives(guild_id: int, limit: int = 15):
+    """프롬프트에 예시로 넣을 최근 오탐 사례 (최신순)."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT content, wrong_level, wrong_reason FROM false_positives
+               WHERE guild_id = ? ORDER BY created_at DESC LIMIT ?""",
+            (guild_id, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def get_all_false_positive_hashes():
+    """완전 일치 차단용 해시 전체 (시작 시 메모리에 로드)."""
+    async with _connect() as db:
+        cursor = await db.execute("SELECT guild_id, content_hash FROM false_positives")
+        return await cursor.fetchall()
+
+
+# ── 범위 지정 오탐 학습(v2) ─────────────────────────────────────────
+
+async def upsert_false_positive_rule(guild_id: int, scope_channel_id: int,
+                                     content_hash: str, content: str,
+                                     wrong_level: str | None, wrong_reason: str | None,
+                                     source_channel_id: int | None,
+                                     marked_by: int | None) -> int:
+    now = time.time()
+    async with _connect() as db:
+        await db.execute(
+            """INSERT INTO false_positive_rules
+               (guild_id, scope_channel_id, content_hash, content, wrong_level, wrong_reason,
+                source_channel_id, marked_by, active, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+               ON CONFLICT(guild_id, scope_channel_id, content_hash) DO UPDATE SET
+                   content = excluded.content,
+                   wrong_level = excluded.wrong_level,
+                   wrong_reason = excluded.wrong_reason,
+                   source_channel_id = excluded.source_channel_id,
+                   marked_by = excluded.marked_by,
+                   active = 1,
+                   updated_at = excluded.updated_at""",
+            (guild_id, scope_channel_id, content_hash, content, wrong_level, wrong_reason,
+             source_channel_id, marked_by, now, now),
+        )
+        cursor = await db.execute(
+            """SELECT id FROM false_positive_rules
+               WHERE guild_id = ? AND scope_channel_id = ? AND content_hash = ?""",
+            (guild_id, scope_channel_id, content_hash),
+        )
+        row = await cursor.fetchone()
+        await db.commit()
+        return int(row[0])
+
+
+async def resolve_review_as_false_positive(review_id: int, guild_id: int,
+                                           scope_channel_id: int, content_hash: str,
+                                           stored_content: str,
+                                           reviewer_id: int, action_taken: str):
+    """검수 완료와 오탐 규칙 저장을 한 트랜잭션으로 처리한다."""
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            """SELECT channel_id, message_content, level, reason
+               FROM violation_log
+               WHERE id = ? AND guild_id = ? AND review_status = 'processing'""",
+            (review_id, guild_id),
+        )
+        row = await cursor.fetchone()
+        if row is None or not row[1] or not row[1].strip():
+            await db.rollback()
+            return None
+
+        source_channel_id, content, wrong_level, wrong_reason = row
+        now = time.time()
+        await db.execute(
+            """INSERT INTO false_positive_rules
+               (guild_id, scope_channel_id, content_hash, content, wrong_level, wrong_reason,
+                source_channel_id, marked_by, active, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+               ON CONFLICT(guild_id, scope_channel_id, content_hash) DO UPDATE SET
+                   content = excluded.content,
+                   wrong_level = excluded.wrong_level,
+                   wrong_reason = excluded.wrong_reason,
+                   source_channel_id = excluded.source_channel_id,
+                   marked_by = excluded.marked_by,
+                   active = 1,
+                   updated_at = excluded.updated_at""",
+            (guild_id, scope_channel_id, content_hash, stored_content, wrong_level, wrong_reason,
+             source_channel_id, reviewer_id, now, now),
+        )
+        rule_cursor = await db.execute(
+            """SELECT id FROM false_positive_rules
+               WHERE guild_id = ? AND scope_channel_id = ? AND content_hash = ?""",
+            (guild_id, scope_channel_id, content_hash),
+        )
+        rule_id = int((await rule_cursor.fetchone())[0])
+        updated = await db.execute(
+            """UPDATE violation_log
+               SET review_status = 'false_positive', reviewed_at = ?, reviewed_by = ?,
+                   action_taken = ?, needs_review = 0
+               WHERE id = ? AND guild_id = ? AND review_status = 'processing'""",
+            (now, reviewer_id, action_taken, review_id, guild_id),
+        )
+        if updated.rowcount != 1:
+            await db.rollback()
+            return None
+        await db.commit()
+        return {"id": rule_id, "content": content}
+
+
+async def get_all_false_positive_rule_keys(include_inactive: bool = False):
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT guild_id, scope_channel_id, content_hash
+               FROM false_positive_rules WHERE active = 1 OR ? = 1""",
+            (int(include_inactive),),
+        )
+        return await cursor.fetchall()
+
+
+async def get_recent_false_positive_rules(guild_id: int, scope_channel_id: int,
+                                          limit: int = 15):
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT id, scope_channel_id, content, wrong_level, updated_at
+               FROM false_positive_rules
+               WHERE guild_id = ? AND active = 1
+                 AND scope_channel_id IN (0, ?)
+               ORDER BY updated_at DESC LIMIT ?""",
+            (guild_id, scope_channel_id, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def list_false_positive_rules(guild_id: int, limit: int = 20):
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT id, scope_channel_id, content, wrong_level, marked_by, updated_at
+               FROM false_positive_rules
+               WHERE guild_id = ? AND active = 1
+               ORDER BY updated_at DESC LIMIT ?""",
+            (guild_id, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def deactivate_false_positive_rule(guild_id: int, rule_id: int) -> bool:
+    async with _connect() as db:
+        cursor = await db.execute(
+            """UPDATE false_positive_rules SET active = 0, updated_at = ?
+               WHERE id = ? AND guild_id = ? AND active = 1""",
+            (time.time(), rule_id, guild_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def get_false_positive_backfill_rows():
+    """기존 학습 테이블과 과거 오탐 검수 이력을 v2로 옮길 원본을 반환한다."""
+    async with _connect() as db:
+        legacy = await (await db.execute(
+            """SELECT guild_id, channel_id, content, wrong_level, wrong_reason, marked_by
+               FROM false_positives WHERE content IS NOT NULL AND trim(content) != ''"""
+        )).fetchall()
+        history = await (await db.execute(
+            """SELECT guild_id, channel_id, message_content, level, reason, reviewed_by
+               FROM violation_log
+               WHERE review_status = 'false_positive'
+                 AND message_content IS NOT NULL AND trim(message_content) != ''"""
+        )).fetchall()
+        return legacy + history
