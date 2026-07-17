@@ -4,7 +4,8 @@
 단계적으로 자동 제재하는 discord.py 기반 봇입니다. 무료 API 티어로 운영 가능하도록 설계했습니다.
 
 ## 구조
-```
+
+```text
 discord-automod/
 ├── bot.py          # 메인 봇 (이벤트, 명령어, 제재 실행, 폴백 조치 제한, 배치 감사 스케줄링)
 ├── batch_audit.py    # 배치 감사 핵심 로직 + 독립 실행 스크립트 (조치 없이 리포트만 생성)
@@ -27,6 +28,7 @@ discord-automod/
 관리자가 버튼으로 확정합니다. 충분히 검증한 뒤에만 자동 모드로 전환하세요.
 
 ## 동작 원리
+
 1. 메시지가 올라오면 `filters.py`가 먼저 금칙어/초대링크/도배 여부를 정규식으로 즉시 판별합니다.
    여기서 결론이 나면 AI 호출 없이 바로 처리됩니다 (비용 절감).
 2. 애매한 메시지만 `moderator.py`로 넘어가 **Gemini**에게 먼저 판단을 요청합니다.
@@ -42,7 +44,8 @@ discord-automod/
    이런 건들만 모아 볼 수 있고, 실제 킥/밴은 관리자가 직접 결정해서 수동으로 처리합니다.
 6. `EXTREME` 등급(노골적 위협, 음란물 등)은 누적 점수와 무관하게 즉시 강한 조치를 취하도록
    설정할 수 있습니다 (`IMMEDIATE_ACTION_FOR_EXTREME`) — 단, 이때도 킥/밴이면 위 5번 규칙이 그대로 적용됩니다.
-7. 관리자 권한(메시지 관리)을 가진 유저는 자동 제재 대상에서 제외됩니다.
+7. 관리자(Administrator) 권한을 가진 유저만 자동 제재 대상에서 제외됩니다.
+   메시지 관리 권한만 가진 모더레이터는 일반 유저와 동일하게 검사받습니다.
 8. 모든 제재는 로그 채널에 임베드로 기록되며 **어느 모델(Gemini/Groq/필터)이 판단했는지**가 항상 남습니다.
    대상 유저에게는 DM으로 사유가 안내됩니다.
 9. **익명화된 제재 로그 공개** (선택): `.env`의 `PUBLIC_LOG_CHANNEL_ID`를 설정하면 MODERATE 이상의
@@ -73,9 +76,11 @@ python -m pip install -r requirements.lock
 ## 설정
 
 1. `.env.example`을 `.env`로 복사 후 값 채우기:
+
    ```bash
    cp .env.example .env
    ```
+
    - `DISCORD_BOT_TOKEN`: [Discord Developer Portal](https://discord.com/developers/applications)에서
      봇 생성 후 발급. **Privileged Gateway Intents**에서 `MESSAGE CONTENT INTENT`와
      `SERVER MEMBERS INTENT`를 반드시 켜야 합니다.
@@ -104,7 +109,7 @@ python -m pip install -r requirements.lock
 ## 명령어 (전부 관리자 전용 — 서버 내에서 `!BB` 접두사 사용, `!bb` 소문자·`!BB점수` 붙여쓰기 모두 인식)
 
 | 명령어 | 권한 | 설명 |
-|---|---|---|
+| --- | --- | --- |
 | `!BB 명령어` | 관리자 권한 | 전체 명령어 목록 확인 (별칭: `도움말`, `help`) |
 | `!BB 점수 @유저` | 관리자 권한 | 해당 유저의 누적 위반 점수 및 최근 이력(판단 모델 포함) 확인 |
 | `!BB 점수초기화 @유저` | 관리자 권한 | 유저의 누적 점수 초기화 |
@@ -113,6 +118,7 @@ python -m pip install -r requirements.lock
 | `!BB 오탐학습 [개수]` | 관리자 권한 | 활성 오탐 학습 규칙과 적용 범위 조회 |
 | `!BB 오탐취소 <규칙번호>` | 관리자 권한 | 잘못 등록한 오탐 학습 규칙 비활성화 |
 | `!BB 상태` | 관리자 권한 | 처리 대기열/워커/드롭 건수 확인 |
+| `!BB 감사실행 [backend]` | 관리자 권한 | 배치 감사를 지금 바로 실행 (backend 생략 시 `config.BATCH_BACKEND` 사용) |
 
 검수 카드(#제재-로그)의 버튼도 명령어와 마찬가지로 **모두 관리자 전용**입니다.
 `정상 · 이 채널 학습`은 해당 채널에서만 동일 오탐을 허용합니다. 스레드에서는
@@ -147,6 +153,7 @@ python -m pip install -r requirements.lock
    여러 인스턴스로 수평 확장해야 한다면 PostgreSQL(asyncpg) 이전을 고려하세요.
 
 ### 튜닝 팁
+
 - 금칙어 목록을 채울수록 AI 호출 비중이 줄어 무료 한도 내에서 더 오래 버틸 수 있습니다.
 - `MAX_CONCURRENT_AI_CALLS`를 무작정 높이면 Gemini/Groq 양쪽 레이트리밋에 걸릴 수 있으니
   각 제공자의 분당 요청 제한을 확인 후 설정하세요.
@@ -158,7 +165,8 @@ python -m pip install -r requirements.lock
 실시간 자동제재와 달리 **조치를 자동 실행하지 않고**, 등록한 채널들의 대화를 주기적으로 모아
 운영 규정 기준으로 분류·태깅한 뒤 유저별로 정리된 리포트만 만들어줍니다. 최종 판단은 관리자가 합니다.
 
-### 설정
+### 배치 감사 설정
+
 1. `config.py`의 `WATCHED_CHANNEL_IDS`에 감시할 채널 ID를 등록합니다.
 2. `BATCH_BACKEND`로 기본 판단 백엔드를 고릅니다: `"auto"`(Gemini→Groq 폴백, 기본) / `"gemini"` / `"groq"` / `"ollama"`.
 3. 로컬 Ollama를 쓰려면 [Ollama](https://ollama.com)를 설치하고 `ollama pull qwen2.5:14b`(또는 원하는 모델)로
@@ -168,27 +176,32 @@ python -m pip install -r requirements.lock
 
 ### 실행 방식 (둘 다 지원, 동시에 써도 됨)
 
-**1) 통합 실행 — 지금 봇과 함께 24/7 서버에서**
+#### 1) 통합 실행 — 지금 봇과 함께 24/7 서버에서
+
 매일 `config.BATCH_RUN_HOUR_KST`시(기본 새벽 4시, 한국 시간)에 봇이 자동으로 감사를 돌립니다.
 봇을 재시작해도 그 즉시 실행되지 않아 API 한도를 아낍니다. 별도 설정 없이
 `WATCHED_CHANNEL_IDS`만 채워두면 `bot.py` 실행 시 자동으로 예약됩니다.
 필요하면 `!BB 감사실행 [gemini|groq|ollama|auto]` 명령어로 즉시 수동 실행도 가능합니다
 (관리자 권한 필요).
 
-**2) 독립 실행 — 개인 PC에서 주 1회, 로컬 GPU + Ollama로**
+#### 2) 독립 실행 — 개인 PC에서 주 1회, 로컬 GPU + Ollama로
+
 ```bash
 python batch_audit.py --backend ollama
 ```
+
 이 스크립트는 디스코드에 한 번 접속해서 감사를 끝내고 바로 종료되므로, 상시 실행 중인 봇과는
 별개로 운영할 수 있습니다. Windows 작업 스케줄러(주 1회, 컴퓨터를 안 쓰는 새벽 시간대 등)나
 macOS/Linux의 cron에 등록해두면 됩니다.
 
 예) Linux/macOS cron으로 매주 일요일 새벽 4시 실행:
-```
+
+```bash
 0 4 * * 0 cd /path/to/discord-automod && /path/to/venv/bin/python batch_audit.py --backend ollama >> audit.log 2>&1
 ```
 
 ### 동작 방식 & 비용 최적화
+
 - 채널별로 **마지막으로 처리한 메시지 지점(체크포인트)**을 SQLite에 저장해, 다음 실행 때는
   그 이후 메시지만 가져옵니다 (중복 검토 없음).
 - **첫 실행은 최근 `BATCH_FIRST_RUN_LOOKBACK_DAYS`(기본 7일)만 수집**합니다. 채널 전체 이력을
@@ -201,12 +214,6 @@ macOS/Linux의 cron에 등록해두면 됩니다.
   유저별로 위반 등급·규정 번호·판단 모델·원문 스니펫·메시지 링크가 정리되어 있습니다.
 - 배치 감사는 **자동으로 삭제/타임아웃/킥/밴을 실행하지 않습니다.** 실시간 자동제재(`bot.py`의
   `on_message`)와 완전히 분리된 기능이라, 여기서 나온 리포트를 보고 관리자가 수동으로 조치합니다.
-
-## 명령어 추가분
-
-| 명령어 | 권한 | 설명 |
-|---|---|---|
-| `!BB 감사실행 [backend]` | 관리자 권한 | 배치 감사를 지금 바로 실행 (backend 생략 시 `config.BATCH_BACKEND` 사용) |
 
 ## 주의사항
 

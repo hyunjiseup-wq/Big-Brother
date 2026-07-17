@@ -882,10 +882,11 @@ def _is_moderation_target(message: discord.Message) -> bool:
     # 봇 명령어(!BB ...)는 검사 대상이 아님 -> AI 한도 낭비 방지
     if message.content.startswith(COMMAND_PREFIXES):
         return False
-    # 관리자(메시지 관리 권한 보유자)는 자동 제재 대상에서 제외
+    # 관리자(Administrator)만 자동 제재 대상에서 제외 — 명령어/검수 버튼과 동일한 정책.
+    # 메시지 관리 권한만 가진 모더레이터는 일반 유저와 똑같이 검사받는다.
     # (웹훅 등으로 author가 Member가 아닐 수 있어 getattr로 안전하게 확인)
     perms = getattr(message.author, "guild_permissions", None)
-    if perms and perms.manage_messages:
+    if perms and perms.administrator:
         return False
     return True
 
