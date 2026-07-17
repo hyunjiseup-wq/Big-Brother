@@ -138,7 +138,7 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 # 실제 서버 정책상 킥/밴처럼 되돌리기 힘든 조치는 운영진 확인 후 결정되어야 하므로,
 # 판단 주체(1차 필터/Gemini/Groq 무관하게) KICK/BAN이 나오면 자동 실행 대신
 # 아래 상한(AUTO_ACTION_CEILING)으로 낮춰 실행하고, 관리자 검토대기 목록에 올린다.
-# 실제 킥/밴은 !automod 검토대기 로 확인 후 관리자가 수동으로 처리한다.
+# 실제 킥/밴은 !BB 검토대기 로 확인 후 관리자가 수동으로 처리한다.
 AUTO_ACTION_CEILING = "TIMEOUT"          # 자동으로 실행 가능한 최고 조치
 AUTO_ACTION_CEILING_TIMEOUT_MINUTES = 1440   # 위 상한 적용 시 타임아웃 길이(분) = 24시간
 # 하향 조정된 경우, 로그 채널에 "관리자 검토 필요"로 강조 표시

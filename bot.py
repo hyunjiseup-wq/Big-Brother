@@ -12,7 +12,7 @@
 5. 누적 점수 -> config.STRIKE_THRESHOLDS 에 따라 조치 결정
    단, 커뮤니티 정책상 킥/밴은 판단 주체(필터/Gemini/Groq) 무관하게 자동 실행하지 않고
    config.AUTO_ACTION_CEILING(기본 타임아웃)으로 항상 하향되며, 로그 채널에
-   "관리자 검토 필요"로 강조 표시됨 (!automod 검토대기 명령어로 목록 확인 가능)
+   "관리자 검토 필요"로 강조 표시됨 (!BB 검토대기 명령어로 목록 확인 가능)
 6. 조치 실행 (경고/삭제/타임아웃/킥/밴) + 로그 채널 기록 (판단 주체 포함)
 
 대규모 트래픽 대응 포인트:
@@ -71,7 +71,35 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!automod ", intents=intents)
+# 명령어 접두사: Big Brother의 약자 "BB". "!BB 점수"처럼 띄어 써도 "!BB점수"처럼
+# 붙여 써도 되고, 대소문자도 구분하지 않는다.
+# 주의: 공백 포함 접두사를 앞에 둬야 "!BB 점수"가 '점수' 명령어로 올바르게 파싱된다.
+COMMAND_PREFIXES = ("!BB ", "!bb ", "!Bb ", "!bB ", "!BB", "!bb", "!Bb", "!bB")
+# 기본 영어 help 명령어는 끄고, 한글 "!BB 명령어"(별칭: 도움말/help)로 대체한다.
+bot = commands.Bot(command_prefix=list(COMMAND_PREFIXES), intents=intents, help_command=None)
+
+
+@bot.check
+async def _admin_only_commands(ctx: commands.Context) -> bool:
+    """서버 정책: 제재봇의 모든 명령어는 관리자만 사용할 수 있다 (DM에서는 사용 불가)."""
+    perms = getattr(ctx.author, "guild_permissions", None)
+    return ctx.guild is not None and perms is not None and perms.administrator
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    """명령어 오류를 조용한 콘솔 예외 대신 사용자가 이해할 수 있는 안내로 바꾼다."""
+    try:
+        if isinstance(error, commands.CommandNotFound):
+            return  # 접두사와 겹친 일반 대화/오타는 조용히 무시
+        if isinstance(error, (commands.CheckFailure, commands.MissingPermissions)):
+            await ctx.send("⛔ 제재봇 명령어는 관리자만 사용할 수 있습니다.")
+        elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+            await ctx.send("사용법이 올바르지 않습니다. `!BB 명령어`에서 사용법을 확인해주세요.")
+        else:
+            print(f"[command] '{ctx.command}' 처리 중 오류: {error}")
+    except (discord.Forbidden, discord.HTTPException):
+        pass  # 안내 메시지를 보낼 권한이 없으면 무시
 
 # AI 판단이 필요한 메시지를 담아두는 큐 (워커들이 소비)
 _message_queue: asyncio.Queue = asyncio.Queue(maxsize=config.MAX_QUEUE_SIZE)
@@ -591,12 +619,11 @@ async def on_interaction(interaction: discord.Interaction):
     if action not in _REVIEW_ACTION_LABEL:
         return
 
-    # 권한 확인: 킥/밴 버튼은 해당 권한이 있는 관리자만, 나머지는 메시지 관리 권한
+    # 권한 확인: 검수 카드의 모든 버튼은 관리자 전용 (명령어와 동일한 서버 정책).
+    # 관리자는 킥/밴 권한을 포함한 모든 권한을 가지므로 별도 세분화가 필요 없다.
     perms = getattr(interaction.user, "guild_permissions", None)
-    needed = {"kick": "kick_members", "ban": "ban_members",
-              "okg": "administrator"}.get(action, "manage_messages")
-    if perms is None or not getattr(perms, needed, False):
-        await interaction.response.send_message("이 버튼을 누를 권한이 없습니다.", ephemeral=True)
+    if perms is None or not perms.administrator:
+        await interaction.response.send_message("⛔ 검수 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
 
     if action in ("kick", "ban"):
@@ -693,7 +720,7 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
         embed.add_field(
             name="⚠️ 하향 조정 안내",
             value=f"정책상 킥/밴은 자동 실행하지 않아 {duration}분 타임아웃으로 대체 적용됨. "
-                  f"`!automod 검토대기`에서 확인 후 관리자가 직접 킥/밴 여부를 결정해주세요.",
+                  f"`!BB 검토대기`에서 확인 후 관리자가 직접 킥/밴 여부를 결정해주세요.",
             inline=False,
         )
     embed.add_field(name="사유", value=reason_text or "-", inline=False)
@@ -852,8 +879,8 @@ def _is_moderation_target(message: discord.Message) -> bool:
     # 봇 자신, 다른 봇, DM은 무시
     if message.author.bot or message.guild is None:
         return False
-    # 봇 명령어(!automod ...)는 검사 대상이 아님 -> AI 한도 낭비 방지
-    if message.content.startswith(bot.command_prefix):
+    # 봇 명령어(!BB ...)는 검사 대상이 아님 -> AI 한도 낭비 방지
+    if message.content.startswith(COMMAND_PREFIXES):
         return False
     # 관리자(메시지 관리 권한 보유자)는 자동 제재 대상에서 제외
     # (웹훅 등으로 author가 Member가 아닐 수 있어 getattr로 안전하게 확인)
@@ -947,8 +974,43 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
 # ── 관리자용 명령어 ──────────────────────────────────────────────────
 
+@bot.command(name="명령어", aliases=["도움말", "help"])
+async def show_commands(ctx):
+    """전체 명령어 목록을 보여준다 (모든 명령어는 관리자 전용)."""
+    embed = discord.Embed(
+        title="📖 Big Brother 명령어 목록",
+        description="모든 명령어는 **관리자 전용**입니다.\n"
+                    "접두사는 `!BB` 입니다. `!BB 점수`처럼 띄어 써도, `!BB점수`처럼 붙여 써도 되고 "
+                    "대소문자(`!bb`)도 구분하지 않아요.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="🔍 조회",
+        value=(
+            "`!BB 명령어` — 이 목록 (별칭: 도움말, help)\n"
+            "`!BB 규칙확인` — 현재 설정된 서버 규칙 확인\n"
+            "`!BB 점수 @유저` — 누적 위반 점수와 최근 이력 확인\n"
+            "`!BB 검토대기 [시간]` — 킥/밴 대신 하향 조정된 건 목록 (기본 72시간)\n"
+            "`!BB 오탐학습 [개수]` — 활성 오탐 학습 규칙과 적용 범위 조회\n"
+            "`!BB 상태` — 처리 대기열/워커/드롭 건수 확인"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⚙️ 실행",
+        value=(
+            "`!BB 점수초기화 @유저` — 유저의 누적 점수 초기화\n"
+            "`!BB 오탐취소 <규칙번호>` — 잘못 등록한 오탐 학습 규칙 취소\n"
+            "`!BB 감사실행 [backend]` — 배치 감사를 지금 바로 실행 (gemini/groq/ollama/auto)"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="위반 검수는 #제재-로그 채널의 카드 버튼으로 처리합니다.")
+    await ctx.send(embed=embed)
+
+
 @bot.command(name="점수")
-@commands.has_permissions(manage_messages=True)
+@commands.has_permissions(administrator=True)
 async def check_points(ctx, member: discord.Member):
     points = await database.get_points(ctx.guild.id, member.id)
     history = await database.get_recent_violations(ctx.guild.id, member.id, limit=5)
@@ -977,7 +1039,7 @@ async def show_rules(ctx):
 
 
 @bot.command(name="검토대기")
-@commands.has_permissions(manage_messages=True)
+@commands.has_permissions(administrator=True)
 async def show_pending_reviews(ctx, hours: int = 72):
     """정책상 킥/밴이 자동 실행되지 않고 타임아웃으로 하향된 건들을 조회 (모델 종류 무관)."""
     rows = await database.get_pending_reviews(ctx.guild.id, hours=hours)
@@ -1005,7 +1067,7 @@ async def show_pending_reviews(ctx, hours: int = 72):
 @bot.command(name="감사실행")
 @commands.has_permissions(administrator=True)
 async def run_audit_now(ctx, backend: str = None):
-    """등록된 감시 채널들을 지금 바로 감사한다. 예: !automod 감사실행 gemini"""
+    """등록된 감시 채널들을 지금 바로 감사한다. 예: !BB 감사실행 gemini"""
     backend = backend or config.BATCH_BACKEND
     if backend not in ("auto", "gemini", "groq", "ollama"):
         await ctx.send("backend은 auto/gemini/groq/ollama 중 하나여야 합니다.")
@@ -1021,7 +1083,7 @@ async def run_audit_now(ctx, backend: str = None):
 
 
 @bot.command(name="상태")
-@commands.has_permissions(manage_messages=True)
+@commands.has_permissions(administrator=True)
 async def show_status(ctx):
     """대기열/워커 상태를 확인 (트래픽이 많을 때 큐가 밀리는지 점검용)."""
     embed = discord.Embed(title="⚙️ 자동 제재 봇 상태", color=discord.Color.blurple())
@@ -1037,7 +1099,7 @@ async def show_status(ctx):
 
 
 @bot.command(name="오탐학습")
-@commands.has_permissions(manage_messages=True)
+@commands.has_permissions(administrator=True)
 async def show_false_positive_rules(ctx, limit: int = 15):
     """활성 오탐 학습 규칙을 최근 순으로 조회한다."""
     rows = await learning.list_rules(ctx.guild.id, limit=limit)
@@ -1057,7 +1119,7 @@ async def show_false_positive_rules(ctx, limit: int = 15):
         description="\n\n".join(lines)[:4000],
         color=discord.Color.green(),
     )
-    embed.set_footer(text="취소: !automod 오탐취소 <규칙번호>")
+    embed.set_footer(text="취소: !BB 오탐취소 <규칙번호>")
     await ctx.send(embed=embed)
 
 
