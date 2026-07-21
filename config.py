@@ -187,6 +187,14 @@ AI_OUTAGE_ALERT_THRESHOLD = 5
 # 장애가 길어져도 이 간격(분)보다 자주 경고를 반복하지는 않음
 AI_OUTAGE_ALERT_COOLDOWN_MINUTES = 60
 
+# ── 메시지 누락(드롭) 알림 ───────────────────────────────────────────
+# 큐가 가득 차거나(MAX_QUEUE_SIZE 초과) 큐에서 너무 오래 대기해(MAX_QUEUE_AGE_SECONDS)
+# 검사되지 못하고 버려진 메시지는 사실상 감시 구멍이다. 콘솔에만 찍히면 놓치기 쉬우므로,
+# 누적 드롭이 아래 개수를 넘을 때마다 로그 채널에 경고를 올린다.
+DROP_ALERT_THRESHOLD = 50
+# 드롭이 계속돼도 이 간격(분)보다 자주 경고를 반복하지는 않음
+DROP_ALERT_COOLDOWN_MINUTES = 30
+
 # ── 1차 필터(키워드/패턴) 설정 ────────────────────────────────────────
 # 여기 걸리면 AI 호출 없이 즉시 처리됩니다.
 # 단어는 반드시 따옴표로 감싸고, 여러 개면 쉼표로 구분하세요. 예: ["단어1", "단어2"]
@@ -304,6 +312,8 @@ def validate_config() -> None:
 
     if MAX_CONCURRENT_AI_CALLS <= 0:
         errors.append("MAX_CONCURRENT_AI_CALLS는 1 이상이어야 합니다.")
+    if DROP_ALERT_THRESHOLD <= 0 or DROP_ALERT_COOLDOWN_MINUTES <= 0:
+        errors.append("DROP_ALERT_THRESHOLD와 DROP_ALERT_COOLDOWN_MINUTES는 1 이상이어야 합니다.")
     if MAX_QUEUE_SIZE <= 0 or MAX_QUEUE_AGE_SECONDS <= 0:
         errors.append("큐 크기와 최대 대기시간은 1 이상이어야 합니다.")
     if CACHE_TTL_SECONDS <= 0 or CACHE_MAX_ENTRIES <= 0:

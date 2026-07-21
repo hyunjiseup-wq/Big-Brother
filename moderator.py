@@ -28,6 +28,27 @@ class BatchClassificationError(RuntimeError):
     """배치 전체를 신뢰할 수 없어 체크포인트를 전진시키면 안 되는 경우."""
 
 
+# 요청마다 AsyncClient를 새로 만들면 매번 TCP/TLS 핸드셰이크를 다시 하고 소켓이 계속
+# 생겼다 사라진다. 트래픽이 많을수록 지연과 소켓 사용량이 커지므로 클라이언트를 공유해
+# 연결을 재사용한다. 실행 중인 이벤트 루프에서 첫 요청 때 지연 생성된다.
+_http_client: httpx.AsyncClient | None = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=15)
+    return _http_client
+
+
+async def aclose_http_client():
+    """봇 종료/테스트 정리용. 다음 호출 때 새 클라이언트가 다시 만들어진다."""
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
+
+
 def _safe_error(error: Exception) -> str:
     """콘솔 오류에 API 키가 포함되지 않도록 민감값을 제거한다."""
     text = str(error)
@@ -170,10 +191,9 @@ async def _classify_with_gemini(content: str, channel_note: str | None = None,
         },
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await _get_http_client().post(url, json=payload, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
 
     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
     parsed = _parse_json_response(raw_text)
@@ -201,10 +221,9 @@ async def _classify_with_groq(content: str, channel_note: str | None = None,
         ],
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await _get_http_client().post(url, json=payload, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
 
     raw_text = data["choices"][0]["message"]["content"]
     parsed = _parse_json_response(raw_text)
@@ -331,10 +350,9 @@ async def _classify_batch_with_gemini(messages: list[dict], channel_note: str | 
         },
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await _get_http_client().post(url, json=payload, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
 
     raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
     return _parse_batch_json(raw_text)
@@ -359,10 +377,9 @@ async def _classify_batch_with_groq(messages: list[dict], channel_note: str | No
         ],
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await _get_http_client().post(url, json=payload, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
 
     raw_text = data["choices"][0]["message"]["content"]
     return _parse_batch_json(raw_text)
@@ -386,10 +403,9 @@ async def _classify_batch_with_ollama(messages: list[dict], channel_note: str | 
     }
 
     # 로컬 GPU 추론은 느릴 수 있어 타임아웃을 넉넉하게 잡는다
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+    resp = await _get_http_client().post(url, json=payload, timeout=300)
+    resp.raise_for_status()
+    data = resp.json()
 
     raw_text = data["message"]["content"]
     return _parse_batch_json(raw_text)

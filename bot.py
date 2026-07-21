@@ -35,6 +35,7 @@ import database
 import cache
 import learning
 from filters import fast_check
+import moderator
 from moderator import classify_message, get_channel_note
 from batch_audit import run_full_audit
 
@@ -104,7 +105,10 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 # AI 판단이 필요한 메시지를 담아두는 큐 (워커들이 소비)
 _message_queue: asyncio.Queue = asyncio.Queue(maxsize=config.MAX_QUEUE_SIZE)
 _ai_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_AI_CALLS)
-_dropped_count = 0
+_dropped_count = 0        # 큐가 가득 차서 검사도 못 하고 버린 메시지 (감시 구멍)
+_expired_count = 0        # 큐에서 너무 오래 대기해 폐기한 메시지
+_last_drop_at: datetime.datetime | None = None
+_last_drop_alert_at: datetime.datetime | None = None
 _workers_started = False  # on_ready는 재연결 시마다 다시 호출되므로 워커 중복 생성 방지용
 _processing_keys: set[tuple[int, int, str]] = set()
 _background_tasks: set[asyncio.Task] = set()
@@ -689,14 +693,25 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
         await _handle_violation_review_only(message, level, reason_text, rule_violated, provider, points_to_add)
         return
 
-    total_points = await database.add_points(message.guild.id, message.author.id, points_to_add)
-    action, duration, downgraded = determine_action(total_points, level)
+    # [점수 정책] 실제로 집행된 제재만 누적 점수에 반영한다.
+    # 예전에는 점수를 먼저 올리고 조치를 실행해서, 권한 부족 등으로 조치가 실패해도 점수는
+    # 남았다. 그러면 유저는 아무 제재도 받지 않았는데 다음 위반에서 더 높은 단계가 적용된다.
+    # 그래서 조치 단계는 "성공하면 될 점수"로 미리 정하고, 실행에 성공한 뒤에만 확정 저장한다.
+    current_points = await database.get_points(message.guild.id, message.author.id)
+    prospective_points = current_points + points_to_add
+    action, duration, downgraded = determine_action(prospective_points, level)
 
     reason = f"[{level}] 규칙 {rule_violated} 위반 - {reason_text}"
     if downgraded:
         reason += " (⚠️ 킥/밴은 자동 실행하지 않는 정책에 따라 타임아웃으로 조정됨, 관리자 검토 필요)"
     action_ok, action_detail = await apply_action(message, action, duration, reason)
     recorded_action = action if action_ok else f"{action}_FAILED"
+
+    if action_ok:
+        total_points = await database.add_points(message.guild.id, message.author.id, points_to_add)
+    else:
+        total_points = current_points
+        action_detail += f" · 조치 실패로 점수 +{points_to_add} 미반영 (누적 {current_points:.1f} 유지)"
 
     await database.log_violation(
         message.guild.id, message.author.id, message.channel.id,
@@ -746,33 +761,35 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
 # AI 전량 장애 감지: Gemini/Groq가 둘 다 실패하면 안전하게 NONE 처리되지만(무고한 제재 방지)
 # 콘솔에만 찍혀서 관리자가 무감시 상태를 모를 수 있다. 연속 실패가 임계치에 닿으면
 # 로그 채널에 경고를 올린다.
-_ai_fail_streak = 0
-_last_outage_alert_at: datetime.datetime | None = None
+# 상태는 서버(guild)별로 따로 센다 — 전역 카운터로 두면 여러 서버에 들어가 있을 때
+# 한 서버의 성공이 다른 서버의 연속 실패를 초기화하고, 알림도 엉뚱한 서버로 갈 수 있다.
+# {guild_id: {"streak": int, "last_alert": datetime | None}}
+_ai_outage_state: dict[int, dict] = {}
 
 
 async def _track_ai_outage(guild: discord.Guild, result):
-    global _ai_fail_streak, _last_outage_alert_at
+    state = _ai_outage_state.setdefault(guild.id, {"streak": 0, "last_alert": None})
 
     if result.provider != "none":
-        if _ai_fail_streak >= config.AI_OUTAGE_ALERT_THRESHOLD:
-            print("✅ AI 판단이 복구되었습니다.")
-        _ai_fail_streak = 0
+        if state["streak"] >= config.AI_OUTAGE_ALERT_THRESHOLD:
+            print(f"✅ AI 판단이 복구되었습니다 (길드 {guild.id}).")
+        state["streak"] = 0
         return
 
-    _ai_fail_streak += 1
-    if _ai_fail_streak < config.AI_OUTAGE_ALERT_THRESHOLD:
+    state["streak"] += 1
+    if state["streak"] < config.AI_OUTAGE_ALERT_THRESHOLD:
         return
 
     now = discord.utils.utcnow()
     cooldown = datetime.timedelta(minutes=config.AI_OUTAGE_ALERT_COOLDOWN_MINUTES)
-    if _last_outage_alert_at and now - _last_outage_alert_at < cooldown:
+    if state["last_alert"] and now - state["last_alert"] < cooldown:
         return
-    _last_outage_alert_at = now
+    state["last_alert"] = now
 
     embed = discord.Embed(
         title="🔴 AI 판단 장애 감지",
         description=(
-            f"Gemini와 Groq 판단이 **{_ai_fail_streak}회 연속 실패**했습니다.\n"
+            f"Gemini와 Groq 판단이 **{state['streak']}회 연속 실패**했습니다.\n"
             "실패한 메시지는 안전하게 '위반 없음' 처리되므로 지금 서버는 **키워드 필터만으로 감시 중**입니다.\n\n"
             "확인할 것:\n"
             "1. API 무료 한도 초과 여부 (Gemini는 한국시간 오후 4시경 리셋)\n"
@@ -793,6 +810,7 @@ async def ai_worker(worker_id: int):
             queue_age = time.monotonic() - enqueued_at
             if queue_age > config.MAX_QUEUE_AGE_SECONDS:
                 print(f"[worker-{worker_id}] {queue_age:.1f}초 지난 메시지를 안전하게 폐기했습니다.")
+                _note_drop(message.guild, expired=True)
                 continue
             # 관리자가 오탐으로 확정했던 내용과 동일하면 AI 호출 없이 즉시 통과
             # (재오탐 방지 + 무료 API 한도 절약)
@@ -862,6 +880,13 @@ async def batch_audit_task():
 
 
 @bot.event
+async def close():
+    """봇 종료 시 공유 HTTP 클라이언트를 정리한 뒤 기본 종료 절차를 진행한다."""
+    await moderator.aclose_http_client()
+    await commands.Bot.close(bot)
+
+
+@bot.event
 async def on_ready():
     global _workers_started
     await database.init_db()
@@ -911,10 +936,52 @@ async def _handle_decided(message: discord.Message, result, processing_key):
         _processing_keys.discard(processing_key)
 
 
+def _note_drop(guild: discord.Guild, expired: bool = False):
+    """
+    검사되지 못하고 버려진 메시지를 집계하고, 누적이 임계치를 넘으면 로그 채널에 경고한다.
+    콘솔 출력만으로는 장시간 감시 구멍을 놓치기 쉬워서 관리자에게 직접 알린다.
+    """
+    global _dropped_count, _expired_count, _last_drop_at
+
+    if expired:
+        _expired_count += 1
+    else:
+        _dropped_count += 1
+    _last_drop_at = discord.utils.utcnow()
+
+    total = _dropped_count + _expired_count
+    if total % config.DROP_ALERT_THRESHOLD == 0 and guild is not None:
+        _spawn(_alert_drops(guild))
+
+
+async def _alert_drops(guild: discord.Guild):
+    global _last_drop_alert_at
+
+    now = discord.utils.utcnow()
+    cooldown = datetime.timedelta(minutes=config.DROP_ALERT_COOLDOWN_MINUTES)
+    if _last_drop_alert_at and now - _last_drop_alert_at < cooldown:
+        return
+    _last_drop_alert_at = now
+
+    usage = _message_queue.qsize() / config.MAX_QUEUE_SIZE * 100
+    embed = discord.Embed(
+        title="🔴 메시지 누락 발생 (감시 구멍)",
+        description=(
+            f"검사하지 못하고 버린 메시지가 누적 **{_dropped_count + _expired_count}건**입니다.\n"
+            f"- 큐 포화로 버림: {_dropped_count}건\n"
+            f"- 대기 시간 초과로 폐기: {_expired_count}건\n"
+            f"- 현재 대기열: {_message_queue.qsize()} / {config.MAX_QUEUE_SIZE} ({usage:.0f}%)\n\n"
+            "이 메시지들은 검사 자체가 되지 않았습니다. 트래픽이 계속 많다면 "
+            "`config.MAX_CONCURRENT_AI_CALLS`(동시 AI 호출 수)나 `MAX_QUEUE_SIZE` 상향을 검토하세요."
+        ),
+        color=discord.Color.red(),
+        timestamp=now,
+    )
+    await send_log(guild, embed, mention=config.ADMIN_REVIEW_MENTION or None)
+
+
 def _run_moderation(message: discord.Message):
     """1차 필터 → (필요 시) AI 큐 투입. 새 메시지와 수정된 메시지가 같은 경로를 탄다."""
-    global _dropped_count
-
     processing_key = _message_processing_key(message)
     if processing_key in _processing_keys:
         return
@@ -933,7 +1000,7 @@ def _run_moderation(message: discord.Message):
             _message_queue.put_nowait((message, time.monotonic(), processing_key))
         except asyncio.QueueFull:
             _processing_keys.discard(processing_key)
-            _dropped_count += 1
+            _note_drop(message.guild)
             if _dropped_count % 100 == 1:
                 print(f"⚠️ 처리 큐가 가득 차 메시지를 버렸습니다 (누적 {_dropped_count}건). "
                       f"MAX_QUEUE_SIZE 또는 MAX_CONCURRENT_AI_CALLS 조정을 고려하세요.")
@@ -1123,9 +1190,28 @@ async def show_status(ctx):
         value="🔍 수동 검수 (감지만 하고 조치 없음)" if config.MANUAL_REVIEW_MODE else "🚨 자동 조치",
         inline=False,
     )
-    embed.add_field(name="대기 중인 메시지", value=f"{_message_queue.qsize()} / {config.MAX_QUEUE_SIZE}", inline=True)
+    queued = _message_queue.qsize()
+    usage = queued / config.MAX_QUEUE_SIZE * 100
+    # 큐 사용률이 높다는 건 곧 드롭(감시 구멍)이 시작된다는 신호다.
+    gauge = "🟢 여유" if usage < 80 else ("🟡 혼잡" if usage < 95 else "🔴 포화 임박")
+    embed.add_field(name="대기열", value=f"{gauge} {queued} / {config.MAX_QUEUE_SIZE} ({usage:.0f}%)", inline=True)
     embed.add_field(name="AI 워커 수", value=str(config.MAX_CONCURRENT_AI_CALLS), inline=True)
-    embed.add_field(name="누적 드롭 메시지", value=str(_dropped_count), inline=True)
+
+    total_dropped = _dropped_count + _expired_count
+    drop_text = (f"큐 포화 {_dropped_count}건 · 대기 초과 {_expired_count}건"
+                 if total_dropped else "없음")
+    embed.add_field(name=f"검사 못한 메시지 (누적 {total_dropped}건)", value=drop_text, inline=False)
+    if _last_drop_at:
+        embed.add_field(name="마지막 누락 시각",
+                        value=discord.utils.format_dt(_last_drop_at, "R"), inline=True)
+
+    uncarded = await database.get_reviews_without_card(ctx.guild.id)
+    if uncarded:
+        embed.add_field(name="카드 없는 검수 대기",
+                        value=f"{len(uncarded)}건 — `!BB 검토대기`에서 확인", inline=True)
+    outage = _ai_outage_state.get(ctx.guild.id, {})
+    if outage.get("streak"):
+        embed.add_field(name="AI 연속 판단 실패", value=f"{outage['streak']}회", inline=True)
     await ctx.send(embed=embed)
 
 

@@ -148,7 +148,9 @@ python -m pip install -r requirements.lock
    재사용합니다. 기본 10분(`CACHE_TTL_SECONDS`) 캐시.
 3. **큐 + 워커 풀 (`bot.py`)**: 애매한 메시지만 큐에 들어가고, `MAX_CONCURRENT_AI_CALLS`(기본 8)개의
    워커가 동시에 AI를 호출합니다. `on_message`는 절대 AI 응답을 기다리지 않습니다.
-4. **과부하 보호**: 큐가 `MAX_QUEUE_SIZE`(기본 5000)를 넘으면 초과분은 버리고 로그만 남깁니다.
+4. **과부하 보호**: 큐가 `MAX_QUEUE_SIZE`(기본 5000)를 넘거나 `MAX_QUEUE_AGE_SECONDS`(기본 120초)를
+   넘겨 대기한 메시지는 검사하지 않고 버립니다. 이 누락이 `DROP_ALERT_THRESHOLD`(기본 50건)마다
+   로그 채널에 경고로 올라오고, `!BB 상태`에서 대기열 사용률과 누락 건수를 확인할 수 있습니다.
 5. **SQLite WAL 모드**: DB 쓰기는 실제 위반 감지 시에만 발생하므로 SQLite로도 상당한 트래픽을 감당합니다.
    여러 인스턴스로 수평 확장해야 한다면 PostgreSQL(asyncpg) 이전을 고려하세요.
 
@@ -220,4 +222,7 @@ macOS/Linux의 cron에 등록해두면 됩니다.
 - AI 판단은 100% 정확하지 않으므로, 처음에는 `STRIKE_THRESHOLDS`를 관대하게 설정하고
   로그 채널을 지켜보며 튜닝하는 것을 권장합니다.
 - 오탐(false positive) 방지를 위해 Gemini/Groq 둘 다 실패하면 안전하게 `NONE`(위반 없음)으로 처리합니다.
+  이 상태가 `AI_OUTAGE_ALERT_THRESHOLD`회 연속되면 서버별로 장애 경고가 로그 채널에 올라옵니다.
+- 자동 조치 모드에서 **실제로 집행에 성공한 제재만 누적 점수에 반영**됩니다. 권한 부족 등으로
+  조치가 실패하면 점수를 올리지 않아, 제재받지 않은 유저가 다음 위반에서 과잉 처벌되는 일을 막습니다.
 - `STRIKE_DECAY_DAYS`(기본 30일)가 지나면 점수가 자동으로 절반 감소합니다.
