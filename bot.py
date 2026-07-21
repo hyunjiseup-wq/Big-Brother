@@ -221,21 +221,25 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
 
 
 async def send_log(guild: discord.Guild, embed: discord.Embed, mention: str = None,
-                   view: discord.ui.View = None):
+                   view: discord.ui.View = None) -> bool:
+    """로그 채널에 임베드를 보낸다. 실제로 전송에 성공하면 True를 반환한다.
+    검수 카드처럼 '전송 성공 여부'가 중요한 호출은 이 반환값으로 실패를 감지한다."""
     if not LOG_CHANNEL_ID:
-        return
+        return False
     channel = guild.get_channel(LOG_CHANNEL_ID)
     if channel is None:
         print(f"⚠️ 로그 채널(ID: {LOG_CHANNEL_ID})을 찾을 수 없습니다. .env의 LOG_CHANNEL_ID를 확인하세요.")
-        return
+        return False
     if not hasattr(channel, "send"):
         print(f"⚠️ 로그 채널 #{channel.name}은(는) {type(channel).__name__}이라 메시지를 보낼 수 없습니다. "
               f"LOG_CHANNEL_ID를 일반 텍스트 채널 ID로 바꿔주세요.")
-        return
+        return False
     try:
         await channel.send(content=mention, embed=embed, view=view)
+        return True
     except (discord.Forbidden, discord.HTTPException) as e:
         print(f"⚠️ 로그 채널 #{channel.name} 전송 실패: {type(e).__name__}")
+        return False
 
 
 async def send_public_sanction_log(guild: discord.Guild, level: str, rule_violated: str, action: str):
@@ -307,11 +311,10 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
     if downgraded:
         action_label += " (킥/밴 후보 → 정책상 타임아웃)"
 
-    review_id = await database.log_violation(
-        message.guild.id, message.author.id, message.channel.id,
+    review_id = await database.create_review_record(
+        message.guild.id, message.author.id, message.channel.id, message.id,
         message.content, level, reason_text,
-        f"검수모드(조치 없음, 모의: {action_label})", provider, needs_review=False,
-        review_status="pending", message_id=message.id,
+        f"검수모드(조치 없음, 모의: {action_label})", provider,
     )
 
     embed = discord.Embed(
@@ -329,15 +332,24 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
     embed.add_field(name="원문", value=(message.content[:500] or "(내용 없음)"), inline=False)
     embed.add_field(name="메시지 바로가기", value=message.jump_url, inline=False)
     view = _build_review_view(message.channel.id, message.id, message.author.id, review_id)
-    await send_log(message.guild, embed, view=view)
+    delivered = await send_log(message.guild, embed, view=view)
+    if not delivered:
+        # 카드가 안 올라가면 관리자는 검수할 방법이 없다. 카드 없음 상태로 표시해
+        # `!BB 검토대기`에서 별도로 확인하고 로그 채널 권한을 점검하게 한다.
+        await database.mark_review_delivery_failed(review_id, message.guild.id)
+        print("⚠️ 검수 카드 전송 실패 — 로그 채널 권한/설정을 확인하세요. "
+              "감지 기록은 DB에 남아 `!BB 검토대기`에서 조회됩니다.")
 
 
 async def post_batch_review_card(message: discord.Message, level: str, reason_text: str,
-                                 rule_violated: str, provider: str):
+                                 rule_violated: str, provider: str, review_id: int):
     """
     배치 감사에서 위반 의심으로 걸린 '과거' 메시지를 제재 로그 채널에 검토 카드로 올린다.
     실시간 검수 카드와 동일한 버튼을 달아, 관리자가 링크로 원문을 확인하고 바로 조치할 수 있게 한다.
     (배치 감사는 자동 조치를 하지 않으므로 검수 모드/자동 모드와 무관하게 항상 '카드만' 올린다.)
+
+    검수 레코드(review_id)는 batch_audit._post_review_cards가 카드 게시 여부와 무관하게
+    미리 만들어 넘겨준다. 여기서는 카드 게시와 전송 실패 표시만 담당한다.
     """
     points = config.VIOLATION_LEVEL_POINTS.get(level, 0)
     current_points = await database.get_points(message.guild.id, message.author.id)
@@ -362,13 +374,10 @@ async def post_batch_review_card(message: discord.Message, level: str, reason_te
     embed.add_field(name="사유", value=reason_text or "-", inline=False)
     embed.add_field(name="원문", value=(message.content[:500] or "(내용 없음)"), inline=False)
     embed.add_field(name="메시지 바로가기", value=message.jump_url, inline=False)
-    review_id = await database.log_violation(
-        message.guild.id, message.author.id, message.channel.id,
-        message.content, level, reason_text, "배치 감사 검토 대기", provider,
-        review_status="pending", message_id=message.id,
-    )
     view = _build_review_view(message.channel.id, message.id, message.author.id, review_id)
-    await send_log(message.guild, embed, view=view)
+    delivered = await send_log(message.guild, embed, view=view)
+    if not delivered:
+        await database.mark_review_delivery_failed(review_id, message.guild.id)
 
 
 def _batch_review_callback():
@@ -1042,10 +1051,17 @@ async def show_rules(ctx):
 @bot.command(name="검토대기")
 @commands.has_permissions(administrator=True)
 async def show_pending_reviews(ctx, hours: int = 72):
-    """정책상 킥/밴이 자동 실행되지 않고 타임아웃으로 하향된 건들을 조회 (모델 종류 무관)."""
+    """
+    관리자 검토가 필요한 두 종류를 함께 보여준다:
+    1. 정책상 킥/밴이 자동 실행되지 않고 타임아웃으로 하향된 건
+    2. 검수 카드가 없는 대기 건 (카드 전송 실패 또는 배치 카드 상한 초과) — 카드가 없어
+       버튼으로 처리할 수 없으므로, 여기서 드러나지 않으면 그대로 묻힌다.
+    """
     rows = await database.get_pending_reviews(ctx.guild.id, hours=hours)
-    if not rows:
-        await ctx.send(f"✅ 최근 {hours}시간 내 관리자 검토가 필요한 하향 조정 건이 없습니다.")
+    uncarded = await database.get_reviews_without_card(ctx.guild.id)
+
+    if not rows and not uncarded:
+        await ctx.send(f"✅ 최근 {hours}시간 내 관리자 검토가 필요한 건이 없습니다.")
         return
 
     provider_label = {"gemini": "Gemini", "groq": "Groq", "filter": "키워드 필터", "none": "판단 실패"}
@@ -1060,6 +1076,20 @@ async def show_pending_reviews(ctx, hours: int = 72):
         embed.add_field(
             name=f"{who} — {level} ({provider_label.get(provider, provider)})",
             value=f"{reason}\n적용된 조치: {action}",
+            inline=False,
+        )
+
+    if uncarded:
+        lines = []
+        for review_id, user_id, channel_id, level, reason, _action, _created_at in uncarded[:5]:
+            member = ctx.guild.get_member(user_id)
+            who = member.mention if member else f"(ID: {user_id})"
+            lines.append(f"`#{review_id}` {who} · {level} · <#{channel_id}>\n> {(reason or '-')[:100]}")
+        embed.add_field(
+            name=f"🃏 카드 없는 대기 건 {len(uncarded)}개 (버튼 처리 불가)",
+            value=("검수 카드가 게시되지 못한 건들입니다. 로그 채널 권한/설정을 확인하거나 "
+                   "배치 카드 상한(BATCH_REVIEW_CARD_LIMIT)을 조정하세요.\n\n"
+                   + "\n".join(lines))[:1024],
             inline=False,
         )
     await ctx.send(embed=embed)

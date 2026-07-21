@@ -246,7 +246,12 @@ _LEVEL_SEVERITY = {"MINOR": 1, "MODERATE": 2, "SEVERE": 3, "EXTREME": 4}
 async def _post_review_cards(audit_results: list, on_flagged):
     """
     위반 의심 메시지들을 제재 로그 채널에 검토 카드로 올린다 (콜백은 bot.py가 제공).
-    심각한 등급부터 올리고, config.BATCH_REVIEW_CARD_LIMIT개까지만 올려 도배를 막는다.
+    심각한 등급부터 올리고, config.BATCH_REVIEW_CARD_LIMIT개까지만 카드로 올려 도배를 막는다.
+
+    카드 상한을 넘은 건도 검수 레코드는 DB에 남긴다(card_delivered=0). 감사 체크포인트는
+    이미 그 메시지들을 지나가므로, 레코드를 안 남기면 리포트 파일에만 존재하고 다음 감사에서
+    다시 카드로 나타나지 않아 영영 검토에서 누락되기 때문이다.
+    `!BB 검토대기`에서 '카드 없는 대기 건'으로 확인할 수 있다.
     """
     flagged = [f for r in audit_results for f in r["flagged"]]
     if not flagged:
@@ -255,16 +260,39 @@ async def _post_review_cards(audit_results: list, on_flagged):
 
     limit = getattr(config, "BATCH_REVIEW_CARD_LIMIT", 25)
     posted = 0
-    for f in flagged[:limit]:
+    stored_only = 0
+    for index, f in enumerate(flagged):
+        message = f["message"]
+        will_post = index < limit
         try:
-            await on_flagged(f["message"], f["level"], f["reason"], f["rule_violated"], f["provider"])
+            review_id = await database.create_review_record(
+                message.guild.id, message.author.id, message.channel.id, message.id,
+                message.content, f["level"], f["reason"],
+                "배치 감사 검토 대기" if will_post else "배치 감사 검토 대기 (카드 상한 초과로 미게시)",
+                f["provider"], card_delivered=will_post,
+            )
+        except Exception as e:
+            print(f"[batch_audit] 검수 레코드 저장 실패: {e}")
+            continue
+
+        if not will_post:
+            stored_only += 1
+            continue
+        try:
+            await on_flagged(message, f["level"], f["reason"], f["rule_violated"],
+                             f["provider"], review_id)
             posted += 1
         except Exception as e:
             print(f"[batch_audit] 검토 카드 전송 실패: {e}")
+            try:
+                await database.mark_review_delivery_failed(review_id, message.guild.id)
+            except Exception:
+                pass
+
     print(f"[batch_audit] 검토 카드 {posted}건을 제재 로그 채널에 올렸습니다.")
-    if len(flagged) > limit:
-        print(f"[batch_audit] 위반 의심 {len(flagged)}건 중 상위 {limit}건만 카드로 올렸습니다. "
-              f"나머지는 리포트를 참고하세요 (BATCH_REVIEW_CARD_LIMIT 조정 가능).")
+    if stored_only:
+        print(f"[batch_audit] 카드 상한({limit}건)을 넘은 {stored_only}건은 카드 없이 검수 대기로 저장했습니다. "
+              f"`!BB 검토대기`에서 확인하세요 (BATCH_REVIEW_CARD_LIMIT 조정 가능).")
 
 
 async def run_full_audit(guild: discord.Guild, backend: str = None, on_flagged=None) -> str:

@@ -82,6 +82,9 @@ async def init_db():
         )
         await _ensure_column(db, "violation_log", "reviewed_at", "REAL")
         await _ensure_column(db, "violation_log", "reviewed_by", "INTEGER")
+        # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
+        # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
+        await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
         # 프로세스가 검수 도중 종료된 경우 다음 시작에서 다시 처리할 수 있게 복구한다.
         await db.execute(
             "UPDATE violation_log SET review_status = 'pending', reviewed_at = NULL "
@@ -276,6 +279,68 @@ async def log_violation(
         )
         await db.commit()
         return cursor.lastrowid
+
+
+async def create_review_record(
+    guild_id, user_id, channel_id, message_id, message_content,
+    level, reason, action_taken, provider="unknown", card_delivered=True,
+) -> int:
+    """
+    검수 대기(pending) 레코드를 만들고 id를 돌려준다.
+
+    같은 메시지(message_id)에 대해 이미 대기/처리중인 검수가 있으면(예: 유저가 메시지를
+    수정해 재검사된 경우) 먼저 'superseded'로 밀어내어 부분 유니크 인덱스
+    (idx_violation_message_review) 충돌로 인한 IntegrityError를 방지한다.
+    이렇게 하면 예전 카드의 버튼은 무력화되고(클릭 시 claim 실패) 최신 카드가 최종본이 된다.
+
+    card_delivered=False면 pending이지만 실제 카드가 없는 상태로 기록된다
+    (전송 실패 또는 배치 카드 상한 초과분). get_reviews_without_card로 조회 가능.
+    """
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        if message_id is not None:
+            await db.execute(
+                "UPDATE violation_log SET review_status = 'superseded' "
+                "WHERE guild_id = ? AND message_id = ? "
+                "AND review_status IN ('pending', 'processing')",
+                (guild_id, message_id),
+            )
+        cursor = await db.execute(
+            """INSERT INTO violation_log
+               (guild_id, user_id, channel_id, message_id, message_content, level, reason,
+                action_taken, provider, needs_review, review_status, card_delivered, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?)""",
+            (guild_id, user_id, channel_id, message_id, message_content, level, reason,
+             action_taken, provider, int(card_delivered), time.time()),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def mark_review_delivery_failed(review_id: int, guild_id: int):
+    """검수 카드 전송이 실패했음을 기록한다 (pending은 유지, 카드만 없음 표시)."""
+    async with _connect() as db:
+        await db.execute(
+            "UPDATE violation_log SET card_delivered = 0 "
+            "WHERE id = ? AND guild_id = ? AND review_status = 'pending'",
+            (review_id, guild_id),
+        )
+        await db.commit()
+
+
+async def get_reviews_without_card(guild_id: int, hours: int = 168, limit: int = 15):
+    """카드가 게시되지 못한 채 남아 있는 pending 검수 건들을 조회한다."""
+    since = time.time() - max(0, hours) * 3600
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT id, user_id, channel_id, level, reason, action_taken, created_at
+               FROM violation_log
+               WHERE guild_id = ? AND review_status = 'pending' AND card_delivered = 0
+                 AND created_at >= ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (guild_id, since, limit),
+        )
+        return await cursor.fetchall()
 
 
 async def claim_review(review_id: int, guild_id: int) -> bool:
