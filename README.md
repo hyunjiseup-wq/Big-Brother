@@ -109,7 +109,8 @@ python -m pip install -r requirements.lock
 - 설치 및 DB 설정 점검: `run_bot.bat --check` (한글/공백이 포함된 경로도 지원)
   이 점검은 Python 패키지, SQLite 접근, 필수 토큰/API 키와 채널 ID 형식을 확인하며 Discord에는 로그인하지 않습니다.
 - 읽기 전용 외부 연결 점검: `run_bot.bat --check-network`
-  Discord 봇 토큰과 Gemini/Groq 모델 조회 API만 확인하며 메시지 생성·전송이나 제재는 수행하지 않습니다.
+  Discord 봇 토큰·설정 채널 조회와 Gemini/Groq 모델 조회 API를 확인하며
+  메시지 생성·전송이나 제재는 수행하지 않습니다.
 - 자동 시작 등록: `register_startup.bat`을 한 번 실행합니다.
 - Linux/macOS: 활성화한 가상환경에서 `python bot.py`를 실행합니다.
 

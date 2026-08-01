@@ -14,6 +14,24 @@ import config
 load_dotenv()
 
 
+def _configured_discord_channels() -> list[tuple[str, int]]:
+    """ID 자체를 출력하지 않도록 용도 라벨과 설정된 채널 ID를 반환한다."""
+    channels = []
+    for label, name in (
+        ("log", "LOG_CHANNEL_ID"),
+        ("public log", "PUBLIC_LOG_CHANNEL_ID"),
+        ("report", "REPORT_CHANNEL_ID"),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            channels.append((label, int(raw)))
+    channels.extend(
+        (f"watched {index}", channel_id)
+        for index, channel_id in enumerate(config.WATCHED_CHANNEL_IDS, 1)
+    )
+    return channels
+
+
 async def _check_response(client: httpx.AsyncClient, name: str, url: str, headers: dict) -> str:
     try:
         response = await client.get(url, headers=headers)
@@ -51,12 +69,20 @@ async def run_network_checks() -> int:
 
     async with httpx.AsyncClient(timeout=15) as client:
         if token:
+            discord_headers = {"Authorization": f"Bot {token}"}
             checks.append(_check_response(
                 client,
                 "Discord bot token",
                 "https://discord.com/api/v10/users/@me",
-                {"Authorization": f"Bot {token}"},
+                discord_headers,
             ))
+            for label, channel_id in _configured_discord_channels():
+                checks.append(_check_response(
+                    client,
+                    f"Discord channel {label}",
+                    f"https://discord.com/api/v10/channels/{channel_id}",
+                    discord_headers,
+                ))
         else:
             print("[FAIL] Discord bot token: DISCORD_BOT_TOKEN missing")
 
