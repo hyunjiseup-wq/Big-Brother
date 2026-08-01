@@ -42,6 +42,11 @@ if /i "%~1"=="--check" (
     exit /b 0
 )
 
+if /i "%~1"=="--check-network" (
+    "%PYTHON%" network_check.py
+    exit /b %errorlevel%
+)
+
 set /a RETRIES=0
 :loop
 echo [%date% %time%] Starting bot...
