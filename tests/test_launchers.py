@@ -20,6 +20,10 @@ class StartupLauncherTests(unittest.TestCase):
 
 
 class BotLauncherTests(unittest.TestCase):
+    def test_environment_check_includes_database_integrity(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn("database.validate_database_integrity()", script)
+
     def test_normal_exit_does_not_restart(self):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn('if "%BOT_EXIT%"=="0" goto stopped', script)

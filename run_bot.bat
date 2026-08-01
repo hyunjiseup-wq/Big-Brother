@@ -21,10 +21,10 @@ if errorlevel 1 (
     exit /b 2
 )
 
-"%PYTHON%" -c "import asyncio, database; asyncio.run(database.init_db())"
+"%PYTHON%" -c "import asyncio, database; asyncio.run(database.init_db()); asyncio.run(database.validate_database_integrity())"
 if errorlevel 1 (
-    echo [ERROR] The database could not be initialized.
-    echo Check AUTOMOD_DB_PATH and folder permissions. The detailed error is shown above.
+    echo [ERROR] The database could not be initialized or failed its integrity check.
+    echo Check AUTOMOD_DB_PATH, folder permissions, and database backups. The detailed error is shown above.
     pause
     exit /b 4
 )

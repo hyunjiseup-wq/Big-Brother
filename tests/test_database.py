@@ -35,6 +35,9 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*(database.add_points(1, 3, 1) for _ in range(20)))
         self.assertEqual(await database.get_points(1, 3), 20)
 
+    async def test_initialized_database_passes_integrity_check(self):
+        await database.validate_database_integrity()
+
     async def test_decay_read_cannot_overwrite_concurrent_add(self):
         old = time.time() - 31 * 86400
         async with aiosqlite.connect(database.DB_PATH) as db:

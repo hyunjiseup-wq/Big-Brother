@@ -160,6 +160,17 @@ async def init_db():
         await db.commit()
 
 
+async def validate_database_integrity() -> None:
+    """SQLite가 보고하는 구조/페이지 손상을 시작 전에 감지한다."""
+    async with _connect() as db:
+        cursor = await db.execute("PRAGMA quick_check;")
+        rows = await cursor.fetchall()
+    messages = [str(row[0]) for row in rows]
+    if messages != ["ok"]:
+        summary = "; ".join(messages[:5]) or "결과 없음"
+        raise RuntimeError(f"SQLite 무결성 검사 실패: {summary}")
+
+
 async def _apply_decay(db, guild_id: int, user_id: int, row):
     """경과한 감쇠 주기 수만큼 한 번만 점수를 감소시킨다."""
     points, last_violation_at, last_decay_at = row
