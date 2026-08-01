@@ -100,6 +100,29 @@ def validate_runtime_environment() -> None:
     if errors:
         raise RuntimeError("환경 설정 오류:\n- " + "\n- ".join(errors))
 
+
+def permission_warnings(member) -> list[str]:
+    """봇 멤버에 부여된 과도하거나 부족한 서버 권한 경고를 반환한다."""
+    permissions = getattr(member, "guild_permissions", None)
+    if permissions is None:
+        return ["봇의 서버 권한을 확인할 수 없습니다."]
+    warnings = []
+    if permissions.administrator:
+        warnings.append(
+            "Administrator 권한이 부여돼 있습니다. 탈취·오작동 피해를 줄이려면 제거하고 "
+            "메시지 관리, 멤버 타임아웃, 추방, 차단 권한만 부여하세요."
+        )
+    required = {
+        "manage_messages": "메시지 관리",
+        "moderate_members": "멤버 타임아웃",
+        "kick_members": "멤버 추방",
+        "ban_members": "멤버 차단",
+    }
+    missing = [label for attr, label in required.items() if not getattr(permissions, attr, False)]
+    if missing:
+        warnings.append("필수 권한이 부족합니다: " + ", ".join(missing))
+    return warnings
+
 # 등급 서열 (공개 로그 최소 등급 비교용)
 _LEVEL_ORDER = {"MINOR": 1, "MODERATE": 2, "SEVERE": 3, "EXTREME": 4}
 
@@ -946,6 +969,9 @@ async def on_ready():
 
     if config.WATCHED_CHANNEL_IDS and not batch_audit_task.is_running():
         batch_audit_task.start()
+    for guild in bot.guilds:
+        for warning in permission_warnings(guild.me):
+            print(f"[permissions] 서버 {guild.id}: {warning}")
     mode = "수동 검수 모드 (감지만 하고 조치 없음)" if config.MANUAL_REVIEW_MODE else "자동 조치 모드"
     print(f"✅ 로그인 완료: {bot.user} ({mode}, AI 워커 {config.MAX_CONCURRENT_AI_CALLS}개, "
           f"배치 감사 {'활성' if config.WATCHED_CHANNEL_IDS else '비활성(채널 미등록)'})")

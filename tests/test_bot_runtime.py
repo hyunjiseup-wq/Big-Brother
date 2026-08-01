@@ -31,6 +31,42 @@ class RuntimeEnvironmentTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "DISCORD_BOT_TOKEN"):
                 bot.validate_runtime_environment()
 
+
+class PermissionWarningTests(unittest.TestCase):
+    def test_administrator_permission_is_flagged(self):
+        permissions = SimpleNamespace(
+            administrator=True,
+            manage_messages=True,
+            moderate_members=True,
+            kick_members=True,
+            ban_members=True,
+        )
+        warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
+        self.assertTrue(any("Administrator" in warning for warning in warnings))
+
+    def test_missing_required_permissions_are_listed(self):
+        permissions = SimpleNamespace(
+            administrator=False,
+            manage_messages=True,
+            moderate_members=False,
+            kick_members=False,
+            ban_members=True,
+        )
+        warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
+        self.assertTrue(any("멤버 타임아웃" in warning and "멤버 추방" in warning for warning in warnings))
+
+    def test_least_privilege_configuration_has_no_warning(self):
+        permissions = SimpleNamespace(
+            administrator=False,
+            manage_messages=True,
+            moderate_members=True,
+            kick_members=True,
+            ban_members=True,
+        )
+        self.assertEqual(
+            bot.permission_warnings(SimpleNamespace(guild_permissions=permissions)), []
+        )
+
     def test_invalid_optional_channel_id_is_rejected(self):
         values = {
             "DISCORD_BOT_TOKEN": "real-looking-test-token",
