@@ -13,7 +13,7 @@ set "AUTOMOD_WORKDIR=%~dp0"
 set "AUTOMOD_SHORTCUT=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Discord AutoMod Bot.lnk"
 
 if /i "%~1"=="--check" (
-    powershell -NoProfile -Command "$p=$env:AUTOMOD_SHORTCUT; if(-not (Test-Path -LiteralPath $p)){Write-Output '[NOT REGISTERED] Startup shortcut was not found.'; exit 2}; $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($p); if($s.TargetPath -ne $env:AUTOMOD_LAUNCHER){Write-Output '[INVALID] Startup shortcut points to a different launcher.'; exit 3}; Write-Output ('[OK] Startup shortcut: '+$s.TargetPath); exit 0"
+    powershell -NoProfile -Command "$p=$env:AUTOMOD_SHORTCUT; if(-not (Test-Path -LiteralPath $p)){Write-Output '[NOT REGISTERED] Startup shortcut was not found.'; exit 2}; $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($p); $expectedTarget=[IO.Path]::GetFullPath($env:AUTOMOD_LAUNCHER); $expectedWork=[IO.Path]::GetFullPath($env:AUTOMOD_WORKDIR).TrimEnd('\'); $actualTarget=[IO.Path]::GetFullPath($s.TargetPath); $actualWork=if($s.WorkingDirectory){[IO.Path]::GetFullPath($s.WorkingDirectory).TrimEnd('\')}else{''}; if($actualTarget -ne $expectedTarget){Write-Output '[INVALID] Startup shortcut points to a different launcher.'; exit 3}; if($actualWork -ne $expectedWork){Write-Output '[INVALID] Startup shortcut has a different working directory.'; exit 4}; if(-not [string]::IsNullOrWhiteSpace($s.Arguments)){Write-Output '[INVALID] Startup shortcut has unexpected arguments.'; exit 5}; Write-Output ('[OK] Startup shortcut: '+$s.TargetPath); Write-Output ('[OK] Working directory: '+$s.WorkingDirectory); Write-Output '[OK] Arguments: none'; exit 0"
     goto check_exit
 )
 

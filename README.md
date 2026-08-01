@@ -232,6 +232,9 @@ macOS/Linux의 cron에 등록해두면 됩니다.
 
 ## 주의사항
 
+- Windows 자동 시작 등록 상태는 `register_startup.bat --check`로 확인할 수 있습니다. 바로가기의
+  실행 대상, 작업 폴더, 예상하지 않은 추가 인수까지 검사합니다.
+
 - AI 판단은 100% 정확하지 않으므로, 처음에는 `STRIKE_THRESHOLDS`를 관대하게 설정하고
   로그 채널을 지켜보며 튜닝하는 것을 권장합니다.
 - 오탐(false positive) 방지를 위해 Gemini/Groq 둘 다 실패하면 안전하게 `NONE`(위반 없음)으로 처리합니다.
