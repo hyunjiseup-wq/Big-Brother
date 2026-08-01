@@ -243,6 +243,25 @@ async def reset_points(guild_id: int, user_id: int):
         await db.commit()
 
 
+async def redact_expired_violation_content(retention_days: int) -> int:
+    """보존 기간이 지난 완료 기록의 메시지 원문을 비우고 변경 건수를 반환한다."""
+    if retention_days <= 0:
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    async with _connect() as db:
+        cursor = await db.execute(
+            """UPDATE violation_log
+               SET message_content = NULL
+               WHERE created_at < ?
+                 AND message_content IS NOT NULL
+                 AND message_content != ''
+                 AND review_status NOT IN ('pending', 'processing')""",
+            (cutoff,),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
 async def log_violation(
     guild_id,
     user_id,

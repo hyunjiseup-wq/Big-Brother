@@ -1,5 +1,7 @@
 @echo off
 setlocal
+chcp 65001 >nul
+set "PYTHONUTF8=1"
 title Discord AutoMod Bot
 cd /d "%~dp0"
 
@@ -11,12 +13,28 @@ if not exist "%PYTHON%" (
     exit /b 1
 )
 
-"%PYTHON%" -c "import asyncio, discord, aiosqlite, httpx, dotenv, database; asyncio.run(database.init_db())" >nul 2>&1
+"%PYTHON%" -c "import discord, aiosqlite, httpx, dotenv" >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Required packages are missing or the environment is damaged.
     echo Reinstall requirements.lock and try again.
     pause
     exit /b 2
+)
+
+"%PYTHON%" -c "import asyncio, database; asyncio.run(database.init_db())"
+if errorlevel 1 (
+    echo [ERROR] The database could not be initialized.
+    echo Check AUTOMOD_DB_PATH and folder permissions. The detailed error is shown above.
+    pause
+    exit /b 4
+)
+
+"%PYTHON%" -c "import bot; bot.validate_runtime_environment()"
+if errorlevel 1 (
+    echo [ERROR] Required values in .env are missing or invalid.
+    echo Review the detailed error above and update .env.
+    pause
+    exit /b 5
 )
 
 if /i "%~1"=="--check" (

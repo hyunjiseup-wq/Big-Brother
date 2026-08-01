@@ -13,6 +13,36 @@ import database  # noqa: E402
 import learning  # noqa: E402
 
 
+class RuntimeEnvironmentTests(unittest.TestCase):
+    def test_valid_minimum_environment(self):
+        values = {
+            "DISCORD_BOT_TOKEN": "real-looking-test-token",
+            "GEMINI_API_KEY": "gemini-test-key",
+            "GROQ_API_KEY": "",
+            "LOG_CHANNEL_ID": "123456789",
+            "PUBLIC_LOG_CHANNEL_ID": "",
+            "REPORT_CHANNEL_ID": "",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            bot.validate_runtime_environment()
+
+    def test_missing_required_environment_is_rejected(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "DISCORD_BOT_TOKEN"):
+                bot.validate_runtime_environment()
+
+    def test_invalid_optional_channel_id_is_rejected(self):
+        values = {
+            "DISCORD_BOT_TOKEN": "real-looking-test-token",
+            "GEMINI_API_KEY": "gemini-test-key",
+            "LOG_CHANNEL_ID": "123456789",
+            "REPORT_CHANNEL_ID": "not-a-channel",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "REPORT_CHANNEL_ID"):
+                bot.validate_runtime_environment()
+
+
 def _message(content="bad text", guild_id=1, user_id=50, message_id=999):
     channel = SimpleNamespace(id=10, mention="#general")
     message = SimpleNamespace(

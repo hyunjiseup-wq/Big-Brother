@@ -37,7 +37,7 @@ import learning
 from filters import fast_check
 import moderator
 from moderator import classify_message, get_channel_note
-from batch_audit import run_full_audit
+from batch_audit import prune_expired_reports, run_full_audit
 
 # Windows 콘솔(cp949)은 이모지를 출력하지 못해 UnicodeEncodeError로
 # 이벤트 핸들러가 중단될 수 있으므로 표준 출력을 UTF-8로 강제한다.
@@ -64,6 +64,41 @@ def _env_int(name: str):
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID")
 PUBLIC_LOG_CHANNEL_ID = _env_int("PUBLIC_LOG_CHANNEL_ID")
+
+
+def validate_runtime_environment() -> None:
+    """네트워크 로그인 전에 필수 환경변수의 누락·형식 오류를 한 번에 알린다."""
+    errors = []
+    token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+    placeholder_markers = ("여기에_", "your_", "replace_me")
+    if not token or any(marker in token.casefold() for marker in placeholder_markers):
+        errors.append("DISCORD_BOT_TOKEN에 실제 봇 토큰을 설정해야 합니다.")
+
+    if not (os.environ.get("GEMINI_API_KEY", "").strip()
+            or os.environ.get("GROQ_API_KEY", "").strip()):
+        errors.append("실시간 AI 판단을 위해 GEMINI_API_KEY 또는 GROQ_API_KEY 중 하나가 필요합니다.")
+
+    raw_log_channel = os.environ.get("LOG_CHANNEL_ID", "").strip()
+    if not raw_log_channel:
+        errors.append("LOG_CHANNEL_ID를 설정해야 제재·장애·누락 로그를 확인할 수 있습니다.")
+    else:
+        try:
+            if int(raw_log_channel) <= 0:
+                raise ValueError
+        except ValueError:
+            errors.append("LOG_CHANNEL_ID는 양의 정수 Discord 채널 ID여야 합니다.")
+
+    for name in ("PUBLIC_LOG_CHANNEL_ID", "REPORT_CHANNEL_ID"):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                if int(raw) <= 0:
+                    raise ValueError
+            except ValueError:
+                errors.append(f"{name}는 비워두거나 양의 정수 Discord 채널 ID를 사용해야 합니다.")
+
+    if errors:
+        raise RuntimeError("환경 설정 오류:\n- " + "\n- ".join(errors))
 
 # 등급 서열 (공개 로그 최소 등급 비교용)
 _LEVEL_ORDER = {"MINOR": 1, "MODERATE": 2, "SEVERE": 3, "EXTREME": 4}
@@ -890,6 +925,14 @@ async def close():
 async def on_ready():
     global _workers_started
     await database.init_db()
+    redacted = await database.redact_expired_violation_content(
+        config.VIOLATION_CONTENT_RETENTION_DAYS
+    )
+    if redacted:
+        print(f"[privacy] 보존 기간이 지난 위반 로그 원문 {redacted}건을 익명화했습니다.")
+    removed_reports = prune_expired_reports(config.REPORT_RETENTION_DAYS)
+    if removed_reports:
+        print(f"[privacy] 보존 기간이 지난 감사 리포트 {removed_reports}개를 정리했습니다.")
     migrated = await learning.initialize()
     if migrated:
         print(f"[learning] 기존 오탐 이력 {migrated}건을 범위 지정 규칙으로 이전했습니다.")
@@ -1267,5 +1310,6 @@ def _acquire_single_instance_lock():
 
 
 if __name__ == "__main__":
+    validate_runtime_environment()
     _instance_lock = _acquire_single_instance_lock()
     bot.run(TOKEN)

@@ -4,6 +4,26 @@
 - STRIKE_THRESHOLDS: 누적 위반 점수(strike)에 따른 제재 단계
 - VIOLATION_LEVEL_POINTS: AI가 판단한 위반 등급별 부여 점수
 """
+import os
+
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+def _parse_channel_id_list(raw: str) -> list[int | str]:
+    """쉼표로 구분한 채널 ID를 파싱하며 오류 값은 시작 검증이 설명하도록 보존한다."""
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.append(int(item))
+        except ValueError:
+            values.append(item)
+    return values
 
 # ── 서버 규칙 (Escape from Tarkov 한국 커뮤니티 실제 약관 기반) ────────────
 # 원문 중 "음성 채팅방 이용 규정(B)"과 "인게임 매너(Ⅲ)"는 텍스트 채팅만 읽는 이 봇으로는
@@ -253,15 +273,21 @@ MIN_LENGTH_FOR_AI_CHECK = 4
 # 운영 규정에 따라 분류/태깅한 뒤 "리포트"만 만든다 (조치는 자동 실행하지 않음).
 # ══════════════════════════════════════════════════════════════════
 
-# 감사 대상 채널 ID 목록. 여기 등록된 채널만 배치 감사에서 수집한다.
-WATCHED_CHANNEL_IDS = [1441312515828224101, #자유
-                       719027398028296282, #PVP
-                       1412298919043661924, #PVE
-                       1412299355431632987, #Arena
-                       1475842559275438161, #PVE-TTS
-                       ]    
-    # 123456789012345678,
-    # 234567890123456789,
+# 감사 대상 채널 ID 목록. .env의 WATCHED_CHANNEL_IDS가 있으면 해당 값을 우선 사용한다.
+# 환경변수를 빈 값으로 두면 배치 감사를 비활성화할 수 있다.
+_DEFAULT_WATCHED_CHANNEL_IDS = [
+    1441312515828224101,  # 자유
+    719027398028296282,   # PVP
+    1412298919043661924,  # PVE
+    1412299355431632987,  # Arena
+    1475842559275438161,  # PVE-TTS
+]
+_watched_channel_ids_env = os.environ.get("WATCHED_CHANNEL_IDS")
+WATCHED_CHANNEL_IDS = (
+    _DEFAULT_WATCHED_CHANNEL_IDS
+    if _watched_channel_ids_env is None
+    else _parse_channel_id_list(_watched_channel_ids_env)
+)
 
 
 # 통합 실행(봇 상시 가동) 모드일 때 배치 감사를 실행할 시각 (24시간제, 한국 시간).
@@ -303,12 +329,22 @@ BATCH_FIRST_RUN_LOOKBACK_DAYS = 7
 # 한 채널에서 한 번의 감사 실행으로 수집하는 메시지 수 상한 (첫 실행 포함 폭주 방지)
 BATCH_MAX_MESSAGES_PER_CHANNEL = 3000
 
+# 위반 로그 원문 보존 기간(일). 0이면 자동 익명화를 하지 않는다.
+# 양수로 설정하면 봇 시작 시 해당 기간보다 오래된 완료 기록의 message_content를 비운다.
+# pending/processing 검수와 오탐 학습 데이터는 판단·학습에 필요하므로 대상에서 제외한다.
+VIOLATION_CONTENT_RETENTION_DAYS = 90
+
+# 로컬 감사 리포트 보존 기간(일). 0이면 자동 삭제하지 않는다.
+# 양수일 때만 REPORT_OUTPUT_DIR의 audit_report_*.md 파일을 대상으로 한다.
+REPORT_RETENTION_DAYS = 180
+
 
 def validate_config() -> None:
     """운영 중 무감시·과잉 제재를 만들 수 있는 잘못된 설정을 시작 시 차단한다."""
     errors = []
     valid_levels = {"NONE", "MINOR", "MODERATE", "SEVERE", "EXTREME"}
     valid_actions = {"NONE", "WARN", "DELETE", "TIMEOUT", "KICK", "BAN"}
+    valid_batch_backends = {"auto", "gemini", "groq", "ollama"}
 
     if MAX_CONCURRENT_AI_CALLS <= 0:
         errors.append("MAX_CONCURRENT_AI_CALLS는 1 이상이어야 합니다.")
@@ -327,23 +363,67 @@ def validate_config() -> None:
         errors.append("MIN_LENGTH_FOR_AI_CHECK는 0 이상이어야 합니다.")
     if BATCH_SIZE <= 0 or BATCH_MAX_MESSAGES_PER_CHANNEL <= 0:
         errors.append("배치 크기와 채널별 최대 메시지 수는 1 이상이어야 합니다.")
+    if BATCH_FIRST_RUN_LOOKBACK_DAYS <= 0 or BATCH_REVIEW_CARD_LIMIT < 0:
+        errors.append("배치 조회 기간은 양수이고 검토 카드 상한은 0 이상이어야 합니다.")
+    if (isinstance(VIOLATION_CONTENT_RETENTION_DAYS, bool)
+            or not isinstance(VIOLATION_CONTENT_RETENTION_DAYS, int)
+            or VIOLATION_CONTENT_RETENTION_DAYS < 0):
+        errors.append("VIOLATION_CONTENT_RETENTION_DAYS는 0 이상의 정수여야 합니다.")
+    if (isinstance(REPORT_RETENTION_DAYS, bool)
+            or not isinstance(REPORT_RETENTION_DAYS, int)
+            or REPORT_RETENTION_DAYS < 0):
+        errors.append("REPORT_RETENTION_DAYS는 0 이상의 정수여야 합니다.")
+    if BATCH_BACKEND not in valid_batch_backends:
+        errors.append("BATCH_BACKEND는 auto/gemini/groq/ollama 중 하나여야 합니다.")
+    if not isinstance(REPORT_OUTPUT_DIR, str) or not REPORT_OUTPUT_DIR.strip():
+        errors.append("REPORT_OUTPUT_DIR는 비어 있지 않은 문자열이어야 합니다.")
+    if not isinstance(OLLAMA_BASE_URL, str) or not OLLAMA_BASE_URL.startswith(("http://", "https://")):
+        errors.append("OLLAMA_BASE_URL은 http:// 또는 https://로 시작해야 합니다.")
+    if not all(isinstance(model, str) and model.strip()
+               for model in (GEMINI_MODEL, GROQ_MODEL, OLLAMA_MODEL)):
+        errors.append("AI 모델 이름은 비어 있지 않은 문자열이어야 합니다.")
     if not 0 <= BATCH_RUN_HOUR_KST <= 23:
         errors.append("BATCH_RUN_HOUR_KST는 0~23이어야 합니다.")
     if not 0 < STRIKE_DECAY_RATIO <= 1 or STRIKE_DECAY_DAYS <= 0:
         errors.append("점수 감쇠 기간은 양수이고 감쇠 비율은 0 초과 1 이하여야 합니다.")
     if set(VIOLATION_LEVEL_POINTS) != valid_levels:
         errors.append("VIOLATION_LEVEL_POINTS에는 5개 표준 등급이 모두 있어야 합니다.")
+    elif any(isinstance(points, bool) or not isinstance(points, (int, float)) or points < 0
+             for points in VIOLATION_LEVEL_POINTS.values()):
+        errors.append("VIOLATION_LEVEL_POINTS의 점수는 0 이상의 숫자여야 합니다.")
     if PUBLIC_LOG_MIN_LEVEL not in valid_levels - {"NONE"}:
         errors.append("PUBLIC_LOG_MIN_LEVEL 값이 올바르지 않습니다.")
     if AUTO_ACTION_CEILING not in {"WARN", "DELETE", "TIMEOUT"}:
         errors.append("AUTO_ACTION_CEILING은 WARN/DELETE/TIMEOUT 중 하나여야 합니다.")
     if IMMEDIATE_ACTION_FOR_EXTREME not in valid_actions | {None}:
         errors.append("IMMEDIATE_ACTION_FOR_EXTREME 값이 올바르지 않습니다.")
-    thresholds = [threshold for threshold, _, _ in STRIKE_THRESHOLDS]
-    if thresholds != sorted(thresholds) or len(thresholds) != len(set(thresholds)):
-        errors.append("STRIKE_THRESHOLDS 임계값은 중복 없이 오름차순이어야 합니다.")
-    if any(action not in valid_actions for _, action, _ in STRIKE_THRESHOLDS):
-        errors.append("STRIKE_THRESHOLDS에 알 수 없는 조치가 있습니다.")
+    threshold_rows_valid = all(isinstance(row, (tuple, list)) and len(row) == 3
+                               for row in STRIKE_THRESHOLDS)
+    if not threshold_rows_valid:
+        errors.append("STRIKE_THRESHOLDS의 각 항목은 (점수, 조치, 시간) 형식이어야 합니다.")
+    else:
+        thresholds = [row[0] for row in STRIKE_THRESHOLDS]
+        numeric_thresholds = all(
+            not isinstance(value, bool) and isinstance(value, (int, float)) and value >= 0
+            for value in thresholds
+        )
+        if not numeric_thresholds:
+            errors.append("STRIKE_THRESHOLDS 임계값은 0 이상의 숫자여야 합니다.")
+        elif thresholds != sorted(thresholds) or len(thresholds) != len(set(thresholds)):
+            errors.append("STRIKE_THRESHOLDS 임계값은 중복 없이 오름차순이어야 합니다.")
+        if any(row[1] not in valid_actions for row in STRIKE_THRESHOLDS):
+            errors.append("STRIKE_THRESHOLDS에 알 수 없는 조치가 있습니다.")
+        if any((row[1] == "TIMEOUT" and
+                (isinstance(row[2], bool) or not isinstance(row[2], (int, float)) or row[2] <= 0))
+               for row in STRIKE_THRESHOLDS):
+            errors.append("TIMEOUT 조치에는 0보다 큰 제한 시간(분)이 필요합니다.")
+    if AUTO_ACTION_CEILING == "TIMEOUT" and AUTO_ACTION_CEILING_TIMEOUT_MINUTES <= 0:
+        errors.append("자동 조치 상한이 TIMEOUT이면 제한 시간은 0보다 커야 합니다.")
+    if IMMEDIATE_ACTION_FOR_EXTREME == "TIMEOUT" and IMMEDIATE_TIMEOUT_MINUTES <= 0:
+        errors.append("EXTREME 즉시 조치가 TIMEOUT이면 제한 시간은 0보다 커야 합니다.")
+    if any(isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0
+           for channel_id in WATCHED_CHANNEL_IDS):
+        errors.append("WATCHED_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다.")
     if len(WATCHED_CHANNEL_IDS) != len(set(WATCHED_CHANNEL_IDS)):
         errors.append("WATCHED_CHANNEL_IDS에 중복 채널이 있습니다.")
 

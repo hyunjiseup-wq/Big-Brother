@@ -76,6 +76,34 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rules[0][1:3], (10, "safe message"))
         self.assertFalse(await database.release_review(review_id, 1))
 
+    async def test_retention_redacts_only_old_completed_content(self):
+        old = time.time() - 100 * 86400
+        async with aiosqlite.connect(database.DB_PATH) as db:
+            for message_id, status, created_at in (
+                (101, "not_required", old),
+                (102, "pending", old),
+                (103, "not_required", time.time()),
+            ):
+                await db.execute(
+                    """INSERT INTO violation_log
+                       (guild_id, user_id, channel_id, message_id, message_content, level,
+                        review_status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (1, 2, 3, message_id, f"content-{message_id}", "MINOR", status, created_at),
+                )
+            await db.commit()
+
+        self.assertEqual(await database.redact_expired_violation_content(90), 1)
+        async with aiosqlite.connect(database.DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT message_id, message_content FROM violation_log ORDER BY message_id"
+            )
+            rows = await cursor.fetchall()
+        self.assertEqual(rows, [(101, None), (102, "content-102"), (103, "content-103")])
+
+    async def test_zero_retention_disables_redaction(self):
+        self.assertEqual(await database.redact_expired_violation_content(0), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

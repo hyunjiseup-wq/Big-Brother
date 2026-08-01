@@ -57,6 +57,7 @@ discord-automod/
 ## 설치
 
 Windows에서는 OneDrive가 가상환경 파일을 잠글 수 있으므로 동기화 폴더 밖의 전용 환경을 권장합니다.
+아래 전용 Python 3.13 환경을 사용하며, 프로젝트 상위 폴더의 `venv`는 사용하지 않습니다.
 
 ```bat
 cd discord-automod
@@ -89,6 +90,8 @@ python -m pip install -r requirements.lock
    - `LOG_CHANNEL_ID`: 제재 로그를 남길 채널의 ID (채널 우클릭 → ID 복사, 개발자 모드 필요).
    - `AUTOMOD_DB_PATH`(선택): SQLite 파일 경로. OneDrive/Dropbox 같은 동기화 폴더 밖의
      로컬 경로를 권장합니다. 비워두면 프로젝트 폴더의 `automod.db`를 사용합니다.
+   - `WATCHED_CHANNEL_IDS`(선택): 배치 감사 대상 채널 ID를 쉼표로 구분합니다.
+     `.env`에 이 키가 있으면 `config.py`의 기본 목록보다 우선하며, 빈 값이면 배치 감사를 비활성화합니다.
 
 2. `config.py`의 `SERVER_RULES`를 실제 서버 규칙으로 수정하세요. AI는 이 텍스트를
    그대로 판단 기준으로 사용합니다. 규칙을 구체적으로 쓸수록 판단 정확도가 올라갑니다.
@@ -103,6 +106,8 @@ python -m pip install -r requirements.lock
 ## 실행
 
 - Windows: `run_bot.bat`을 더블클릭합니다.
+- 설치 및 DB 설정 점검: `run_bot.bat --check` (한글/공백이 포함된 경로도 지원)
+  이 점검은 Python 패키지, SQLite 접근, 필수 토큰/API 키와 채널 ID 형식을 확인하며 Discord에는 로그인하지 않습니다.
 - 자동 시작 등록: `register_startup.bat`을 한 번 실행합니다.
 - Linux/macOS: 활성화한 가상환경에서 `python bot.py`를 실행합니다.
 
@@ -169,7 +174,7 @@ python -m pip install -r requirements.lock
 
 ### 배치 감사 설정
 
-1. `config.py`의 `WATCHED_CHANNEL_IDS`에 감시할 채널 ID를 등록합니다.
+1. `.env`의 `WATCHED_CHANNEL_IDS`에 감시할 채널 ID를 쉼표로 구분해 등록합니다.
 2. `BATCH_BACKEND`로 기본 판단 백엔드를 고릅니다: `"auto"`(Gemini→Groq 폴백, 기본) / `"gemini"` / `"groq"` / `"ollama"`.
 3. 로컬 Ollama를 쓰려면 [Ollama](https://ollama.com)를 설치하고 `ollama pull qwen2.5:14b`(또는 원하는 모델)로
    받은 뒤, `config.py`의 `OLLAMA_MODEL`을 맞춰주세요. 한국어 뉘앙스 판단이 중요하므로 한국어 성능이
@@ -226,3 +231,8 @@ macOS/Linux의 cron에 등록해두면 됩니다.
 - 자동 조치 모드에서 **실제로 집행에 성공한 제재만 누적 점수에 반영**됩니다. 권한 부족 등으로
   조치가 실패하면 점수를 올리지 않아, 제재받지 않은 유저가 다음 위반에서 과잉 처벌되는 일을 막습니다.
 - `STRIKE_DECAY_DAYS`(기본 30일)가 지나면 점수가 자동으로 절반 감소합니다.
+- 개인정보 보호를 위해 `config.VIOLATION_CONTENT_RETENTION_DAYS`의 기본값은 90일입니다.
+  기간이 지난 완료 기록의 메시지 원문만 비우며, `0`으로 설정하면 자동 익명화를 비활성화합니다.
+  아직 검토 중인 기록과 오탐 학습 데이터는 자동 익명화 대상에서 제외됩니다.
+- `config.REPORT_RETENTION_DAYS`의 기본값은 180일입니다. `REPORT_OUTPUT_DIR` 안의 오래된
+  `audit_report_*.md`만 정리하며 백업과 다른 파일은 삭제하지 않습니다. `0`이면 비활성화됩니다.

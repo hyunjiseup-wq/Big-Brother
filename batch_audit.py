@@ -17,6 +17,7 @@ import os
 import argparse
 import asyncio
 import datetime
+from pathlib import Path
 from collections import defaultdict
 
 import discord
@@ -210,6 +211,24 @@ def save_report_file(report_text: str) -> str:
     with open(path, "w", encoding="utf-8") as f:
         f.write(report_text)
     return path
+
+
+def prune_expired_reports(retention_days: int) -> int:
+    """설정된 기간보다 오래된 감사 리포트만 삭제하고 삭제 건수를 반환한다."""
+    if retention_days <= 0:
+        return 0
+    report_dir = Path(config.REPORT_OUTPUT_DIR)
+    if not report_dir.is_dir():
+        return 0
+    cutoff = datetime.datetime.now().timestamp() - retention_days * 86400
+    removed = 0
+    for path in report_dir.glob("audit_report_*.md"):
+        # 링크를 따라 외부 파일을 지우지 않고 일반 파일만 정리한다.
+        if path.is_symlink() or not path.is_file() or path.stat().st_mtime >= cutoff:
+            continue
+        path.unlink()
+        removed += 1
+    return removed
 
 
 async def send_report_to_discord(guild: discord.Guild, report_text: str, file_path: str):

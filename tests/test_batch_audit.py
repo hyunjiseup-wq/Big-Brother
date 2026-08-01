@@ -1,4 +1,6 @@
 import datetime
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -80,6 +82,36 @@ class BatchAuditCheckpointTests(unittest.IsolatedAsyncioTestCase):
         classifier.assert_not_awaited()
         checkpoint.assert_awaited_once_with(1, 10, 2)
         self.assertEqual(result["reviewed_count"], 2)
+
+
+class ReportRetentionTests(unittest.TestCase):
+    def test_prunes_only_old_matching_report_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            batch_audit.config, "REPORT_OUTPUT_DIR", temp_dir
+        ):
+            old_report = os.path.join(temp_dir, "audit_report_20200101_000000.md")
+            new_report = os.path.join(temp_dir, "audit_report_20990101_000000.md")
+            unrelated = os.path.join(temp_dir, "notes.md")
+            for path in (old_report, new_report, unrelated):
+                with open(path, "w", encoding="utf-8") as file:
+                    file.write("test")
+            old_time = datetime.datetime.now().timestamp() - 100 * 86400
+            os.utime(old_report, (old_time, old_time))
+
+            self.assertEqual(batch_audit.prune_expired_reports(90), 1)
+            self.assertFalse(os.path.exists(old_report))
+            self.assertTrue(os.path.exists(new_report))
+            self.assertTrue(os.path.exists(unrelated))
+
+    def test_zero_retention_disables_report_pruning(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            batch_audit.config, "REPORT_OUTPUT_DIR", temp_dir
+        ):
+            report = os.path.join(temp_dir, "audit_report_20200101_000000.md")
+            with open(report, "w", encoding="utf-8") as file:
+                file.write("test")
+            self.assertEqual(batch_audit.prune_expired_reports(0), 0)
+            self.assertTrue(os.path.exists(report))
 
 
 if __name__ == "__main__":
