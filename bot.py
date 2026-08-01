@@ -939,7 +939,23 @@ async def batch_audit_task():
 
 @bot.event
 async def close():
-    """봇 종료 시 공유 HTTP 클라이언트를 정리한 뒤 기본 종료 절차를 진행한다."""
+    """진행 중인 자체 작업을 정리한 뒤 Discord와 공유 HTTP 연결을 닫는다."""
+    global _workers_started
+
+    # tasks.loop는 다음 실행 시각을 기다리는 내부 Task를 갖는다. Discord 연결을 먼저
+    # 닫으면 종료 도중 감사가 시작될 수 있으므로 가장 먼저 중단한다.
+    if batch_audit_task.is_running():
+        batch_audit_task.cancel()
+
+    # ai_worker는 Queue.get()에서 계속 대기하므로 명시적으로 취소해야 정상 종료 시
+    # "Task was destroyed but it is pending" 경고와 미완료 작업 잔존을 막을 수 있다.
+    pending = [task for task in tuple(_background_tasks) if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    _workers_started = False
+
     await moderator.aclose_http_client()
     await commands.Bot.close(bot)
 

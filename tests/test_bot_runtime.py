@@ -1,5 +1,6 @@
 """bot.py 핵심 런타임 흐름(조치 결정·점수 반영·AI 장애·큐 누락) 회귀 테스트."""
 import os
+import asyncio
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -245,6 +246,42 @@ class DropAlertTests(unittest.IsolatedAsyncioTestCase):
             await bot._alert_drops(guild)
             await bot._alert_drops(guild)
         self.assertEqual(send_log.await_count, 1)
+
+
+class GracefulShutdownTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        bot._background_tasks.clear()
+        bot._workers_started = True
+
+    async def asyncTearDown(self):
+        for task in tuple(bot._background_tasks):
+            task.cancel()
+        bot._background_tasks.clear()
+        bot._workers_started = False
+
+    async def test_close_cancels_background_workers_before_connections(self):
+        started = asyncio.Event()
+
+        async def waiting_worker():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = bot._spawn(waiting_worker())
+        await started.wait()
+
+        with (
+            patch.object(bot.batch_audit_task, "is_running", return_value=True),
+            patch.object(bot.batch_audit_task, "cancel") as cancel_audit,
+            patch.object(bot.moderator, "aclose_http_client", new=AsyncMock()) as close_http,
+            patch.object(bot.commands.Bot, "close", new=AsyncMock()) as close_discord,
+        ):
+            await bot.close()
+
+        cancel_audit.assert_called_once_with()
+        self.assertTrue(task.cancelled())
+        self.assertFalse(bot._workers_started)
+        close_http.assert_awaited_once_with()
+        close_discord.assert_awaited_once_with(bot.bot)
 
 
 if __name__ == "__main__":
