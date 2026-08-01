@@ -38,6 +38,15 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_initialized_database_passes_integrity_check(self):
         await database.validate_database_integrity()
 
+    async def test_corrupt_existing_database_is_rejected_before_initialization(self):
+        corrupt_path = os.path.join(self.temp_dir.name, "corrupt.db")
+        with open(corrupt_path, "wb") as file:
+            file.write(b"not a sqlite database")
+        database.DB_PATH = corrupt_path
+
+        with self.assertRaises(aiosqlite.DatabaseError):
+            await database.init_db()
+
     async def test_decay_read_cannot_overwrite_concurrent_add(self):
         old = time.time() - 31 * 86400
         async with aiosqlite.connect(database.DB_PATH) as db:

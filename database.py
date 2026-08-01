@@ -35,9 +35,20 @@ async def _ensure_column(db, table: str, column: str, declaration: str):
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
+async def _validate_connection_integrity(db) -> None:
+    cursor = await db.execute("PRAGMA quick_check;")
+    messages = [str(row[0]) for row in await cursor.fetchall()]
+    if messages != ["ok"]:
+        summary = "; ".join(messages[:5]) or "결과 없음"
+        raise RuntimeError(f"SQLite 무결성 검사 실패: {summary}")
+
+
 async def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     async with _connect() as db:
+        # 기존 파일은 journal mode 변경이나 스키마 마이그레이션보다 먼저 검사한다.
+        # 직접 `python bot.py`로 실행해 run_bot.bat을 거치지 않아도 동일하게 보호된다.
+        await _validate_connection_integrity(db)
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
         await db.execute("""
@@ -163,12 +174,7 @@ async def init_db():
 async def validate_database_integrity() -> None:
     """SQLite가 보고하는 구조/페이지 손상을 시작 전에 감지한다."""
     async with _connect() as db:
-        cursor = await db.execute("PRAGMA quick_check;")
-        rows = await cursor.fetchall()
-    messages = [str(row[0]) for row in rows]
-    if messages != ["ok"]:
-        summary = "; ".join(messages[:5]) or "결과 없음"
-        raise RuntimeError(f"SQLite 무결성 검사 실패: {summary}")
+        await _validate_connection_integrity(db)
 
 
 async def _apply_decay(db, guild_id: int, user_id: int, row):
