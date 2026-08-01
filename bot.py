@@ -1163,6 +1163,7 @@ async def show_commands(ctx):
         value=(
             "`!BB 점수초기화 @유저` — 유저의 누적 점수 초기화\n"
             "`!BB 오탐취소 <규칙번호>` — 잘못 등록한 오탐 학습 규칙 취소\n"
+            "`!BB 검토복구 <번호>` — 중단된 검수를 확인 후 다시 대기 상태로 전환\n"
             "`!BB 감사실행 [backend]` — 배치 감사를 지금 바로 실행 (gemini/groq/ollama/auto)"
         ),
         inline=False,
@@ -1211,8 +1212,9 @@ async def show_pending_reviews(ctx, hours: int = 72):
     """
     rows = await database.get_pending_reviews(ctx.guild.id, hours=hours)
     uncarded = await database.get_reviews_without_card(ctx.guild.id)
+    stalled = await database.get_stale_processing_reviews(ctx.guild.id)
 
-    if not rows and not uncarded:
+    if not rows and not uncarded and not stalled:
         await ctx.send(f"✅ 최근 {hours}시간 내 관리자 검토가 필요한 건이 없습니다.")
         return
 
@@ -1244,7 +1246,34 @@ async def show_pending_reviews(ctx, hours: int = 72):
                    + "\n".join(lines))[:1024],
             inline=False,
         )
+    if stalled:
+        lines = []
+        for review_id, user_id, channel_id, level, action, _started_at in stalled:
+            member = ctx.guild.get_member(user_id)
+            who = member.mention if member else f"(ID: {user_id})"
+            lines.append(f"`#{review_id}` {who} · {level} · <#{channel_id}> · {action}")
+        embed.add_field(
+            name=f"⛔ 처리 중 중단 의심 {len(stalled)}건",
+            value=("Discord 감사 로그와 대상 상태를 먼저 확인하세요. 제재가 적용되지 않은 것이 "
+                   "확실한 건만 `!BB 검토복구 <번호>`로 복구할 수 있습니다.\n"
+                   + "\n".join(lines))[:1024],
+            inline=False,
+        )
     await ctx.send(embed=embed)
+
+
+@bot.command(name="검토복구")
+@commands.has_permissions(administrator=True)
+async def recover_review_cmd(ctx, review_id: int):
+    """외부 제재 미적용을 관리자가 확인한 중단 검수를 다시 누를 수 있게 한다."""
+    recovered = await database.recover_processing_review(review_id, ctx.guild.id)
+    if recovered:
+        await ctx.send(
+            f"✅ 검토 `#{review_id}`을 대기 상태로 복구했습니다. 기존 카드에서 다시 처리하세요. "
+            "이미 제재가 적용된 건이었다면 중복 실행될 수 있으니 대상 상태를 반드시 확인하세요."
+        )
+    else:
+        await ctx.send("⚠️ 해당 서버에서 처리 중인 검토 건을 찾지 못했습니다.")
 
 
 @bot.command(name="감사실행")

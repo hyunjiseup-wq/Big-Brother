@@ -85,13 +85,8 @@ async def init_db():
         # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
         # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
         await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
-        # 프로세스가 검수 도중 종료된 경우 다음 시작에서 다시 처리할 수 있게 복구한다.
-        await db.execute(
-            "UPDATE violation_log SET review_status = 'pending', reviewed_at = NULL "
-            "WHERE review_status = 'processing' "
-            "AND (reviewed_at IS NULL OR reviewed_at < ?)",
-            (time.time() - 600,),
-        )
+        # processing 상태는 자동으로 pending으로 되돌리지 않는다. 외부 제재 성공 직후
+        # DB 확정 전에 프로세스가 종료됐을 수 있어 자동 재시도하면 중복 제재가 된다.
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channel_checkpoints (
@@ -382,6 +377,33 @@ async def release_review(review_id: int, guild_id: int):
             (review_id, guild_id),
         )
         await db.commit()
+
+
+async def get_stale_processing_reviews(guild_id: int, minutes: int = 10, limit: int = 10):
+    """처리가 시작된 뒤 오래 완료되지 않은 검수 건을 관리자 확인용으로 조회한다."""
+    before = time.time() - max(1, minutes) * 60
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT id, user_id, channel_id, level, action_taken, reviewed_at
+               FROM violation_log
+               WHERE guild_id = ? AND review_status = 'processing'
+                 AND (reviewed_at IS NULL OR reviewed_at < ?)
+               ORDER BY reviewed_at ASC LIMIT ?""",
+            (guild_id, before, limit),
+        )
+        return await cursor.fetchall()
+
+
+async def recover_processing_review(review_id: int, guild_id: int) -> bool:
+    """관리자가 외부 제재 미적용을 확인한 processing 건만 다시 pending으로 돌린다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "UPDATE violation_log SET review_status = 'pending', reviewed_at = NULL "
+            "WHERE id = ? AND guild_id = ? AND review_status = 'processing'",
+            (review_id, guild_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 async def resolve_review(
