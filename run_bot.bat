@@ -21,6 +21,11 @@ if errorlevel 1 (
     exit /b 2
 )
 
+if /i "%~1"=="--backup-db" (
+    "%PYTHON%" -c "import asyncio, database; p=asyncio.run(database.create_database_backup()); print('Database backup created: '+str(p))"
+    exit /b %errorlevel%
+)
+
 "%PYTHON%" -c "import asyncio, database; asyncio.run(database.init_db()); asyncio.run(database.validate_database_integrity())"
 if errorlevel 1 (
     echo [ERROR] The database could not be initialized or failed its integrity check.
@@ -42,14 +47,15 @@ if /i "%~1"=="--check" (
     exit /b 0
 )
 
-if /i "%~1"=="--backup-db" (
-    "%PYTHON%" -c "import asyncio, database; p=asyncio.run(database.create_database_backup()); print('Database backup created: '+str(p))"
-    exit /b %errorlevel%
-)
-
 if /i "%~1"=="--check-network" (
     "%PYTHON%" network_check.py
     exit /b %errorlevel%
+)
+
+if not "%~1"=="" (
+    echo [ERROR] Unknown option: %~1
+    echo Supported options: --check, --check-network, --backup-db
+    exit /b 6
 )
 
 set /a RETRIES=0

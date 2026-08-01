@@ -28,6 +28,16 @@ class BotLauncherTests(unittest.TestCase):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn('if /i "%~1"=="--backup-db"', script)
         self.assertIn("database.create_database_backup()", script)
+        self.assertLess(
+            script.index('if /i "%~1"=="--backup-db"'),
+            script.index("database.init_db()"),
+        )
+
+    def test_unknown_option_is_rejected_before_bot_loop(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn('if not "%~1"==""', script)
+        self.assertIn("exit /b 6", script)
+        self.assertLess(script.index("Unknown option"), script.index("set /a RETRIES=0"))
 
     def test_normal_exit_does_not_restart(self):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
