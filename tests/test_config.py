@@ -44,3 +44,8 @@ class ConfigValidationTests(unittest.TestCase):
         with patch.object(config, "REPORT_RETENTION_DAYS", -1):
             with self.assertRaisesRegex(ValueError, "REPORT_RETENTION_DAYS"):
                 config.validate_config()
+
+    def test_administrator_permission_policy_must_be_boolean(self):
+        with patch.object(config, "ALLOW_ADMINISTRATOR_PERMISSION", "yes"):
+            with self.assertRaisesRegex(ValueError, "ALLOW_ADMINISTRATOR_PERMISSION"):
+                config.validate_config()

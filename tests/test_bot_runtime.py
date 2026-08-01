@@ -41,8 +41,21 @@ class PermissionWarningTests(unittest.TestCase):
             kick_members=True,
             ban_members=True,
         )
-        warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
+        with patch.object(bot.config, "ALLOW_ADMINISTRATOR_PERMISSION", False):
+            warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
         self.assertTrue(any("Administrator" in warning for warning in warnings))
+
+    def test_explicitly_allowed_administrator_has_no_warning(self):
+        permissions = SimpleNamespace(
+            administrator=True,
+            manage_messages=True,
+            moderate_members=True,
+            kick_members=True,
+            ban_members=True,
+        )
+        with patch.object(bot.config, "ALLOW_ADMINISTRATOR_PERMISSION", True):
+            warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
+        self.assertEqual(warnings, [])
 
     def test_missing_required_permissions_are_listed(self):
         permissions = SimpleNamespace(

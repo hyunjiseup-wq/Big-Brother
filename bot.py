@@ -107,7 +107,7 @@ def permission_warnings(member) -> list[str]:
     if permissions is None:
         return ["봇의 서버 권한을 확인할 수 없습니다."]
     warnings = []
-    if permissions.administrator:
+    if permissions.administrator and not config.ALLOW_ADMINISTRATOR_PERMISSION:
         warnings.append(
             "Administrator 권한이 부여돼 있습니다. 탈취·오작동 피해를 줄이려면 제거하고 "
             "메시지 관리, 멤버 타임아웃, 추방, 차단 권한만 부여하세요."

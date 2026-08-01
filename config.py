@@ -167,6 +167,10 @@ FLAG_DOWNGRADED_FOR_REVIEW = True
 # (예: "<@&역할ID>" 또는 "<@유저ID>"). 비워두면 멘션 없이 임베드만 강조 표시.
 ADMIN_REVIEW_MENTION = ""
 
+# 운영 정책상 봇 역할에 Administrator 권한을 유지하는 경우 True.
+# True이면 로그인 시 과도 권한 경고를 생략하지만 필수 권한 누락 검사는 계속 수행한다.
+ALLOW_ADMINISTRATOR_PERMISSION = True
+
 # ── 익명화된 제재 로그 공개 (운영 투명성) ─────────────────────────────
 # 커뮤니티 공지의 "제재 로그 공개 기능"에 해당: 경고/제재가 이루어질 때
 # 특정 유저를 지칭하지 않는 범위(닉네임/ID/멘션/원문 제외)에서 위반 사유와
@@ -395,6 +399,8 @@ def validate_config() -> None:
         errors.append("PUBLIC_LOG_MIN_LEVEL 값이 올바르지 않습니다.")
     if AUTO_ACTION_CEILING not in {"WARN", "DELETE", "TIMEOUT"}:
         errors.append("AUTO_ACTION_CEILING은 WARN/DELETE/TIMEOUT 중 하나여야 합니다.")
+    if not isinstance(ALLOW_ADMINISTRATOR_PERMISSION, bool):
+        errors.append("ALLOW_ADMINISTRATOR_PERMISSION은 True 또는 False여야 합니다.")
     if IMMEDIATE_ACTION_FOR_EXTREME not in valid_actions | {None}:
         errors.append("IMMEDIATE_ACTION_FOR_EXTREME 값이 올바르지 않습니다.")
     threshold_rows_valid = all(isinstance(row, (tuple, list)) and len(row) == 3

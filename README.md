@@ -103,9 +103,9 @@ python -m pip install -r requirements.lock
    - 멤버 차단 (Ban Members)
    - 채널 보기 / 메시지 보내기
 
-   `Administrator` 권한은 필요하지 않으며 권장하지 않습니다. 위 권한만 개별 부여하면
-   봇 토큰 탈취나 오작동이 발생했을 때 피해 범위를 줄일 수 있습니다. 봇은 로그인 시
-   관리자 권한이 있거나 필수 권한이 빠진 서버를 콘솔에 경고합니다.
+   최소 권한 운영 시에는 위 권한만 개별 부여할 수 있습니다. 현재 운영 정책은
+   `config.ALLOW_ADMINISTRATOR_PERMISSION=True`로 Administrator 권한 유지를 명시적으로 허용합니다.
+   이를 `False`로 바꾸면 로그인 시 관리자 권한을 경고합니다. 필수 권한 누락 검사는 설정과 무관하게 유지됩니다.
 
 ## 실행
 
