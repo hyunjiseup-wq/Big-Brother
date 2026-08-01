@@ -25,6 +25,23 @@ async def _check_response(client: httpx.AsyncClient, name: str, url: str, header
         return f"[FAIL] {name}: {type(error).__name__}"
 
 
+async def _check_groq_model(client: httpx.AsyncClient, api_key: str, model: str) -> str:
+    """슬래시가 포함된 Groq 모델 ID는 목록 API에서 정확히 일치하는지 확인한다."""
+    name = f"Groq model {model}"
+    try:
+        response = await client.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        response.raise_for_status()
+        model_ids = {item.get("id") for item in response.json().get("data", [])}
+        return f"[OK] {name}" if model in model_ids else f"[FAIL] {name}: not found"
+    except httpx.HTTPStatusError as error:
+        return f"[FAIL] {name}: HTTP {error.response.status_code}"
+    except (httpx.HTTPError, ValueError, TypeError) as error:
+        return f"[FAIL] {name}: {type(error).__name__}"
+
+
 async def run_network_checks() -> int:
     """읽기 전용 상태 확인을 실행하고 하나라도 실패하면 1을 반환한다."""
     checks = []
@@ -54,12 +71,7 @@ async def run_network_checks() -> int:
             print("[SKIP] Gemini: GEMINI_API_KEY missing")
 
         if groq_key:
-            checks.append(_check_response(
-                client,
-                f"Groq model {config.GROQ_MODEL}",
-                f"https://api.groq.com/openai/v1/models/{quote(config.GROQ_MODEL, safe='')}",
-                {"Authorization": f"Bearer {groq_key}"},
-            ))
+            checks.append(_check_groq_model(client, groq_key, config.GROQ_MODEL))
         else:
             print("[SKIP] Groq: GROQ_API_KEY missing")
 
