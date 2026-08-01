@@ -1,8 +1,11 @@
 """유저별 위반 점수와 검수 이력을 관리하는 SQLite 저장소."""
 
+import asyncio
+import datetime
 import os
+import sqlite3
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 import aiosqlite
@@ -175,6 +178,37 @@ async def validate_database_integrity() -> None:
     """SQLite가 보고하는 구조/페이지 손상을 시작 전에 감지한다."""
     async with _connect() as db:
         await _validate_connection_integrity(db)
+
+
+def _backup_database_sync(source: Path, destination: Path) -> None:
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    try:
+        # Connection의 일반 context manager는 commit/rollback만 하고 close하지 않는다.
+        # Windows에서는 열린 파일을 rename할 수 없으므로 closing으로 핸들을 먼저 닫는다.
+        with closing(sqlite3.connect(source)) as source_db:
+            with closing(sqlite3.connect(partial)) as backup_db:
+                source_db.backup(backup_db)
+                result = backup_db.execute("PRAGMA quick_check;").fetchall()
+                if result != [("ok",)]:
+                    raise RuntimeError("생성된 SQLite 백업의 무결성 검사에 실패했습니다.")
+        partial.replace(destination)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+async def create_database_backup(output_dir: str | os.PathLike | None = None) -> Path:
+    """실행 중인 WAL DB도 일관되게 복사하는 명시적 수동 백업을 만든다."""
+    await validate_database_integrity()
+    source = Path(DB_PATH).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"백업할 DB 파일이 없습니다: {source}")
+    directory = Path(output_dir or Path(__file__).resolve().parent / "backups").resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    destination = directory / f"automod_backup_{stamp}.db"
+    await asyncio.to_thread(_backup_database_sync, source, destination)
+    return destination
 
 
 async def _apply_decay(db, guild_id: int, user_id: int, row):

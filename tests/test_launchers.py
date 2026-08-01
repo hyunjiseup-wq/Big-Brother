@@ -24,6 +24,11 @@ class BotLauncherTests(unittest.TestCase):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn("database.validate_database_integrity()", script)
 
+    def test_manual_database_backup_option_is_available(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn('if /i "%~1"=="--backup-db"', script)
+        self.assertIn("database.create_database_backup()", script)
+
     def test_normal_exit_does_not_restart(self):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn('if "%BOT_EXIT%"=="0" goto stopped', script)

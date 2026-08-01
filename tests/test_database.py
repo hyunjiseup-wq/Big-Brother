@@ -47,6 +47,21 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(aiosqlite.DatabaseError):
             await database.init_db()
 
+    async def test_online_backup_is_complete_and_valid(self):
+        await database.add_points(1, 77, 3)
+        backup_dir = os.path.join(self.temp_dir.name, "backups")
+        backup_path = await database.create_database_backup(backup_dir)
+
+        self.assertTrue(backup_path.is_file())
+        async with aiosqlite.connect(backup_path) as backup_db:
+            points = await (await backup_db.execute(
+                "SELECT points FROM strikes WHERE guild_id = 1 AND user_id = 77"
+            )).fetchone()
+            check = await (await backup_db.execute("PRAGMA quick_check")).fetchone()
+        self.assertEqual(points, (3.0,))
+        self.assertEqual(check, ("ok",))
+        self.assertEqual(list(backup_path.parent.glob("*.partial")), [])
+
     async def test_decay_read_cannot_overwrite_concurrent_add(self):
         old = time.time() - 31 * 86400
         async with aiosqlite.connect(database.DB_PATH) as db:

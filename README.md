@@ -115,6 +115,9 @@ python -m pip install -r requirements.lock
 - 읽기 전용 외부 연결 점검: `run_bot.bat --check-network`
   Discord 봇 토큰·설정 채널 조회와 Gemini/Groq 모델 조회 API를 확인하며
   메시지 생성·전송이나 제재는 수행하지 않습니다.
+- 수동 DB 백업: `run_bot.bat --backup-db`
+  SQLite 온라인 백업 API로 WAL의 최신 기록까지 일관되게 `backups/`에 복사하고 결과 파일의
+  무결성을 검사합니다. 백업에는 메시지 원문이 포함될 수 있으므로 필요한 시점에만 실행하고 안전하게 보관하세요.
 - 자동 시작 등록: `register_startup.bat`을 한 번 실행합니다.
 - 자동 시작 상태만 확인: `register_startup.bat --check` (등록하거나 변경하지 않음)
 - 실행기는 오류 종료가 연속될 때만 최대 5회 재시작합니다. 정상 종료는 다시 실행하지 않으며,

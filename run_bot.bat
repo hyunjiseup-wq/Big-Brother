@@ -42,6 +42,11 @@ if /i "%~1"=="--check" (
     exit /b 0
 )
 
+if /i "%~1"=="--backup-db" (
+    "%PYTHON%" -c "import asyncio, database; p=asyncio.run(database.create_database_backup()); print('Database backup created: '+str(p))"
+    exit /b %errorlevel%
+)
+
 if /i "%~1"=="--check-network" (
     "%PYTHON%" network_check.py
     exit /b %errorlevel%
