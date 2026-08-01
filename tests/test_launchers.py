@@ -19,5 +19,18 @@ class StartupLauncherTests(unittest.TestCase):
         self.assertIn("$s.WorkingDirectory=$env:AUTOMOD_WORKDIR", script)
 
 
+class BotLauncherTests(unittest.TestCase):
+    def test_normal_exit_does_not_restart(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn('if "%BOT_EXIT%"=="0" goto stopped', script)
+        self.assertIn(":stopped", script)
+        self.assertIn("exit /b 0", script)
+
+    def test_stable_runtime_resets_consecutive_failure_count(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn("BOT_RUNTIME=BOT_STOPPED_AT-BOT_STARTED_AT", script)
+        self.assertIn("if %BOT_RUNTIME% GEQ 300 set /a RETRIES=0", script)
+
+
 if __name__ == "__main__":
     unittest.main()

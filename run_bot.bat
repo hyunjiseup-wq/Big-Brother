@@ -50,15 +50,24 @@ if /i "%~1"=="--check-network" (
 set /a RETRIES=0
 :loop
 echo [%date% %time%] Starting bot...
+for /f %%T in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"') do set "BOT_STARTED_AT=%%T"
 "%PYTHON%" bot.py
 set "BOT_EXIT=%errorlevel%"
+if "%BOT_EXIT%"=="0" goto stopped
 if "%BOT_EXIT%"=="3" goto duplicate
 
+for /f %%T in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"') do set "BOT_STOPPED_AT=%%T"
+set /a BOT_RUNTIME=BOT_STOPPED_AT-BOT_STARTED_AT
+if %BOT_RUNTIME% GEQ 300 set /a RETRIES=0
 set /a RETRIES+=1
 if %RETRIES% GEQ 5 goto failed
-echo [%date% %time%] Bot exited. Restarting in 10 seconds. (%RETRIES%/5)
+echo [%date% %time%] Bot exited with code %BOT_EXIT%. Restarting in 10 seconds. (%RETRIES%/5 consecutive failures)
 timeout /t 10 /nobreak >nul
 goto loop
+
+:stopped
+echo [INFO] The bot stopped normally. Automatic restart is not required.
+exit /b 0
 
 :duplicate
 echo [INFO] The bot is already running.
