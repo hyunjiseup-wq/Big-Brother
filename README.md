@@ -116,6 +116,7 @@ python -m pip install -r requirements.lock
   Discord 봇 토큰·설정 채널 조회와 Gemini/Groq 모델 조회 API를 확인하며
   메시지 생성·전송이나 제재는 수행하지 않습니다.
 - 자동 시작 등록: `register_startup.bat`을 한 번 실행합니다.
+- 자동 시작 상태만 확인: `register_startup.bat --check` (등록하거나 변경하지 않음)
 - Linux/macOS: 활성화한 가상환경에서 `python bot.py`를 실행합니다.
 
 ## 명령어 (전부 관리자 전용 — 서버 내에서 `!BB` 접두사 사용, `!bb` 소문자·`!BB점수` 붙여쓰기 모두 인식)
