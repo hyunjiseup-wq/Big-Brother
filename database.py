@@ -18,6 +18,7 @@ DB_PATH = os.path.expandvars(os.path.expanduser(os.environ.get(
     str(Path(__file__).resolve().parent / "automod.db"),
 )))
 _BUSY_TIMEOUT_MS = 10_000
+_REVIEW_RECOVERY_MIN_AGE_SECONDS = 600
 
 
 @asynccontextmanager
@@ -395,12 +396,14 @@ async def get_stale_processing_reviews(guild_id: int, minutes: int = 10, limit: 
 
 
 async def recover_processing_review(review_id: int, guild_id: int) -> bool:
-    """관리자가 외부 제재 미적용을 확인한 processing 건만 다시 pending으로 돌린다."""
+    """10분 이상 중단된 processing 건만 관리자가 다시 pending으로 돌린다."""
+    before = time.time() - _REVIEW_RECOVERY_MIN_AGE_SECONDS
     async with _connect() as db:
         cursor = await db.execute(
             "UPDATE violation_log SET review_status = 'pending', reviewed_at = NULL "
-            "WHERE id = ? AND guild_id = ? AND review_status = 'processing'",
-            (review_id, guild_id),
+            "WHERE id = ? AND guild_id = ? AND review_status = 'processing' "
+            "AND (reviewed_at IS NULL OR reviewed_at < ?)",
+            (review_id, guild_id, before),
         )
         await db.commit()
         return cursor.rowcount == 1

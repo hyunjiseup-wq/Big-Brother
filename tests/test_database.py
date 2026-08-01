@@ -3,6 +3,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import aiosqlite
 
@@ -80,16 +81,25 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         review_id = await database.create_review_record(
             1, 50, 10, 999, "message", "MODERATE", "reason", "검수 대기"
         )
-        self.assertTrue(await database.claim_review(review_id, 1))
+        with patch.object(database.time, "time", return_value=1):
+            self.assertTrue(await database.claim_review(review_id, 1))
 
         # DB 초기화(봇 재시작)가 처리 중 건을 자동 재시도 상태로 바꾸면 안 된다.
         await database.init_db()
         self.assertFalse(await database.claim_review(review_id, 1))
 
         stalled = await database.get_stale_processing_reviews(1, minutes=1)
-        self.assertEqual(stalled, [])  # 방금 선점한 건은 아직 중단 의심 대상이 아니다.
+        self.assertEqual([row[0] for row in stalled], [review_id])
         self.assertTrue(await database.recover_processing_review(review_id, 1))
         self.assertTrue(await database.claim_review(review_id, 1))
+
+    async def test_active_processing_review_cannot_be_recovered(self):
+        review_id = await database.create_review_record(
+            1, 50, 10, 1000, "message", "MODERATE", "reason", "검수 대기"
+        )
+        self.assertTrue(await database.claim_review(review_id, 1))
+        self.assertFalse(await database.recover_processing_review(review_id, 1))
+        self.assertFalse(await database.claim_review(review_id, 1))
 
     async def test_retention_redacts_only_old_completed_content(self):
         old = time.time() - 100 * 86400

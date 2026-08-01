@@ -1273,7 +1273,7 @@ async def recover_review_cmd(ctx, review_id: int):
             "이미 제재가 적용된 건이었다면 중복 실행될 수 있으니 대상 상태를 반드시 확인하세요."
         )
     else:
-        await ctx.send("⚠️ 해당 서버에서 처리 중인 검토 건을 찾지 못했습니다.")
+        await ctx.send("⚠️ 해당 서버에서 10분 이상 중단된 검토 건을 찾지 못했습니다.")
 
 
 @bot.command(name="감사실행")
