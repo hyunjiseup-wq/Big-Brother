@@ -39,6 +39,11 @@ class BotLauncherTests(unittest.TestCase):
         self.assertIn("exit /b 6", script)
         self.assertLess(script.index("Unknown option"), script.index("set /a RETRIES=0"))
 
+    def test_local_runtime_status_option_is_available(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn('if /i "%~1"=="--status"', script)
+        self.assertIn("runtime_status.py", script)
+
     def test_normal_exit_does_not_restart(self):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn('if "%BOT_EXIT%"=="0" goto stopped', script)

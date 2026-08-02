@@ -119,6 +119,7 @@ python -m pip install -r requirements.lock
   SQLite 온라인 백업 API로 WAL의 최신 기록까지 일관되게 `backups/`에 복사하고 결과 파일의
   무결성을 검사합니다. Discord 토큰이나 AI 키 검증과 독립적으로 실행되므로 환경설정 장애 중에도
   백업할 수 있습니다. 백업에는 메시지 원문이 포함될 수 있으므로 필요한 시점에만 실행하고 안전하게 보관하세요.
+- 로컬 실행 상태 확인: `run_bot.bat --status` (Discord/API 접속 없이 단일 인스턴스 잠금 상태만 확인)
 - 자동 시작 등록: `register_startup.bat`을 한 번 실행합니다.
 - 자동 시작 상태만 확인: `register_startup.bat --check` (등록하거나 변경하지 않음)
 - 실행기는 오류 종료가 연속될 때만 최대 5회 재시작합니다. 정상 종료는 다시 실행하지 않으며,

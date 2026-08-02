@@ -36,6 +36,7 @@ import cache
 import learning
 from filters import fast_check
 import moderator
+import runtime_lock
 from moderator import classify_message, get_channel_note
 from batch_audit import prune_expired_reports, run_full_audit
 
@@ -1369,15 +1370,12 @@ def _acquire_single_instance_lock():
     봇 중복 실행 방지. 두 인스턴스가 동시에 돌면 같은 위반에 제재가 두 번 나간다
     (실제 발생했던 사고). 고정 포트를 선점하는 방식이라 프로세스가 죽으면 자동 해제된다.
     """
-    import socket
-    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        lock.bind(("127.0.0.1", 57391))
+        return runtime_lock.acquire_instance_lock()
     except OSError:
         print("⚠️ 봇이 이미 실행 중입니다. 이중 제재를 막기 위해 이 인스턴스는 종료합니다.")
         print("   (기존 봇을 끄려면: 그 창에서 Ctrl+C, 또는 작업 관리자에서 python 종료)")
         sys.exit(3)  # 봇실행.bat이 "중복 실행"을 크래시와 구별해 재시작을 멈추는 신호
-    return lock
 
 
 if __name__ == "__main__":

@@ -26,6 +26,11 @@ if /i "%~1"=="--backup-db" (
     exit /b %errorlevel%
 )
 
+if /i "%~1"=="--status" (
+    "%PYTHON%" runtime_status.py
+    exit /b %errorlevel%
+)
+
 "%PYTHON%" -c "import asyncio, database; asyncio.run(database.init_db()); asyncio.run(database.validate_database_integrity())"
 if errorlevel 1 (
     echo [ERROR] The database could not be initialized or failed its integrity check.
@@ -54,7 +59,7 @@ if /i "%~1"=="--check-network" (
 
 if not "%~1"=="" (
     echo [ERROR] Unknown option: %~1
-    echo Supported options: --check, --check-network, --backup-db
+    echo Supported options: --check, --check-network, --backup-db, --status
     exit /b 6
 )
 
