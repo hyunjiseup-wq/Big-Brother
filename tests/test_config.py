@@ -49,3 +49,18 @@ class ConfigValidationTests(unittest.TestCase):
         with patch.object(config, "ALLOW_ADMINISTRATOR_PERMISSION", "yes"):
             with self.assertRaisesRegex(ValueError, "ALLOW_ADMINISTRATOR_PERMISSION"):
                 config.validate_config()
+
+    def test_realtime_ollama_fallback_flag_must_be_boolean(self):
+        with patch.object(config, "OLLAMA_REALTIME_FALLBACK", "yes"):
+            with self.assertRaisesRegex(ValueError, "OLLAMA_REALTIME_FALLBACK"):
+                config.validate_config()
+
+    def test_local_concurrency_must_be_positive(self):
+        with patch.object(config, "OLLAMA_MAX_CONCURRENT_CALLS", 0):
+            with self.assertRaisesRegex(ValueError, "OLLAMA_MAX_CONCURRENT_CALLS"):
+                config.validate_config()
+
+    def test_negative_ollama_cooldown_is_rejected(self):
+        with patch.object(config, "OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS", -1):
+            with self.assertRaisesRegex(ValueError, "OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS"):
+                config.validate_config()

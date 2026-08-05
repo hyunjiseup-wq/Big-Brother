@@ -322,6 +322,32 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 # VRAM 여유가 있으면 더 큰 모델로, 부족하면 작은 모델로 바꾸세요.
 OLLAMA_MODEL = "qwen2.5:14b"
 
+# ══════════════════════════════════════════════════════════════════
+# 실시간 판단의 3차 폴백: 로컬 Ollama
+# Gemini도 Groq도 무료 티어라 일일 한도가 있고, 둘 다 소진되면 실시간 판단이 전부
+# 실패해 메시지가 "위반 없음"으로 통과한다(= 키워드 필터만 남은 사실상 무감시 상태).
+# 로컬 Ollama는 호출 한도가 없으므로 마지막 그물로 쓴다.
+# 봇을 돌리는 PC에 Ollama가 떠 있어야 하며, 없으면 자동으로 건너뛰므로
+# (아래 UNAVAILABLE_COOLDOWN 참고) 켜 둔 채로 두어도 손해는 없다.
+# ══════════════════════════════════════════════════════════════════
+OLLAMA_REALTIME_FALLBACK = True
+
+# 로컬 GPU는 MAX_CONCURRENT_AI_CALLS(클라우드 기준으로 잡은 값)만큼 동시 추론을 감당하지
+# 못한다. 폴백이 발동하는 동안에는 이 개수만큼만 동시에 Ollama를 호출한다.
+# GPU가 넉넉하면 2까지 올려도 되지만, 그 이상은 오히려 전체 응답이 느려진다.
+OLLAMA_MAX_CONCURRENT_CALLS = 1
+
+# 실시간 폴백에서 메시지 한 건에 쓸 수 있는 최대 시간(초).
+# 위의 동시 실행 제한 때문에 순서를 기다리는 시간까지 여기에 포함된다(대기 + 추론 합계).
+# 참고: 여기서 오래 붙잡혀도 MAX_QUEUE_AGE_SECONDS를 넘긴 메시지는 어차피 폐기되므로,
+# 큐가 밀릴 때는 이 값을 줄이는 편이 더 많은 메시지를 검사할 수 있다.
+OLLAMA_REALTIME_TIMEOUT_SECONDS = 60
+
+# Ollama에 연결 자체가 안 되면(미설치/미실행/모델 없음) 이 시간(초) 동안은 아예 시도하지
+# 않는다. 매 메시지마다 죽은 주소로 연결을 시도하다 큐가 밀리는 것을 막는 회로 차단기다.
+# 0으로 두면 매번 시도한다.
+OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS = 300
+
 # 완성된 리포트를 저장할 로컬 폴더 (Markdown 파일)
 REPORT_OUTPUT_DIR = "./reports"
 
@@ -383,6 +409,15 @@ def validate_config() -> None:
         errors.append("REPORT_OUTPUT_DIR는 비어 있지 않은 문자열이어야 합니다.")
     if not isinstance(OLLAMA_BASE_URL, str) or not OLLAMA_BASE_URL.startswith(("http://", "https://")):
         errors.append("OLLAMA_BASE_URL은 http:// 또는 https://로 시작해야 합니다.")
+    if not isinstance(OLLAMA_REALTIME_FALLBACK, bool):
+        errors.append("OLLAMA_REALTIME_FALLBACK은 True 또는 False여야 합니다.")
+    if isinstance(OLLAMA_MAX_CONCURRENT_CALLS, bool) or not isinstance(OLLAMA_MAX_CONCURRENT_CALLS, int) \
+            or OLLAMA_MAX_CONCURRENT_CALLS <= 0:
+        errors.append("OLLAMA_MAX_CONCURRENT_CALLS는 1 이상의 정수여야 합니다.")
+    if OLLAMA_REALTIME_TIMEOUT_SECONDS <= 0:
+        errors.append("OLLAMA_REALTIME_TIMEOUT_SECONDS는 0보다 커야 합니다.")
+    if OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS < 0:
+        errors.append("OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS는 0 이상이어야 합니다.")
     if not all(isinstance(model, str) and model.strip()
                for model in (GEMINI_MODEL, GROQ_MODEL, OLLAMA_MODEL)):
         errors.append("AI 모델 이름은 비어 있지 않은 문자열이어야 합니다.")

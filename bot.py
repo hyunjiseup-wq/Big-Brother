@@ -1,5 +1,5 @@
 """
-디스코드 자동 제재 봇 메인 파일 (대규모 서버 + Gemini/Groq 이중화 버전).
+디스코드 자동 제재 봇 메인 파일 (대규모 서버 + Gemini/Groq/로컬 Ollama 삼중화 버전).
 
 흐름:
 1. 메시지 수신 -> filters.fast_check()로 1차 필터링 (정규식/금칙어/스팸, AI 호출 없음)
@@ -7,10 +7,11 @@
    - DECIDED : 필터만으로 등급 확정, AI 호출 없이 바로 제재 처리
    - NEEDS_AI: 애매한 경우만 큐에 넣어 워커가 비동기로 AI 판단
 2. AI 판단 전, cache에서 동일/반복 문구의 기존 판단 결과가 있는지 먼저 확인
-3. moderator.classify_message()가 Gemini를 우선 시도하고, 실패/한도초과 시 Groq로 자동 폴백
+3. moderator.classify_message()가 Gemini를 우선 시도하고, 실패/한도초과 시 Groq로,
+   Groq까지 막히면 호출 한도가 없는 로컬 Ollama로 자동 폴백 (무료 한도 소진 시 무감시 방지)
 4. 위반 등급에 따라 점수 부여 (config.VIOLATION_LEVEL_POINTS)
 5. 누적 점수 -> config.STRIKE_THRESHOLDS 에 따라 조치 결정
-   단, 커뮤니티 정책상 킥/밴은 판단 주체(필터/Gemini/Groq) 무관하게 자동 실행하지 않고
+   단, 커뮤니티 정책상 킥/밴은 판단 주체(필터/Gemini/Groq/Ollama) 무관하게 자동 실행하지 않고
    config.AUTO_ACTION_CEILING(기본 타임아웃)으로 항상 하향되며, 로그 채널에
    "관리자 검토 필요"로 강조 표시됨 (!BB 검토대기 명령어로 목록 확인 가능)
 6. 조치 실행 (경고/삭제/타임아웃/킥/밴) + 로그 채널 기록 (판단 주체 포함)
@@ -357,7 +358,8 @@ async def send_public_sanction_log(guild: discord.Guild, level: str, rule_violat
         print(f"⚠️ 공개 제재 로그 전송 실패: {type(e).__name__}")
 
 
-_PROVIDER_LABEL = {"gemini": "Gemini(1차)", "groq": "Groq(폴백)", "filter": "키워드 필터", "none": "판단 실패"}
+_PROVIDER_LABEL = {"gemini": "Gemini(1차)", "groq": "Groq(2차 폴백)",
+                   "ollama": "Ollama(3차 폴백·로컬)", "filter": "키워드 필터", "none": "판단 실패"}
 
 
 async def _handle_violation_review_only(message: discord.Message, level: str, reason_text: str,
@@ -817,8 +819,8 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
         await send_public_sanction_log(message.guild, level, rule_violated, action)
 
 
-# AI 전량 장애 감지: Gemini/Groq가 둘 다 실패하면 안전하게 NONE 처리되지만(무고한 제재 방지)
-# 콘솔에만 찍혀서 관리자가 무감시 상태를 모를 수 있다. 연속 실패가 임계치에 닿으면
+# AI 전량 장애 감지: Gemini/Groq/Ollama가 모두 실패하면 안전하게 NONE 처리되지만(무고한 제재
+# 방지) 콘솔에만 찍혀서 관리자가 무감시 상태를 모를 수 있다. 연속 실패가 임계치에 닿으면
 # 로그 채널에 경고를 올린다.
 # 상태는 서버(guild)별로 따로 센다 — 전역 카운터로 두면 여러 서버에 들어가 있을 때
 # 한 서버의 성공이 다른 서버의 연속 실패를 초기화하고, 알림도 엉뚱한 서버로 갈 수 있다.
@@ -845,15 +847,31 @@ async def _track_ai_outage(guild: discord.Guild, result):
         return
     state["last_alert"] = now
 
+    if config.OLLAMA_REALTIME_FALLBACK:
+        chain_text = "Gemini · Groq · 로컬 Ollama 판단이"
+        checklist = (
+            "1. API 무료 한도 초과 여부 (Gemini는 한국시간 오후 4시경 리셋)\n"
+            "2. .env의 GEMINI_API_KEY / GROQ_API_KEY 유효 여부\n"
+            f"3. 로컬 Ollama 실행 여부 — `ollama serve` 후 `ollama list`에 "
+            f"`{config.OLLAMA_MODEL}`이 있는지 확인\n"
+            "4. 봇 콘솔 창의 오류 메시지"
+        )
+    else:
+        chain_text = "Gemini와 Groq 판단이"
+        checklist = (
+            "1. API 무료 한도 초과 여부 (Gemini는 한국시간 오후 4시경 리셋)\n"
+            "2. .env의 GEMINI_API_KEY / GROQ_API_KEY 유효 여부\n"
+            "3. 봇 콘솔 창의 오류 메시지\n"
+            "4. `config.OLLAMA_REALTIME_FALLBACK`을 켜면 한도 없는 로컬 Ollama가 "
+            "마지막 폴백으로 동작합니다"
+        )
+
     embed = discord.Embed(
         title="🔴 AI 판단 장애 감지",
         description=(
-            f"Gemini와 Groq 판단이 **{state['streak']}회 연속 실패**했습니다.\n"
+            f"{chain_text} **{state['streak']}회 연속 실패**했습니다.\n"
             "실패한 메시지는 안전하게 '위반 없음' 처리되므로 지금 서버는 **키워드 필터만으로 감시 중**입니다.\n\n"
-            "확인할 것:\n"
-            "1. API 무료 한도 초과 여부 (Gemini는 한국시간 오후 4시경 리셋)\n"
-            "2. .env의 GEMINI_API_KEY / GROQ_API_KEY 유효 여부\n"
-            "3. 봇 콘솔 창의 오류 메시지"
+            f"확인할 것:\n{checklist}"
         ),
         color=discord.Color.red(),
         timestamp=now,
@@ -862,7 +880,7 @@ async def _track_ai_outage(guild: discord.Guild, result):
 
 
 async def ai_worker(worker_id: int):
-    """큐에서 메시지를 꺼내 캐시 확인 후 필요하면 AI(Gemini/Groq)로 판단하는 워커."""
+    """큐에서 메시지를 꺼내 캐시 확인 후 필요하면 AI(Gemini→Groq→Ollama)로 판단하는 워커."""
     while True:
         message, enqueued_at, processing_key = await _message_queue.get()
         try:
@@ -1219,7 +1237,8 @@ async def show_pending_reviews(ctx, hours: int = 72):
         await ctx.send(f"✅ 최근 {hours}시간 내 관리자 검토가 필요한 건이 없습니다.")
         return
 
-    provider_label = {"gemini": "Gemini", "groq": "Groq", "filter": "키워드 필터", "none": "판단 실패"}
+    provider_label = {"gemini": "Gemini", "groq": "Groq", "ollama": "Ollama(로컬)",
+                      "filter": "키워드 필터", "none": "판단 실패"}
     embed = discord.Embed(
         title=f"⚠️ 관리자 검토 필요 목록 (최근 {hours}시간)",
         description="정책상 킥/밴은 자동 실행하지 않고 타임아웃으로 대체 적용된 건들입니다. 직접 확인 후 필요시 수동으로 킥/밴 처리하세요.",
@@ -1295,6 +1314,24 @@ async def run_audit_now(ctx, backend: str = None):
         await ctx.send("검토할 새 메시지가 없거나 감시 채널이 등록되지 않았습니다. `config.WATCHED_CHANNEL_IDS`를 확인하세요.")
 
 
+def _fallback_chain_status() -> str:
+    """무료 한도가 마르면 어디까지 버틸 수 있는지를 `!BB 상태`에서 한눈에 보여준다."""
+    if not config.OLLAMA_REALTIME_FALLBACK:
+        return ("Gemini → Groq → **(없음)**\n"
+                "⚠️ 둘 다 무료 티어라 한도가 함께 소진되면 키워드 필터만 남습니다. "
+                "`config.OLLAMA_REALTIME_FALLBACK = True`로 한도 없는 로컬 Ollama를 "
+                "마지막 폴백으로 쓸 수 있습니다.")
+
+    chain = f"Gemini → Groq → Ollama(`{config.OLLAMA_MODEL}`)"
+    ready, cooldown = moderator.ollama_fallback_status()
+    if ready:
+        return f"{chain}\n🟢 3차 폴백 대기 중 (최근 연결 실패 없음)"
+    left = f"{cooldown / 60:.0f}분" if cooldown >= 60 else f"{cooldown:.0f}초"
+    return (f"{chain}\n🔴 Ollama 연결 실패로 {left}간 건너뛰는 중 — "
+            f"봇이 도는 PC에서 Ollama가 실행 중인지, `{config.OLLAMA_MODEL}` 모델이 "
+            "받아져 있는지 확인하세요.")
+
+
 @bot.command(name="상태")
 @commands.has_permissions(administrator=True)
 async def show_status(ctx):
@@ -1311,6 +1348,7 @@ async def show_status(ctx):
     gauge = "🟢 여유" if usage < 80 else ("🟡 혼잡" if usage < 95 else "🔴 포화 임박")
     embed.add_field(name="대기열", value=f"{gauge} {queued} / {config.MAX_QUEUE_SIZE} ({usage:.0f}%)", inline=True)
     embed.add_field(name="AI 워커 수", value=str(config.MAX_CONCURRENT_AI_CALLS), inline=True)
+    embed.add_field(name="판단 폴백 사슬", value=_fallback_chain_status(), inline=False)
 
     total_dropped = _dropped_count + _expired_count
     drop_text = (f"큐 포화 {_dropped_count}건 · 대기 초과 {_expired_count}건"

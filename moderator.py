@@ -3,16 +3,22 @@
 
 - 1차: Gemini (품질/한도 우선)
 - 2차(폴백): Gemini가 실패/한도초과일 때 Groq로 자동 전환
+- 3차(폴백): Gemini와 Groq가 둘 다 막히면(무료 일일 한도 소진 등) 호출 한도가 없는
+  로컬 Ollama로 전환. config.OLLAMA_REALTIME_FALLBACK로 켜고 끈다.
 - 어떤 provider가 판단했는지 결과에 항상 포함 (bot.py에서 폴백 판단은
   KICK/BAN 같은 되돌리기 힘든 조치를 못 하도록 제한하는 데 사용됨)
 """
+import asyncio
 import json
 import os
+import time
 import httpx
 from dotenv import load_dotenv
 
 from config import (SERVER_RULES, GEMINI_MODEL, GROQ_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL,
-                    CHANNEL_CONTEXT_NOTES)
+                    CHANNEL_CONTEXT_NOTES, OLLAMA_REALTIME_FALLBACK,
+                    OLLAMA_MAX_CONCURRENT_CALLS, OLLAMA_REALTIME_TIMEOUT_SECONDS,
+                    OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS)
 
 # 이 모듈은 import 시점에 API 키를 읽으므로, bot.py의 load_dotenv()보다 먼저
 # import되어도 키를 놓치지 않도록 여기서 직접 .env를 로드한다.
@@ -55,6 +61,9 @@ def _safe_error(error: Exception) -> str:
     for secret in (GEMINI_API_KEY, GROQ_API_KEY):
         if secret:
             text = text.replace(secret, "[REDACTED]")
+    # TimeoutError처럼 메시지가 비어 있는 예외는 종류라도 남겨야 원인을 추적할 수 있다.
+    if not text.strip():
+        text = type(error).__name__
     return text[:1000]
 
 SYSTEM_PROMPT = f"""당신은 디스코드 서버의 자동 규칙 위반 판별기입니다.
@@ -147,7 +156,8 @@ class ModerationResult:
         self.level = level
         self.rule_violated = rule_violated
         self.reason = reason
-        self.provider = provider  # "gemini" | "groq" | "none"(빈 메시지 등 API 미호출)
+        # "gemini" | "groq" | "ollama" | "none"(빈 메시지 등 API 미호출)
+        self.provider = provider
 
     def __repr__(self):
         return (f"<ModerationResult level={self.level} rule={self.rule_violated} "
@@ -230,19 +240,107 @@ async def _classify_with_groq(content: str, channel_note: str | None = None,
     return _build_result(parsed, provider="groq")
 
 
+# ── 3차 폴백(로컬 Ollama) 동시 실행 제한 & 회로 차단기 ──────────────────
+# 클라우드 API와 달리 로컬 추론은 GPU 하나를 나눠 쓰므로, bot.py의 AI 워커 수만큼
+# 동시에 밀어 넣으면 전부 느려지기만 한다. 폴백 구간에서만 따로 좁게 제한한다.
+_ollama_semaphore = asyncio.Semaphore(OLLAMA_MAX_CONCURRENT_CALLS)
+
+# Ollama가 아예 떠 있지 않은 환경(대부분의 사용자)에서 메시지마다 연결을 시도하면
+# 실패는 빠르더라도 로그만 지저분해지고 큐 처리도 느려진다. 연결/모델 수준의
+# 영구성 오류가 나면 일정 시간 동안 아예 건너뛴다.
+_ollama_unavailable_until = 0.0
+
+
+def _ollama_available() -> bool:
+    """폴백이 켜져 있고, 회로 차단기 쿨다운 중이 아닐 때만 시도한다."""
+    if not OLLAMA_REALTIME_FALLBACK or not OLLAMA_BASE_URL or not OLLAMA_MODEL:
+        return False
+    return time.monotonic() >= _ollama_unavailable_until
+
+
+def _trip_ollama_breaker(error: Exception) -> bool:
+    """
+    Ollama 미설치·미실행·모델 없음처럼 '다시 시도해도 똑같을' 오류면 쿨다운을 건다.
+    타임아웃이나 JSON 파싱 실패는 일시적일 수 있으므로 차단하지 않는다.
+    """
+    persistent = isinstance(error, httpx.ConnectError) or (
+        isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 404
+    )
+    if not persistent or OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS <= 0:
+        return False
+    global _ollama_unavailable_until
+    _ollama_unavailable_until = time.monotonic() + OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS
+    return True
+
+
+def reset_ollama_breaker() -> None:
+    """쿨다운을 즉시 해제한다 (Ollama를 방금 켠 뒤 바로 쓰고 싶을 때/테스트용)."""
+    global _ollama_unavailable_until
+    _ollama_unavailable_until = 0.0
+
+
+def ollama_fallback_status() -> tuple[bool, float]:
+    """
+    (3차 폴백을 지금 시도할 수 있는지, 남은 쿨다운 초)를 돌려준다.
+    bot.py의 `!BB 상태`에서 마지막 그물이 살아 있는지 보여주는 데 쓴다.
+    첫 값이 True여도 "최근 연결 실패가 없다"는 뜻이지 Ollama 가동을 확인한 것은 아니다.
+    """
+    if not OLLAMA_REALTIME_FALLBACK or not OLLAMA_BASE_URL or not OLLAMA_MODEL:
+        return False, 0.0
+    remaining = _ollama_unavailable_until - time.monotonic()
+    return remaining <= 0, max(0.0, remaining)
+
+
+async def _classify_with_ollama(content: str, channel_note: str | None = None,
+                                fp_examples: list[dict] | None = None) -> ModerationResult:
+    if not OLLAMA_BASE_URL or not OLLAMA_MODEL:
+        raise RuntimeError("OLLAMA_BASE_URL/OLLAMA_MODEL이 설정되어 있지 않습니다.")
+
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _user_prompt(content, channel_note, fp_examples)},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0},
+    }
+
+    # 시간 제한은 "순서 대기 + 실제 추론"을 모두 포함한다. 동시 실행이 1로 좁기 때문에
+    # 요청 자체에만 제한을 걸면, 워커들이 세마포어 앞에 줄을 서느라 제한 시간의 몇 배를
+    # 붙잡혀 큐가 밀릴 수 있다. 여기서 시간이 다 되면 그 메시지만 포기한다.
+    async with asyncio.timeout(OLLAMA_REALTIME_TIMEOUT_SECONDS):
+        async with _ollama_semaphore:
+            resp = await _get_http_client().post(
+                url, json=payload, timeout=OLLAMA_REALTIME_TIMEOUT_SECONDS
+            )
+    resp.raise_for_status()
+    data = resp.json()
+
+    raw_text = data["message"]["content"]
+    parsed = _parse_json_response(raw_text)
+    return _build_result(parsed, provider="ollama")
+
+
 async def classify_message(content: str, channel_note: str | None = None,
                            fp_examples: list[dict] | None = None) -> ModerationResult:
     """
-    메시지를 분류한다. Gemini를 먼저 시도하고, 실패(한도초과/오류/JSON파싱실패)하면
-    Groq로 자동 전환한다. 두 곳 다 실패하면 안전하게 NONE 처리(오탐으로 인한 무고한
-    제재 방지)한다.
+    메시지를 분류한다. Gemini → Groq → 로컬 Ollama 순으로 시도하고, 앞 단계가
+    실패(한도초과/오류/JSON파싱실패)하면 다음 단계로 자동 전환한다. 셋 다 실패하면
+    안전하게 NONE 처리(오탐으로 인한 무고한 제재 방지)한다.
+
+    Gemini와 Groq는 둘 다 무료 티어라 같은 날 함께 한도가 마르는 일이 생기는데,
+    그때 호출 한도가 없는 로컬 Ollama가 마지막 그물 역할을 한다
+    (config.OLLAMA_REALTIME_FALLBACK = False로 끌 수 있음).
 
     channel_note: 이 메시지가 올라온 채널의 특수 규칙(config.CHANNEL_CONTEXT_NOTES).
     fp_examples: 관리자가 오탐으로 확정한 과거 사례 목록(learning.get_prompt_examples).
     둘 다 있으면 서버 규칙과 함께 AI에게 전달되어 판단 정확도를 높인다.
 
     반환되는 ModerationResult.provider 값으로 어떤 모델이 판단했는지 알 수 있고,
-    bot.py는 이를 이용해 폴백(groq) 판단에는 KICK/BAN 같은 조치를 제한한다.
+    bot.py는 이를 이용해 폴백(groq/ollama) 판단에 조치를 제한하거나 로그에 표시한다.
     """
     if not content or not content.strip():
         return ModerationResult("NONE", "NONE", "빈 메시지", provider="none")
@@ -251,13 +349,29 @@ async def classify_message(content: str, channel_note: str | None = None,
         return await _classify_with_gemini(content, channel_note, fp_examples)
     except Exception as gemini_error:
         print(f"[moderator] Gemini 판단 실패, Groq로 폴백: {_safe_error(gemini_error)}")
-        try:
-            return await _classify_with_groq(content, channel_note, fp_examples)
-        except Exception as groq_error:
+
+    last_error = None
+    try:
+        return await _classify_with_groq(content, channel_note, fp_examples)
+    except Exception as groq_error:
+        last_error = groq_error
+        if not _ollama_available():
             print(f"[moderator] Groq 폴백도 실패, 안전하게 NONE 처리: {_safe_error(groq_error)}")
-            return ModerationResult(
-                "NONE", "NONE", f"판단 실패(안전 처리): {_safe_error(groq_error)}", provider="none"
-            )
+        else:
+            print(f"[moderator] Groq 폴백도 실패, 로컬 Ollama로 폴백: {_safe_error(groq_error)}")
+            try:
+                return await _classify_with_ollama(content, channel_note, fp_examples)
+            except Exception as ollama_error:
+                last_error = ollama_error
+                tripped = _trip_ollama_breaker(ollama_error)
+                skip_note = (f" (Ollama를 {OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS}초간 건너뜁니다)"
+                             if tripped else "")
+                print(f"[moderator] Ollama 폴백도 실패, 안전하게 NONE 처리: "
+                      f"{_safe_error(ollama_error)}{skip_note}")
+
+    return ModerationResult(
+        "NONE", "NONE", f"판단 실패(안전 처리): {_safe_error(last_error)}", provider="none"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
