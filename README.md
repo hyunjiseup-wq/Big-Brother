@@ -168,6 +168,12 @@ python -m pip install -r requirements.lock
   - `OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS`(기본 300): Ollama에 연결 자체가 안 되면(미설치/미실행,
     모델 없음) 이 시간 동안 시도조차 하지 않는 회로 차단기입니다. 죽은 주소에 매 메시지마다
     연결을 시도하다 큐가 밀리는 것을 막습니다. 타임아웃 같은 일시적 오류로는 차단되지 않습니다.
+- **클라우드 연쇄 장애 방지**: `GEMINI_MAX_CONCURRENT_CALLS`와
+  `GROQ_MAX_CONCURRENT_CALLS`는 각각 기본 2개입니다. 429·5xx·타임아웃은 짧게 한 번
+  재시도하며, 장애 카드에는 `rate_limit`, `timeout`, `invalid_response` 같은 최근 실패 유형이 표시됩니다.
+- **Gemini 응답 안정화**: 실시간 분류에서는 동적 사고를 끄고(`thinkingBudget=0`), JSON Schema와
+  1,024 출력 토큰을 사용합니다. 잘못된 등급·필드 누락·모순된 결과는 정상 `NONE`으로 캐시하지 않고
+  다음 제공자로 넘깁니다. 사용자 메시지는 비신뢰 JSON 데이터로 감싸 프롬프트 지시로 취급하지 않습니다.
 - **상태 확인**: `!BB 상태`의 "판단 폴백 사슬"에서 3차 폴백이 대기 중인지, 연결 실패로 건너뛰는
   중인지 볼 수 있습니다. `run_bot.bat --check-network`는 Ollama 가동/모델 보유 여부를
   `[WARN]`으로 알려줍니다(없어도 봇은 정상 동작하므로 실패로 처리하지 않습니다).

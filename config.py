@@ -185,6 +185,10 @@ PUBLIC_LOG_MIN_LEVEL = "MODERATE"   # "MINOR" | "MODERATE" | "SEVERE" | "EXTREME
 # 동시에 처리할 수 있는 최대 외부 AI 호출 수 (트래픽이 몰려도 이 이상 동시 호출 안 함)
 MAX_CONCURRENT_AI_CALLS = 8
 
+# 전체 워커와 별도로 제공자별 동시 요청을 좁혀 폴백 시 무료 한도 연쇄 초과를 막는다.
+GEMINI_MAX_CONCURRENT_CALLS = 2
+GROQ_MAX_CONCURRENT_CALLS = 2
+
 # 메시지 처리 대기열(큐)의 최대 크기. 초과분은 버리고 로그만 남김 (폭주 시 봇 다운 방지)
 MAX_QUEUE_SIZE = 5000
 
@@ -378,6 +382,12 @@ def validate_config() -> None:
 
     if MAX_CONCURRENT_AI_CALLS <= 0:
         errors.append("MAX_CONCURRENT_AI_CALLS는 1 이상이어야 합니다.")
+    for name, value in (
+        ("GEMINI_MAX_CONCURRENT_CALLS", GEMINI_MAX_CONCURRENT_CALLS),
+        ("GROQ_MAX_CONCURRENT_CALLS", GROQ_MAX_CONCURRENT_CALLS),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{name}는 1 이상의 정수여야 합니다.")
     if DROP_ALERT_THRESHOLD <= 0 or DROP_ALERT_COOLDOWN_MINUTES <= 0:
         errors.append("DROP_ALERT_THRESHOLD와 DROP_ALERT_COOLDOWN_MINUTES는 1 이상이어야 합니다.")
     if MAX_QUEUE_SIZE <= 0 or MAX_QUEUE_AGE_SECONDS <= 0:

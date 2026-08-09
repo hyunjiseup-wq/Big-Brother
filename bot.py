@@ -829,15 +829,19 @@ _ai_outage_state: dict[int, dict] = {}
 
 
 async def _track_ai_outage(guild: discord.Guild, result):
-    state = _ai_outage_state.setdefault(guild.id, {"streak": 0, "last_alert": None})
+    state = _ai_outage_state.setdefault(
+        guild.id, {"streak": 0, "last_alert": None, "last_category": None}
+    )
 
     if result.provider != "none":
         if state["streak"] >= config.AI_OUTAGE_ALERT_THRESHOLD:
             print(f"✅ AI 판단이 복구되었습니다 (길드 {guild.id}).")
         state["streak"] = 0
+        state["last_category"] = None
         return
 
     state["streak"] += 1
+    state["last_category"] = getattr(result, "failure_category", None) or "unknown"
     if state["streak"] < config.AI_OUTAGE_ALERT_THRESHOLD:
         return
 
@@ -870,6 +874,7 @@ async def _track_ai_outage(guild: discord.Guild, result):
         title="🔴 AI 판단 장애 감지",
         description=(
             f"{chain_text} **{state['streak']}회 연속 실패**했습니다.\n"
+            f"최근 실패 유형: `{state['last_category']}`\n"
             "실패한 메시지는 안전하게 '위반 없음' 처리되므로 지금 서버는 **키워드 필터만으로 감시 중**입니다.\n\n"
             f"확인할 것:\n{checklist}"
         ),

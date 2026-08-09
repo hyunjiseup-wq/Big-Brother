@@ -15,6 +15,12 @@ class ConfigValidationTests(unittest.TestCase):
     def test_current_configuration_is_valid(self):
         config.validate_config()
 
+    def test_cloud_concurrency_must_be_positive_integer(self):
+        for name in ("GEMINI_MAX_CONCURRENT_CALLS", "GROQ_MAX_CONCURRENT_CALLS"):
+            with self.subTest(name=name), patch.object(config, name, 0):
+                with self.assertRaisesRegex(ValueError, name):
+                    config.validate_config()
+
     def test_invalid_batch_backend_is_rejected(self):
         with patch.object(config, "BATCH_BACKEND", "unknown"):
             with self.assertRaisesRegex(ValueError, "BATCH_BACKEND"):
