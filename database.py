@@ -12,6 +12,7 @@ import aiosqlite
 from dotenv import load_dotenv
 
 from config import STRIKE_DECAY_DAYS, STRIKE_DECAY_RATIO
+from language_detection import detect_language_group
 
 
 load_dotenv()
@@ -97,6 +98,7 @@ async def init_db():
         )
         await _ensure_column(db, "violation_log", "reviewed_at", "REAL")
         await _ensure_column(db, "violation_log", "reviewed_by", "INTEGER")
+        await _ensure_column(db, "violation_log", "language_group", "TEXT NOT NULL DEFAULT 'und'")
         # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
         # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
         await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
@@ -343,8 +345,8 @@ async def log_violation(
         cursor = await db.execute(
             """INSERT INTO violation_log
                (guild_id, user_id, channel_id, message_id, message_content, level, reason,
-                action_taken, provider, needs_review, review_status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                action_taken, provider, needs_review, review_status, language_group, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 guild_id,
                 user_id,
@@ -357,6 +359,7 @@ async def log_violation(
                 provider,
                 int(needs_review),
                 review_status,
+                detect_language_group(message_content),
                 time.time(),
             ),
         )
@@ -391,10 +394,12 @@ async def create_review_record(
         cursor = await db.execute(
             """INSERT INTO violation_log
                (guild_id, user_id, channel_id, message_id, message_content, level, reason,
-                action_taken, provider, needs_review, review_status, card_delivered, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?)""",
+                action_taken, provider, needs_review, review_status, card_delivered,
+                language_group, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?)""",
             (guild_id, user_id, channel_id, message_id, message_content, level, reason,
-             action_taken, provider, int(card_delivered), time.time()),
+             action_taken, provider, int(card_delivered),
+             detect_language_group(message_content), time.time()),
         )
         await db.commit()
         return cursor.lastrowid
@@ -525,6 +530,21 @@ async def get_moderation_training_examples(guild_id: int, limit: int = 100):
                  AND TRIM(v.message_content) != ''
                ORDER BY l.created_at DESC LIMIT ?""",
             (guild_id, max(1, limit)),
+        )
+        return await cursor.fetchall()
+
+
+async def get_moderation_label_stats(guild_id: int):
+    """Return confirmed normal/violation counts grouped by offline language family."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT v.language_group, l.verdict, COUNT(*)
+               FROM moderation_labels AS l
+               JOIN violation_log AS v ON v.id = l.review_id AND v.guild_id = l.guild_id
+               WHERE l.guild_id = ?
+               GROUP BY v.language_group, l.verdict
+               ORDER BY COUNT(*) DESC, v.language_group""",
+            (guild_id,),
         )
         return await cursor.fetchall()
 

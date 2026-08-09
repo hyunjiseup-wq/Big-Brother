@@ -126,6 +126,23 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await database.get_moderation_training_examples(1), [])
 
+    async def test_training_stats_are_grouped_by_language_and_verdict(self):
+        for message_id, content, status in (
+            (21, "정상적인 한국어", "false_positive"),
+            (22, "harmful latin text", "confirmed"),
+        ):
+            review_id = await database.log_violation(
+                1, 9, 10, content, "MODERATE", "reason", "review",
+                review_status="pending", message_id=message_id,
+            )
+            self.assertTrue(await database.claim_review(review_id, 1))
+            self.assertTrue(await database.resolve_review(review_id, 1, status, 99, "done"))
+
+        self.assertEqual(
+            set(await database.get_moderation_label_stats(1)),
+            {("ko", "normal", 1), ("latin", "violation", 1)},
+        )
+
     async def test_processing_review_requires_explicit_recovery(self):
         review_id = await database.create_review_record(
             1, 50, 10, 999, "message", "MODERATE", "reason", "검수 대기"

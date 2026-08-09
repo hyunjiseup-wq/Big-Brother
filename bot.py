@@ -1321,16 +1321,17 @@ async def run_audit_now(ctx, backend: str = None):
 
 def _fallback_chain_status() -> str:
     """무료 한도가 마르면 어디까지 버틸 수 있는지를 `!BB 상태`에서 한눈에 보여준다."""
-    if not config.OLLAMA_REALTIME_FALLBACK:
-        return ("Gemini → Groq → **(없음)**\n"
-                "⚠️ 둘 다 무료 티어라 한도가 함께 소진되면 키워드 필터만 남습니다. "
-                "`config.OLLAMA_REALTIME_FALLBACK = True`로 한도 없는 로컬 Ollama를 "
-                "마지막 폴백으로 쓸 수 있습니다.")
+    labels = {"gemini": "Gemini", "groq": "Groq", "ollama": f"Ollama(`{config.OLLAMA_MODEL}`)"}
+    enabled = [provider for provider in config.REALTIME_PROVIDER_ORDER
+               if provider != "ollama" or config.OLLAMA_REALTIME_FALLBACK]
+    chain = " → ".join(labels[provider] for provider in enabled)
+    if "ollama" not in enabled:
+        return (f"{chain}\n⚠️ 클라우드 한도가 모두 소진되면 키워드 필터만 남습니다. "
+                "로컬 Ollama를 순서에 넣고 OLLAMA_REALTIME_FALLBACK을 켜세요.")
 
-    chain = f"Gemini → Groq → Ollama(`{config.OLLAMA_MODEL}`)"
     ready, cooldown = moderator.ollama_fallback_status()
     if ready:
-        return f"{chain}\n🟢 3차 폴백 대기 중 (최근 연결 실패 없음)"
+        return f"{chain}\n🟢 로컬 제공자 사용 가능 (최근 연결 실패 없음)"
     left = f"{cooldown / 60:.0f}분" if cooldown >= 60 else f"{cooldown:.0f}초"
     return (f"{chain}\n🔴 Ollama 연결 실패로 {left}간 건너뛰는 중 — "
             f"봇이 도는 PC에서 Ollama가 실행 중인지, `{config.OLLAMA_MODEL}` 모델이 "
@@ -1370,6 +1371,21 @@ async def show_status(ctx):
     outage = _ai_outage_state.get(ctx.guild.id, {})
     if outage.get("streak"):
         embed.add_field(name="AI 연속 판단 실패", value=f"{outage['streak']}회", inline=True)
+    label_stats = await database.get_moderation_label_stats(ctx.guild.id)
+    if label_stats:
+        language_names = {
+            "ko": "한국어", "ja": "일본어", "zh": "중국어", "latin": "라틴 문자",
+            "cyrillic": "키릴 문자", "arabic": "아랍 문자", "devanagari": "데바나가리",
+            "thai": "태국 문자", "mixed": "혼합 언어", "und": "판별 불가",
+        }
+        totals = {}
+        for language, verdict, count in label_stats:
+            totals.setdefault(language, {"normal": 0, "violation": 0})[verdict] = count
+        lines = [
+            f"{language_names.get(language, language)}: 정상 {values['normal']} · 위반 {values['violation']}"
+            for language, values in totals.items()
+        ]
+        embed.add_field(name="관리자 확정 학습 자료", value="\n".join(lines)[:1024], inline=False)
     await ctx.send(embed=embed)
 
 
