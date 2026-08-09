@@ -7,6 +7,7 @@
 import os
 
 from dotenv import load_dotenv
+from policy_loader import load_policy_file
 
 
 load_dotenv()
@@ -114,6 +115,12 @@ CHANNEL_CONTEXT_NOTES = {
         "- 핵 사용을 옹호·조장하거나 핵 판매/구매를 유도하는 발언"
     ),
 }
+
+# 다른 커뮤니티에서는 코드를 수정하지 않고 UTF-8 JSON 정책 파일만 연결할 수 있다.
+# 비워두면 위의 기존 Tarkov 커뮤니티 정책을 그대로 사용한다.
+POLICY_FILE = os.environ.get("POLICY_FILE", "").strip()
+if POLICY_FILE:
+    SERVER_RULES, CHANNEL_CONTEXT_NOTES = load_policy_file(POLICY_FILE)
 
 # ══════════════════════════════════════════════════════════════════
 # 수동 검수 모드 (운영 초기 안전장치)

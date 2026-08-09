@@ -96,8 +96,11 @@ python -m pip install -r requirements.lock
    - `WATCHED_CHANNEL_IDS`(선택): 배치 감사 대상 채널 ID를 쉼표로 구분합니다.
      `.env`에 이 키가 있으면 `config.py`의 기본 목록보다 우선하며, 빈 값이면 배치 감사를 비활성화합니다.
 
-2. `config.py`의 `SERVER_RULES`를 실제 서버 규칙으로 수정하세요. AI는 이 텍스트를
-   그대로 판단 기준으로 사용합니다. 규칙을 구체적으로 쓸수록 판단 정확도가 올라갑니다.
+2. 현재 서버만 운영한다면 `config.py`의 `SERVER_RULES`를 실제 서버 규칙으로 수정하세요.
+   다른 커뮤니티에 배포할 때는 `policy.example.json`을 복사해 규칙과 채널별 맥락을 작성하고,
+   `.env`에 `POLICY_FILE=C:\경로\community-policy.json`을 지정하세요. 코드나 API 키 파일을
+   복제하지 않고도 커뮤니티 정책을 교체할 수 있습니다. 숫자로 된 키는 채널 ID로, 그 외 키는
+   채널 이름으로 인식됩니다. 규칙을 구체적으로 쓸수록 판단 정확도가 올라갑니다.
 
 3. 봇을 서버에 초대할 때 필요한 권한:
    - 메시지 관리 (Manage Messages)
