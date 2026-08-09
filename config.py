@@ -25,6 +25,10 @@ def _parse_channel_id_list(raw: str) -> list[int | str]:
             values.append(item)
     return values
 
+
+def _parse_provider_order(raw: str) -> tuple[str, ...]:
+    return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+
 # ── 서버 규칙 (Escape from Tarkov 한국 커뮤니티 실제 약관 기반) ────────────
 # 원문 중 "음성 채팅방 이용 규정(B)"과 "인게임 매너(Ⅲ)"는 텍스트 채팅만 읽는 이 봇으로는
 # 판별할 수 없어 제외했습니다. 텍스트로 감지 가능한 커뮤니티 약관(A)만 반영했습니다.
@@ -188,6 +192,11 @@ MAX_CONCURRENT_AI_CALLS = 8
 # 전체 워커와 별도로 제공자별 동시 요청을 좁혀 폴백 시 무료 한도 연쇄 초과를 막는다.
 GEMINI_MAX_CONCURRENT_CALLS = 2
 GROQ_MAX_CONCURRENT_CALLS = 2
+
+# 실시간 판단 순서. 로컬 Ollama가 없거나 회로 차단 중이면 즉시 다음 클라우드로 넘어간다.
+REALTIME_PROVIDER_ORDER = _parse_provider_order(
+    os.environ.get("REALTIME_PROVIDER_ORDER", "ollama,gemini,groq")
+)
 
 # 메시지 처리 대기열(큐)의 최대 크기. 초과분은 버리고 로그만 남김 (폭주 시 봇 다운 방지)
 MAX_QUEUE_SIZE = 5000
@@ -379,6 +388,7 @@ def validate_config() -> None:
     valid_levels = {"NONE", "MINOR", "MODERATE", "SEVERE", "EXTREME"}
     valid_actions = {"NONE", "WARN", "DELETE", "TIMEOUT", "KICK", "BAN"}
     valid_batch_backends = {"auto", "gemini", "groq", "ollama"}
+    valid_realtime_providers = {"gemini", "groq", "ollama"}
 
     if MAX_CONCURRENT_AI_CALLS <= 0:
         errors.append("MAX_CONCURRENT_AI_CALLS는 1 이상이어야 합니다.")
@@ -388,6 +398,13 @@ def validate_config() -> None:
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"{name}는 1 이상의 정수여야 합니다.")
+    if (not REALTIME_PROVIDER_ORDER
+            or len(set(REALTIME_PROVIDER_ORDER)) != len(REALTIME_PROVIDER_ORDER)
+            or any(provider not in valid_realtime_providers
+                   for provider in REALTIME_PROVIDER_ORDER)):
+        errors.append(
+            "REALTIME_PROVIDER_ORDER는 gemini/groq/ollama를 중복 없이 하나 이상 지정해야 합니다."
+        )
     if DROP_ALERT_THRESHOLD <= 0 or DROP_ALERT_COOLDOWN_MINUTES <= 0:
         errors.append("DROP_ALERT_THRESHOLD와 DROP_ALERT_COOLDOWN_MINUTES는 1 이상이어야 합니다.")
     if MAX_QUEUE_SIZE <= 0 or MAX_QUEUE_AGE_SECONDS <= 0:

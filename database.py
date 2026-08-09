@@ -171,6 +171,23 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_false_positive_rule_recent "
             "ON false_positive_rules(guild_id, updated_at DESC)"
         )
+
+        # Only administrator-confirmed outcomes become training labels. Message text is
+        # deliberately not duplicated here; it remains subject to violation_log retention.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS moderation_labels (
+                review_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                verdict TEXT NOT NULL CHECK (verdict IN ('normal', 'violation')),
+                corrected_level TEXT NOT NULL,
+                marked_by INTEGER,
+                created_at REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_moderation_label_recent "
+            "ON moderation_labels(guild_id, created_at DESC)"
+        )
         await db.commit()
 
 
@@ -470,14 +487,46 @@ async def resolve_review(
     if status not in {"confirmed", "false_positive"}:
         raise ValueError(f"알 수 없는 검수 상태: {status}")
     async with _connect() as db:
-        await db.execute(
+        updated = await db.execute(
             """UPDATE violation_log
                SET review_status = ?, reviewed_at = ?, reviewed_by = ?,
                    action_taken = ?, needs_review = 0
                WHERE id = ? AND guild_id = ? AND review_status = 'processing'""",
             (status, time.time(), reviewer_id, action_taken, review_id, guild_id),
         )
+        if updated.rowcount == 1:
+            verdict = "violation" if status == "confirmed" else "normal"
+            corrected_level = "NONE" if status == "false_positive" else None
+            await db.execute(
+                """INSERT INTO moderation_labels
+                   (review_id, guild_id, verdict, corrected_level, marked_by, created_at)
+                   SELECT id, guild_id, ?, COALESCE(?, level), ?, ?
+                   FROM violation_log WHERE id = ? AND guild_id = ?
+                   ON CONFLICT(review_id) DO UPDATE SET
+                       verdict = excluded.verdict,
+                       corrected_level = excluded.corrected_level,
+                       marked_by = excluded.marked_by,
+                       created_at = excluded.created_at""",
+                (verdict, corrected_level, reviewer_id, time.time(), review_id, guild_id),
+            )
         await db.commit()
+        return updated.rowcount == 1
+
+
+async def get_moderation_training_examples(guild_id: int, limit: int = 100):
+    """Return administrator-confirmed examples whose retained message text still exists."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT v.message_content, l.verdict, l.corrected_level,
+                      v.reason, v.provider, l.created_at
+               FROM moderation_labels AS l
+               JOIN violation_log AS v ON v.id = l.review_id AND v.guild_id = l.guild_id
+               WHERE l.guild_id = ? AND v.message_content IS NOT NULL
+                 AND TRIM(v.message_content) != ''
+               ORDER BY l.created_at DESC LIMIT ?""",
+            (guild_id, max(1, limit)),
+        )
+        return await cursor.fetchall()
 
 
 async def get_checkpoint(guild_id: int, channel_id: int):
@@ -668,6 +717,17 @@ async def resolve_review_as_false_positive(review_id: int, guild_id: int,
         if updated.rowcount != 1:
             await db.rollback()
             return None
+        await db.execute(
+            """INSERT INTO moderation_labels
+               (review_id, guild_id, verdict, corrected_level, marked_by, created_at)
+               VALUES (?, ?, 'normal', 'NONE', ?, ?)
+               ON CONFLICT(review_id) DO UPDATE SET
+                   verdict = excluded.verdict,
+                   corrected_level = excluded.corrected_level,
+                   marked_by = excluded.marked_by,
+                   created_at = excluded.created_at""",
+            (review_id, guild_id, reviewer_id, now),
+        )
         await db.commit()
         return {"id": rule_id, "content": content}
 

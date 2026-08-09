@@ -103,6 +103,28 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0][1:3], (10, "safe message"))
         self.assertFalse(await database.release_review(review_id, 1))
+        examples = await database.get_moderation_training_examples(1)
+        self.assertEqual(examples[0][:3], ("safe message", "normal", "NONE"))
+
+    async def test_confirmed_review_creates_violation_training_label(self):
+        review_id = await database.log_violation(
+            1, 9, 10, "harmful message", "SEVERE", "confirmed reason", "review",
+            review_status="pending", message_id=13,
+        )
+        self.assertTrue(await database.claim_review(review_id, 1))
+        self.assertTrue(await database.resolve_review(
+            review_id, 1, "confirmed", 99, "confirmed action",
+        ))
+
+        examples = await database.get_moderation_training_examples(1)
+        self.assertEqual(examples[0][:3], ("harmful message", "violation", "SEVERE"))
+
+    async def test_unconfirmed_review_is_not_a_training_example(self):
+        await database.log_violation(
+            1, 9, 10, "pending message", "MINOR", "model guess", "review",
+            review_status="pending", message_id=14,
+        )
+        self.assertEqual(await database.get_moderation_training_examples(1), [])
 
     async def test_processing_review_requires_explicit_recovery(self):
         review_id = await database.create_review_record(

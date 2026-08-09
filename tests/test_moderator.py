@@ -108,6 +108,17 @@ class RealtimeOllamaFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.provider, "ollama")
         self.assertEqual(result.level, "MODERATE")
 
+    async def test_default_order_uses_local_before_cloud(self):
+        verdict = moderator.ModerationResult("NONE", "NONE", "", provider="ollama")
+        with (
+            patch.object(moderator, "REALTIME_PROVIDER_ORDER", ("ollama", "gemini", "groq")),
+            patch.object(moderator, "_classify_with_ollama",
+                         new=AsyncMock(return_value=verdict)) as ollama,
+        ):
+            result = await moderator.classify_message("정상 채팅")
+        ollama.assert_awaited_once()
+        self.assertEqual(result.provider, "ollama")
+
     async def test_disabled_fallback_reports_failure_without_calling_ollama(self):
         with (
             patch.object(moderator, "OLLAMA_REALTIME_FALLBACK", False),
@@ -167,8 +178,8 @@ class RealtimeOllamaFallbackTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await moderator.classify_message("뭐함")
         self.assertEqual(result.provider, "none")
-        # 메시지가 없는 예외라도 사유에 종류는 남아야 관리자가 원인을 추적할 수 있다
-        self.assertIn("TimeoutError", result.reason)
+        # 로컬이 먼저 실패한 뒤 클라우드까지 실패해도 전체 사슬에 원인이 남아야 한다.
+        self.assertIn("ollama:timeout", result.failure_category)
         # 일시적 지연이므로 마지막 그물을 걷어내면 안 된다
         self.assertTrue(moderator.ollama_fallback_status()[0])
 

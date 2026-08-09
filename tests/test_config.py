@@ -21,6 +21,12 @@ class ConfigValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, name):
                     config.validate_config()
 
+    def test_realtime_provider_order_rejects_duplicates_and_unknowns(self):
+        for value in ((), ("ollama", "ollama"), ("unknown", "gemini")):
+            with self.subTest(value=value), patch.object(config, "REALTIME_PROVIDER_ORDER", value):
+                with self.assertRaisesRegex(ValueError, "REALTIME_PROVIDER_ORDER"):
+                    config.validate_config()
+
     def test_invalid_batch_backend_is_rejected(self):
         with patch.object(config, "BATCH_BACKEND", "unknown"):
             with self.assertRaisesRegex(ValueError, "BATCH_BACKEND"):

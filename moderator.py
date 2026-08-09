@@ -1,10 +1,8 @@
 """
 서버 규칙 위반 여부를 판단하는 모듈.
 
-- 1차: Gemini (품질/한도 우선)
-- 2차(폴백): Gemini가 실패/한도초과일 때 Groq로 자동 전환
-- 3차(폴백): Gemini와 Groq가 둘 다 막히면(무료 일일 한도 소진 등) 호출 한도가 없는
-  로컬 Ollama로 전환. config.OLLAMA_REALTIME_FALLBACK로 켜고 끈다.
+- config.REALTIME_PROVIDER_ORDER에 지정된 순서로 Ollama/Gemini/Groq를 시도한다.
+- 기본값은 호출 한도가 없는 로컬 Ollama 우선이며, 로컬 장애 때 클라우드로 전환한다.
 - 어떤 provider가 판단했는지 결과에 항상 포함 (bot.py에서 폴백 판단은
   KICK/BAN 같은 되돌리기 힘든 조치를 못 하도록 제한하는 데 사용됨)
 """
@@ -19,7 +17,8 @@ from config import (SERVER_RULES, GEMINI_MODEL, GROQ_MODEL, OLLAMA_BASE_URL, OLL
                     CHANNEL_CONTEXT_NOTES, OLLAMA_REALTIME_FALLBACK,
                     OLLAMA_MAX_CONCURRENT_CALLS, OLLAMA_REALTIME_TIMEOUT_SECONDS,
                     OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS,
-                    GEMINI_MAX_CONCURRENT_CALLS, GROQ_MAX_CONCURRENT_CALLS)
+                    GEMINI_MAX_CONCURRENT_CALLS, GROQ_MAX_CONCURRENT_CALLS,
+                    REALTIME_PROVIDER_ORDER)
 
 # 이 모듈은 import 시점에 API 키를 읽으므로, bot.py의 load_dotenv()보다 먼저
 # import되어도 키를 놓치지 않도록 여기서 직접 .env를 로드한다.
@@ -122,13 +121,15 @@ async def _post_with_retry(url: str, **kwargs) -> httpx.Response:
             await asyncio.sleep(0.25)
     raise RuntimeError("재시도 상태 오류")
 
-SYSTEM_PROMPT = f"""당신은 디스코드 서버의 자동 규칙 위반 판별기입니다.
+SYSTEM_PROMPT = f"""당신은 디스코드 서버의 다국어 규칙 위반 판별기입니다.
 아래는 이 서버의 규칙입니다:
 
 {SERVER_RULES}
 
 사용자가 보낸 메시지 하나를 위 규칙에 비추어 판단하고, 반드시 아래 JSON 형식으로만 응답하세요.
 설명, 코드블록, 다른 텍스트를 절대 추가하지 마세요. JSON만 출력하세요.
+메시지가 한국어가 아니어도 원문 언어의 의미와 문화적 맥락을 해석해 같은 규칙을 적용하세요.
+여러 언어가 섞인 문장, 로마자 표기, 은어도 전체 문맥으로 판단하되 번역 불확실성만으로 위반 처리하지 마세요.
 
 {{
   "level": "NONE" | "MINOR" | "MODERATE" | "SEVERE" | "EXTREME",
@@ -402,13 +403,11 @@ async def _classify_with_ollama(content: str, channel_note: str | None = None,
 async def classify_message(content: str, channel_note: str | None = None,
                            fp_examples: list[dict] | None = None) -> ModerationResult:
     """
-    메시지를 분류한다. Gemini → Groq → 로컬 Ollama 순으로 시도하고, 앞 단계가
-    실패(한도초과/오류/JSON파싱실패)하면 다음 단계로 자동 전환한다. 셋 다 실패하면
-    안전하게 NONE 처리(오탐으로 인한 무고한 제재 방지)한다.
+    config.REALTIME_PROVIDER_ORDER 순서로 제공자를 시도한다. 기본은 로컬 Ollama →
+    Gemini → Groq이며, 로컬이 없거나 실패하면 클라우드로 넘어간다. 모두 실패하면
+    안전하게 NONE 처리한다.
 
-    Gemini와 Groq는 둘 다 무료 티어라 같은 날 함께 한도가 마르는 일이 생기는데,
-    그때 호출 한도가 없는 로컬 Ollama가 마지막 그물 역할을 한다
-    (config.OLLAMA_REALTIME_FALLBACK = False로 끌 수 있음).
+    로컬 사용이 꺼져 있거나 연결할 수 없을 때는 지정된 다음 클라우드 제공자로 넘어간다.
 
     channel_note: 이 메시지가 올라온 채널의 특수 규칙(config.CHANNEL_CONTEXT_NOTES).
     fp_examples: 관리자가 오탐으로 확정한 과거 사례 목록(learning.get_prompt_examples).
@@ -420,37 +419,30 @@ async def classify_message(content: str, channel_note: str | None = None,
     if not content or not content.strip():
         return ModerationResult("NONE", "NONE", "빈 메시지", provider="none")
 
+    classifiers = {
+        "gemini": _classify_with_gemini,
+        "groq": _classify_with_groq,
+        "ollama": _classify_with_ollama,
+    }
     failures = []
-    try:
-        return await _classify_with_gemini(content, channel_note, fp_examples)
-    except Exception as gemini_error:
-        failures.append(("gemini", gemini_error))
-        print(f"[moderator] Gemini 판단 실패, Groq로 폴백: {_safe_error(gemini_error)}")
-
-    last_error = None
-    try:
-        return await _classify_with_groq(content, channel_note, fp_examples)
-    except Exception as groq_error:
-        failures.append(("groq", groq_error))
-        last_error = groq_error
-        if not _ollama_available():
-            print(f"[moderator] Groq 폴백도 실패, 안전하게 NONE 처리: {_safe_error(groq_error)}")
-        else:
-            print(f"[moderator] Groq 폴백도 실패, 로컬 Ollama로 폴백: {_safe_error(groq_error)}")
-            try:
-                return await _classify_with_ollama(content, channel_note, fp_examples)
-            except Exception as ollama_error:
-                failures.append(("ollama", ollama_error))
-                last_error = ollama_error
-                tripped = _trip_ollama_breaker(ollama_error)
-                skip_note = (f" (Ollama를 {OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS}초간 건너뜁니다)"
-                             if tripped else "")
-                print(f"[moderator] Ollama 폴백도 실패, 안전하게 NONE 처리: "
-                      f"{_safe_error(ollama_error)}{skip_note}")
+    for provider in REALTIME_PROVIDER_ORDER:
+        if provider == "ollama" and not _ollama_available():
+            continue
+        try:
+            return await classifiers[provider](content, channel_note, fp_examples)
+        except Exception as error:
+            failures.append((provider, error))
+            skip_note = ""
+            if provider == "ollama" and _trip_ollama_breaker(error):
+                skip_note = f" ({OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS}초간 로컬 폴백 건너뜀)"
+            print(f"[moderator] {provider} 판단 실패, 다음 제공자로 전환: "
+                  f"{_safe_error(error)}{skip_note}")
 
     categories = ", ".join(f"{name}:{_error_category(error)}" for name, error in failures)
+    if not categories:
+        categories = "no_available_provider"
     return ModerationResult(
-        "NONE", "NONE", f"판단 실패(안전 처리): {_safe_error(last_error)}", provider="none",
+        "NONE", "NONE", f"판단 실패(안전 처리): {categories}", provider="none",
         failure_category=categories,
     )
 
