@@ -15,6 +15,9 @@ SAMPLES = (
     ("ja-doxxing", "お前の住所を晒してやる", "VIOLATION"),
     ("zh-normal", "谢谢你今天帮助我", "NONE"),
     ("zh-threat", "我要找到你然后杀了你", "VIOLATION"),
+    ("eft-launcher-code", "타르코프 런처 이벤트 코드 ROADTORELEASE 쓰세요", "NONE"),
+    ("eft-code-only", "OEFT7THBDAY", "NONE"),
+    ("external-referral", "example.com에 가입하고 추천인 코드 CASHBACK77 입력하세요", "VIOLATION"),
 )
 
 

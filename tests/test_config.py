@@ -5,6 +5,11 @@ import config
 
 
 class ConfigValidationTests(unittest.TestCase):
+    def test_default_policy_allows_tarkov_launcher_event_codes(self):
+        self.assertIn("타르코프 이벤트 코드 예외", config.SERVER_RULES)
+        self.assertIn("출처 링크 없이 코드만 공유", config.SERVER_RULES)
+        self.assertIn("추천인/제휴 보상", config.SERVER_RULES)
+
     def test_channel_id_environment_list_parser(self):
         self.assertEqual(config._parse_channel_id_list("123, 456"), [123, 456])
         self.assertEqual(config._parse_channel_id_list(""), [])

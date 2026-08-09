@@ -5,6 +5,10 @@ import filters
 
 
 class FilterTests(unittest.TestCase):
+    def test_promo_code_text_is_not_fast_filtered_as_advertising(self):
+        result = filters.fast_check(101, 202, "타르코프 런처 이벤트 코드 ROADTORELEASE 쓰세요")
+        self.assertEqual(result.decision, "NEEDS_AI")
+
     def setUp(self):
         filters._recent_messages.clear()
         filters._call_counter = 0
