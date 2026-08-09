@@ -333,7 +333,7 @@ BATCH_BACKEND = "auto"
 OLLAMA_BASE_URL = "http://localhost:11434"
 # 한국어 뉘앙스 판단이 중요하므로 한국어 성능이 검증된 모델 권장.
 # VRAM 여유가 있으면 더 큰 모델로, 부족하면 작은 모델로 바꾸세요.
-OLLAMA_MODEL = "qwen2.5:14b"
+OLLAMA_MODEL = "qwen3:14b"
 
 # ══════════════════════════════════════════════════════════════════
 # 실시간 판단의 3차 폴백: 로컬 Ollama

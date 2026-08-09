@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -118,6 +118,18 @@ class RealtimeOllamaFallbackTests(unittest.IsolatedAsyncioTestCase):
             result = await moderator.classify_message("정상 채팅")
         ollama.assert_awaited_once()
         self.assertEqual(result.provider, "ollama")
+
+    async def test_ollama_disables_thinking_for_realtime_json(self):
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {
+            "message": {"content": '{"level":"NONE","rule_violated":"NONE","reason":""}'},
+        }
+        with patch.object(moderator, "_get_http_client") as get_client:
+            get_client.return_value.post = AsyncMock(return_value=response)
+            await moderator._classify_with_ollama("hello")
+        payload = get_client.return_value.post.await_args.kwargs["json"]
+        self.assertIs(payload["think"], False)
 
     async def test_disabled_fallback_reports_failure_without_calling_ollama(self):
         with (

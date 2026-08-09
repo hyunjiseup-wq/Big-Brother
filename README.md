@@ -168,7 +168,7 @@ python -m pip install -r requirements.lock
   이때 실시간 판단이 전부 실패하면 메시지는 안전하게 "위반 없음"으로 통과하므로
   **사실상 키워드 필터만 남은 무감시 상태**가 됩니다. 로컬 Ollama는 호출 한도가 없어 이 구멍을 막습니다.
 - **로컬 판단 켜는 법**: `config.OLLAMA_REALTIME_FALLBACK = True`(기본값)로 두고, 봇이 도는 PC에
-  [Ollama](https://ollama.com)를 설치한 뒤 `ollama pull qwen2.5:14b`(= `config.OLLAMA_MODEL`)만
+  [Ollama](https://ollama.com)를 설치한 뒤 `ollama pull qwen3:14b`(= `config.OLLAMA_MODEL`)만
   받아두면 됩니다. Ollama가 없으면 자동으로 건너뛰므로 켜 둔 채로 둬도 손해는 없습니다.
 - **로컬 폴백 관련 설정**
   - `OLLAMA_MAX_CONCURRENT_CALLS`(기본 1): 로컬 GPU는 `MAX_CONCURRENT_AI_CALLS`(기본 8)만큼
@@ -188,6 +188,8 @@ python -m pip install -r requirements.lock
 - **상태 확인**: `!BB 상태`의 "판단 폴백 사슬"에서 3차 폴백이 대기 중인지, 연결 실패로 건너뛰는
   중인지 볼 수 있습니다. `run_bot.bat --check-network`는 Ollama 가동/모델 보유 여부를
   `[WARN]`으로 알려줍니다(없어도 봇은 정상 동작하므로 실패로 처리하지 않습니다).
+- **로컬 다국어 스모크 테스트**: `python local_model_eval.py`는 클라우드 API를 호출하지 않고 설정된
+  Ollama 모델만 사용해 한국어·영어·일본어·중국어 정상/위반 예시 8건의 결과와 처리 시간을 출력합니다.
 - **모델이 다르면 판단도 달라질 수 있음**: Gemini/Groq/로컬 모델은 학습 데이터와 안전 기준이 달라
   같은 메시지에 다른 등급을 매길 수 있고, 특히 로컬 소형 모델은 한국어 뉘앙스 판단이 가장 약합니다.
   다만 이 프로젝트는 판단 주체와 무관하게 **킥/밴을 아예 자동 실행하지 않는 정책**
@@ -232,7 +234,7 @@ python -m pip install -r requirements.lock
 
 1. `.env`의 `WATCHED_CHANNEL_IDS`에 감시할 채널 ID를 쉼표로 구분해 등록합니다.
 2. `BATCH_BACKEND`로 기본 판단 백엔드를 고릅니다: `"auto"`(Gemini→Groq 폴백, 기본) / `"gemini"` / `"groq"` / `"ollama"`.
-3. 로컬 Ollama를 쓰려면 [Ollama](https://ollama.com)를 설치하고 `ollama pull qwen2.5:14b`(또는 원하는 모델)로
+3. 로컬 Ollama를 쓰려면 [Ollama](https://ollama.com)를 설치하고 `ollama pull qwen3:14b`(또는 원하는 모델)로
    받은 뒤, `config.py`의 `OLLAMA_MODEL`을 맞춰주세요. 한국어 뉘앙스 판단이 중요하므로 한국어 성능이
    검증된 모델(Qwen, EXAONE 계열 등)을 권장하며, VRAM에 맞춰 크기를 조정하세요.
 4. `.env`의 `REPORT_CHANNEL_ID`를 설정하면 리포트가 디스코드에도 자동 전송됩니다 (비워두면 로컬 파일만 저장).

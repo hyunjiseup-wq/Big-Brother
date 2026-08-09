@@ -381,6 +381,8 @@ async def _classify_with_ollama(content: str, channel_note: str | None = None,
         ],
         "format": "json",
         "stream": False,
+        # Qwen3 thinking output is unnecessary for a short structured moderation verdict.
+        "think": False,
         "options": {"temperature": 0},
     }
 
