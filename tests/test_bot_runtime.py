@@ -235,6 +235,23 @@ class AutoModePointsTests(unittest.IsolatedAsyncioTestCase):
         rows = await database.get_recent_violations(1, 50)
         self.assertTrue(rows[0][2].endswith("_FAILED"))
 
+    async def test_warn_succeeds_without_sending_user_dm_when_disabled(self):
+        message = _message()
+        message.author.send = AsyncMock()
+        with patch.object(bot.config, "USER_SANCTION_DM_ENABLED", False):
+            ok, detail = await bot.apply_action(message, "WARN", None, "reason")
+        self.assertTrue(ok)
+        message.author.send.assert_not_awaited()
+        self.assertIn("DM 비활성화", detail)
+
+    async def test_optional_manual_notice_is_polite_and_not_a_warning(self):
+        member = SimpleNamespace(send=AsyncMock())
+        with patch.object(bot.config, "MANUAL_REVIEW_USER_NOTICE_ENABLED", True):
+            self.assertTrue(await bot._send_manual_review_test_notice(member, "테스트 서버"))
+        sent = member.send.await_args.args[0]
+        self.assertIn("실제 경고나 제재가 아니며", sent)
+        self.assertIn("불이익도 적용되지 않습니다", sent)
+
 
 class AiOutageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

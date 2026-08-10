@@ -147,6 +147,19 @@ if POLICY_FILE:
 # ══════════════════════════════════════════════════════════════════
 MANUAL_REVIEW_MODE = True
 
+# 사용자에게 제재/경고 DM을 보내지 않는다. 관리자 검수 카드와 내부 로그는 계속 유지된다.
+USER_SANCTION_DM_ENABLED = False
+
+# 수동 검수 감지 때도 기본적으로 사용자에게 아무 메시지도 보내지 않는다.
+# 꼭 테스트 안내가 필요할 때만 True로 바꾸면 아래의 공손한 안내문만 전송된다.
+MANUAL_REVIEW_USER_NOTICE_ENABLED = False
+MANUAL_REVIEW_TEST_NOTICE = (
+    "안녕하세요. 현재 '{guild_name}' 서버에서 BB봇의 판단 기능을 점검하고 있습니다.\n"
+    "이 안내는 테스트 과정에서 전달된 것으로 실제 경고나 제재가 아니며, "
+    "회원님의 이용 기록이나 권한에 어떠한 불이익도 적용되지 않습니다.\n"
+    "갑작스러운 안내로 불편을 드렸다면 죄송합니다. 확인해 주셔서 감사합니다."
+)
+
 # ── AI 판단 등급별 부여 점수 ─────────────────────────────────────────
 # AI는 메시지를 아래 5개 등급 중 하나로 분류합니다.
 VIOLATION_LEVEL_POINTS = {
@@ -203,7 +216,7 @@ ALLOW_ADMINISTRATOR_PERMISSION = True
 # 조치 내용만 공개 채널에 게시한다. 특정인을 비난하기 위한 목적이 아니라
 # 운영 기준을 투명하게 안내하기 위한 목적이다.
 # 사용하려면 .env에 PUBLIC_LOG_CHANNEL_ID를 설정하세요. 비워두면 비활성화.
-PUBLIC_SANCTION_LOG_ENABLED = True
+PUBLIC_SANCTION_LOG_ENABLED = False
 # 공개 로그에 올릴 최소 등급 (이 미만의 경미한 위반은 공개하지 않음)
 PUBLIC_LOG_MIN_LEVEL = "MODERATE"   # "MINOR" | "MODERATE" | "SEVERE" | "EXTREME"
 
@@ -491,6 +504,14 @@ def validate_config() -> None:
         errors.append("AUTO_ACTION_CEILING은 WARN/DELETE/TIMEOUT 중 하나여야 합니다.")
     if not isinstance(ALLOW_ADMINISTRATOR_PERMISSION, bool):
         errors.append("ALLOW_ADMINISTRATOR_PERMISSION은 True 또는 False여야 합니다.")
+    if not isinstance(USER_SANCTION_DM_ENABLED, bool):
+        errors.append("USER_SANCTION_DM_ENABLED는 True 또는 False여야 합니다.")
+    if not isinstance(MANUAL_REVIEW_USER_NOTICE_ENABLED, bool):
+        errors.append("MANUAL_REVIEW_USER_NOTICE_ENABLED는 True 또는 False여야 합니다.")
+    if not isinstance(PUBLIC_SANCTION_LOG_ENABLED, bool):
+        errors.append("PUBLIC_SANCTION_LOG_ENABLED는 True 또는 False여야 합니다.")
+    if not isinstance(MANUAL_REVIEW_TEST_NOTICE, str) or not MANUAL_REVIEW_TEST_NOTICE.strip():
+        errors.append("MANUAL_REVIEW_TEST_NOTICE는 비어 있지 않은 문자열이어야 합니다.")
     if IMMEDIATE_ACTION_FOR_EXTREME not in valid_actions | {None}:
         errors.append("IMMEDIATE_ACTION_FOR_EXTREME 값이 올바르지 않습니다.")
     threshold_rows_valid = all(isinstance(row, (tuple, list)) and len(row) == 3

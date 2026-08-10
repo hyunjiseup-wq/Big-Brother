@@ -262,8 +262,8 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
     elif action == "DELETE":
         primary_ok = delete_ok
 
-    # 유저에게 DM으로 안내. WARN은 DM 자체가 핵심 조치라 실패 여부를 반영한다.
-    if action != "NONE":
+    # 사용자 제재 DM은 운영 설정으로 명시적으로 켠 경우에만 보낸다.
+    if action != "NONE" and config.USER_SANCTION_DM_ENABLED:
         try:
             action_text = {
                 "WARN": "경고",
@@ -280,6 +280,10 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
                 primary_ok = True
         except (discord.Forbidden, discord.HTTPException) as e:
             details.append(f"DM 실패: {type(e).__name__}")
+    elif action == "WARN":
+        # DM을 끈 상태의 WARN은 사용자 메시지 없이 내부 경고 기록/점수만 남기는 조치다.
+        primary_ok = True
+        details.append("사용자 경고 DM 비활성화 (내부 기록만 적용)")
 
     return primary_ok, "; ".join(details) or "실행할 조치 없음"
 
@@ -405,6 +409,9 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
         print("⚠️ 검수 카드 전송 실패 — 로그 채널 권한/설정을 확인하세요. "
               "감지 기록은 DB에 남아 `!BB 검토대기`에서 조회됩니다.")
 
+    if config.MANUAL_REVIEW_USER_NOTICE_ENABLED:
+        await _send_manual_review_test_notice(message.author, message.guild.name)
+
 
 async def post_batch_review_card(message: discord.Message, level: str, reason_text: str,
                                  rule_violated: str, provider: str, review_id: int):
@@ -460,7 +467,7 @@ _REVIEW_ACTION_LABEL = {
     "ok": "정상 처리 · 이 채널에서 오탐 학습",
     "okg": "정상 처리 · 서버 전체 오탐 학습",
     "del": "메시지 삭제",
-    "warn": "경고 DM",
+    "warn": "경고 기록 (사용자 메시지 없음)",
     "to1": "타임아웃 1시간",
     "to24": "타임아웃 24시간",
     "kick": "킥 (추방)",
@@ -482,7 +489,7 @@ def _build_review_view(channel_id: int, message_id: int, user_id: int,
     add("✅ 정상 · 이 채널 학습", "ok", discord.ButtonStyle.success, 0)
     add("🌐 정상 · 서버 전체 학습", "okg", discord.ButtonStyle.success, 0)
     add("🗑️ 메시지 삭제만", "del", discord.ButtonStyle.secondary, 0)
-    add("⚠️ 경고 DM", "warn", discord.ButtonStyle.secondary, 0)
+    add("⚠️ 경고 기록", "warn", discord.ButtonStyle.secondary, 0)
     add("⏱️ 타임아웃 1시간", "to1", discord.ButtonStyle.primary, 1)
     add("⏱️ 타임아웃 24시간", "to24", discord.ButtonStyle.primary, 1)
     add("👢 킥", "kick", discord.ButtonStyle.danger, 1)
@@ -498,10 +505,23 @@ def _embed_field(embed: discord.Embed, name: str, default: str = "") -> str:
 
 
 async def _dm_member(member: discord.Member, guild_name: str, action_text: str, reason_text: str):
+    if not config.USER_SANCTION_DM_ENABLED:
+        return True
     try:
         await member.send(
             f"'{guild_name}' 서버에서 규칙 위반으로 다음 조치가 적용되었습니다: **{action_text}**\n사유: {reason_text}"
         )
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
+
+
+async def _send_manual_review_test_notice(member: discord.Member, guild_name: str) -> bool:
+    """Optional non-sanction notice for test periods; disabled by default."""
+    if not config.MANUAL_REVIEW_USER_NOTICE_ENABLED:
+        return False
+    try:
+        await member.send(config.MANUAL_REVIEW_TEST_NOTICE.format(guild_name=guild_name))
         return True
     except (discord.Forbidden, discord.HTTPException):
         return False
@@ -519,7 +539,8 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
     reason = f"[{level}] 관리자 검수 확정({admin}) - {reason_text}"[:480]
 
     member = guild.get_member(user_id)
-    if action in ("warn", "to1", "to24", "kick") and member is None:
+    if (action in ("to1", "to24", "kick")
+            or (action == "warn" and config.USER_SANCTION_DM_ENABLED)) and member is None:
         return False, "대상 유저가 서버에 없어 이 조치를 실행할 수 없습니다."
 
     if review_id and not await database.claim_review(review_id, guild.id):
@@ -530,11 +551,11 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
             await database.release_review(review_id, guild.id)
         return False, text
 
-    dm_text = {
+    dm_text = ({
         "del": "메시지 삭제 및 경고", "warn": "경고",
         "to1": "60분 타임아웃", "to24": "24시간 타임아웃",
         "kick": "서버에서 추방", "ban": "서버에서 영구 차단",
-    }.get(action)
+    }.get(action) if config.USER_SANCTION_DM_ENABLED else None)
     # 원문 메시지 삭제 (정상/경고 제외 모든 조치에 포함)
     note = ""
     if action in ("del", "to1", "to24", "kick", "ban"):
@@ -1383,6 +1404,13 @@ async def show_status(ctx):
     embed.add_field(
         name="운영 모드",
         value="🔍 수동 검수 (감지만 하고 조치 없음)" if config.MANUAL_REVIEW_MODE else "🚨 자동 조치",
+        inline=False,
+    )
+    embed.add_field(
+        name="사용자 제재 메시지",
+        value=("DM 전송" if config.USER_SANCTION_DM_ENABLED else "전송 안 함")
+              + (" · 공개 제재 로그 사용" if config.PUBLIC_SANCTION_LOG_ENABLED
+                 else " · 공개 제재 로그 사용 안 함"),
         inline=False,
     )
     queued = _message_queue.qsize()

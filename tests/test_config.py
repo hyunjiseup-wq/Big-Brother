@@ -5,6 +5,21 @@ import config
 
 
 class ConfigValidationTests(unittest.TestCase):
+    def test_user_facing_sanction_messages_are_disabled_by_default(self):
+        self.assertFalse(config.USER_SANCTION_DM_ENABLED)
+        self.assertFalse(config.MANUAL_REVIEW_USER_NOTICE_ENABLED)
+        self.assertFalse(config.PUBLIC_SANCTION_LOG_ENABLED)
+        self.assertIn("실제 경고나 제재가 아니며", config.MANUAL_REVIEW_TEST_NOTICE)
+
+    def test_user_message_flags_must_be_boolean(self):
+        for name in (
+            "USER_SANCTION_DM_ENABLED",
+            "MANUAL_REVIEW_USER_NOTICE_ENABLED",
+            "PUBLIC_SANCTION_LOG_ENABLED",
+        ):
+            with self.subTest(name=name), patch.object(config, name, "false"):
+                with self.assertRaisesRegex(ValueError, name):
+                    config.validate_config()
     def test_default_policy_allows_tarkov_launcher_event_codes(self):
         self.assertIn("타르코프 이벤트 코드 예외", config.SERVER_RULES)
         self.assertIn("출처 링크 없이 코드만 공유", config.SERVER_RULES)
