@@ -128,6 +128,27 @@ async def init_db():
             "WHERE message_id IS NOT NULL AND review_status IN ('pending', 'processing')"
         )
 
+        # AI 전량 장애 메시지는 원문을 중복 저장하지 않고 Discord 식별자만 보관한다.
+        # 재시작 후에도 Discord에서 최신 원문을 다시 읽어 판단할 수 있다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS moderation_retry_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                last_failure TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(guild_id, message_id)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_moderation_retry_due "
+            "ON moderation_retry_queue(next_attempt_at, id)"
+        )
+
         # 관리자가 검수 카드에서 '정상(오탐)'으로 확정한 메시지 (오탐 학습용, learning.py)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS false_positives (
@@ -365,6 +386,93 @@ async def log_violation(
         )
         await db.commit()
         return cursor.lastrowid
+
+
+async def enqueue_moderation_retry(
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    failure_category: str,
+    delay_seconds: float,
+) -> None:
+    """AI 전량 장애 메시지를 중복 없이 내구성 보류 큐에 넣는다."""
+    now = time.time()
+    next_attempt_at = now + max(0.0, delay_seconds)
+    async with _connect() as db:
+        await db.execute(
+            """INSERT INTO moderation_retry_queue
+               (guild_id, channel_id, message_id, attempts, next_attempt_at,
+                last_failure, created_at, updated_at)
+               VALUES (?, ?, ?, 0, ?, ?, ?, ?)
+               ON CONFLICT(guild_id, message_id) DO UPDATE SET
+                   channel_id = excluded.channel_id,
+                   next_attempt_at = MIN(moderation_retry_queue.next_attempt_at,
+                                         excluded.next_attempt_at),
+                   last_failure = excluded.last_failure,
+                   updated_at = excluded.updated_at""",
+            (guild_id, channel_id, message_id, next_attempt_at,
+             failure_category[:500], now, now),
+        )
+        await db.commit()
+
+
+async def get_due_moderation_retries(limit: int = 10):
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT id, guild_id, channel_id, message_id, attempts, last_failure
+               FROM moderation_retry_queue
+               WHERE next_attempt_at <= ?
+               ORDER BY next_attempt_at ASC, id ASC
+               LIMIT ?""",
+            (time.time(), max(1, limit)),
+        )
+        return await cursor.fetchall()
+
+
+async def reschedule_moderation_retry(
+    retry_id: int,
+    attempts: int,
+    failure_category: str,
+    delay_seconds: float,
+) -> None:
+    now = time.time()
+    async with _connect() as db:
+        await db.execute(
+            """UPDATE moderation_retry_queue
+               SET attempts = ?, next_attempt_at = ?, last_failure = ?, updated_at = ?
+               WHERE id = ?""",
+            (attempts, now + max(0.0, delay_seconds),
+             failure_category[:500], now, retry_id),
+        )
+        await db.commit()
+
+
+async def delete_moderation_retry(retry_id: int) -> None:
+    async with _connect() as db:
+        await db.execute("DELETE FROM moderation_retry_queue WHERE id = ?", (retry_id,))
+        await db.commit()
+
+
+async def delete_moderation_retry_for_message(guild_id: int, message_id: int) -> None:
+    async with _connect() as db:
+        await db.execute(
+            "DELETE FROM moderation_retry_queue WHERE guild_id = ? AND message_id = ?",
+            (guild_id, message_id),
+        )
+        await db.commit()
+
+
+async def count_moderation_retries(guild_id: int | None = None) -> int:
+    async with _connect() as db:
+        if guild_id is None:
+            cursor = await db.execute("SELECT COUNT(*) FROM moderation_retry_queue")
+        else:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM moderation_retry_queue WHERE guild_id = ?",
+                (guild_id,),
+            )
+        row = await cursor.fetchone()
+        return int(row[0])
 
 
 async def create_review_record(

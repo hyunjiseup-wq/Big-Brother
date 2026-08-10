@@ -120,6 +120,29 @@ class ConfigValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "OLLAMA_REALTIME_FALLBACK"):
                 config.validate_config()
 
+    def test_ai_retry_and_ollama_startup_settings_are_validated(self):
+        invalid = (
+            ("AI_RETRY_ENABLED", "yes"),
+            ("AI_RETRY_INITIAL_DELAY_SECONDS", 0),
+            ("AI_RETRY_MAX_DELAY_SECONDS", 0),
+            ("AI_RETRY_POLL_SECONDS", 0),
+            ("AI_RETRY_BATCH_SIZE", 0),
+            ("CLOUD_RATE_LIMIT_COOLDOWN_SECONDS", 0),
+            ("OLLAMA_AUTO_START", "yes"),
+            ("OLLAMA_STARTUP_TIMEOUT_SECONDS", 0),
+        )
+        for name, value in invalid:
+            with self.subTest(name=name), patch.object(config, name, value):
+                with self.assertRaisesRegex(ValueError, name):
+                    config.validate_config()
+
+        with (
+            patch.object(config, "AI_RETRY_INITIAL_DELAY_SECONDS", 60),
+            patch.object(config, "AI_RETRY_MAX_DELAY_SECONDS", 30),
+        ):
+            with self.assertRaisesRegex(ValueError, "초기 지연"):
+                config.validate_config()
+
     def test_local_concurrency_must_be_positive(self):
         with patch.object(config, "OLLAMA_MAX_CONCURRENT_CALLS", 0):
             with self.assertRaisesRegex(ValueError, "OLLAMA_MAX_CONCURRENT_CALLS"):

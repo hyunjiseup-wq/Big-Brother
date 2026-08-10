@@ -195,6 +195,28 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_retention_disables_redaction(self):
         self.assertEqual(await database.redact_expired_violation_content(0), 0)
 
+    async def test_ai_retry_queue_is_durable_deduplicated_and_reschedulable(self):
+        with patch.object(database.time, "time", return_value=100):
+            await database.enqueue_moderation_retry(1, 10, 99, "rate_limit", 30)
+            await database.enqueue_moderation_retry(1, 10, 99, "rate_limit", 60)
+        self.assertEqual(await database.count_moderation_retries(1), 1)
+
+        await database.init_db()
+        with patch.object(database.time, "time", return_value=131):
+            rows = await database.get_due_moderation_retries()
+        self.assertEqual(len(rows), 1)
+        retry_id = rows[0][0]
+
+        with patch.object(database.time, "time", return_value=131):
+            await database.reschedule_moderation_retry(retry_id, 1, "timeout", 60)
+        with patch.object(database.time, "time", return_value=190):
+            self.assertEqual(await database.get_due_moderation_retries(), [])
+        with patch.object(database.time, "time", return_value=192):
+            self.assertEqual((await database.get_due_moderation_retries())[0][4], 1)
+
+        await database.delete_moderation_retry_for_message(1, 99)
+        self.assertEqual(await database.count_moderation_retries(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

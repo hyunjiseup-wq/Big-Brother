@@ -18,7 +18,7 @@ from config import (SERVER_RULES, GEMINI_MODEL, GROQ_MODEL, OLLAMA_BASE_URL, OLL
                     OLLAMA_MAX_CONCURRENT_CALLS, OLLAMA_REALTIME_TIMEOUT_SECONDS,
                     OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS,
                     GEMINI_MAX_CONCURRENT_CALLS, GROQ_MAX_CONCURRENT_CALLS,
-                    REALTIME_PROVIDER_ORDER)
+                    CLOUD_RATE_LIMIT_COOLDOWN_SECONDS, REALTIME_PROVIDER_ORDER)
 
 # 이 모듈은 import 시점에 API 키를 읽으므로, bot.py의 load_dotenv()보다 먼저
 # import되어도 키를 놓치지 않도록 여기서 직접 .env를 로드한다.
@@ -38,6 +38,18 @@ _MODERATION_RESPONSE_SCHEMA = {
     },
     "required": ["level", "rule_violated", "reason"],
 }
+
+
+class _RateLimitCooldown(RuntimeError):
+    """429 회로 차단 중임을 원문 응답 없이 나타내는 내부 예외."""
+
+
+_cloud_rate_limit_until = {"gemini": 0.0, "groq": 0.0}
+
+
+def reset_cloud_rate_limit_cooldowns() -> None:
+    for provider in _cloud_rate_limit_until:
+        _cloud_rate_limit_until[provider] = 0.0
 
 
 class BatchClassificationError(RuntimeError):
@@ -83,6 +95,8 @@ def _error_category(error: Exception) -> str:
     """관리자 경고에 원문·키를 노출하지 않고 실패 종류만 남긴다."""
     if isinstance(error, (httpx.TimeoutException, TimeoutError)):
         return "timeout"
+    if isinstance(error, _RateLimitCooldown):
+        return "rate_limit"
     if isinstance(error, httpx.ConnectError):
         return "connection"
     if isinstance(error, httpx.HTTPStatusError):
@@ -333,7 +347,7 @@ async def _classify_with_groq(content: str, channel_note: str | None = None,
     return _build_result(parsed, provider="groq")
 
 
-# ── 3차 폴백(로컬 Ollama) 동시 실행 제한 & 회로 차단기 ──────────────────
+# ── 로컬 Ollama 동시 실행 제한 & 회로 차단기 ─────────────────────────
 # 클라우드 API와 달리 로컬 추론은 GPU 하나를 나눠 쓰므로, bot.py의 AI 워커 수만큼
 # 동시에 밀어 넣으면 전부 느려지기만 한다. 폴백 구간에서만 따로 좁게 제한한다.
 _ollama_semaphore = asyncio.Semaphore(OLLAMA_MAX_CONCURRENT_CALLS)
@@ -374,7 +388,7 @@ def reset_ollama_breaker() -> None:
 
 def ollama_fallback_status() -> tuple[bool, float]:
     """
-    (3차 폴백을 지금 시도할 수 있는지, 남은 쿨다운 초)를 돌려준다.
+    (로컬 판단을 지금 시도할 수 있는지, 남은 쿨다운 초)를 돌려준다.
     bot.py의 `!BB 상태`에서 마지막 그물이 살아 있는지 보여주는 데 쓴다.
     첫 값이 True여도 "최근 연결 실패가 없다"는 뜻이지 Ollama 가동을 확인한 것은 아니다.
     """
@@ -428,7 +442,7 @@ async def classify_message(content: str, channel_note: str | None = None,
     """
     config.REALTIME_PROVIDER_ORDER 순서로 제공자를 시도한다. 기본은 로컬 Ollama →
     Gemini → Groq이며, 로컬이 없거나 실패하면 클라우드로 넘어간다. 모두 실패하면
-    안전하게 NONE 처리한다.
+    provider="none" 결과를 반환하며 bot.py가 메시지를 영속 재검사 큐에 보류한다.
 
     로컬 사용이 꺼져 있거나 연결할 수 없을 때는 지정된 다음 클라우드 제공자로 넘어간다.
 
@@ -452,15 +466,27 @@ async def classify_message(content: str, channel_note: str | None = None,
     for provider in REALTIME_PROVIDER_ORDER:
         if provider == "ollama" and not _ollama_available():
             continue
+        if (provider in _cloud_rate_limit_until
+                and time.monotonic() < _cloud_rate_limit_until[provider]):
+            failures.append((provider, _RateLimitCooldown("provider cooldown")))
+            continue
         try:
-            return await classifiers[provider](
+            result = await classifiers[provider](
                 content, channel_note, fp_examples, conversation_context
             )
+            if provider in _cloud_rate_limit_until:
+                _cloud_rate_limit_until[provider] = 0.0
+            return result
         except Exception as error:
             failures.append((provider, error))
             skip_note = ""
             if provider == "ollama" and _trip_ollama_breaker(error):
                 skip_note = f" ({OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS}초간 로컬 폴백 건너뜀)"
+            elif provider in _cloud_rate_limit_until and _error_category(error) == "rate_limit":
+                _cloud_rate_limit_until[provider] = (
+                    time.monotonic() + CLOUD_RATE_LIMIT_COOLDOWN_SECONDS
+                )
+                skip_note = f" ({CLOUD_RATE_LIMIT_COOLDOWN_SECONDS}초간 제공자 건너뜀)"
             print(f"[moderator] {provider} 판단 실패, 다음 제공자로 전환: "
                   f"{_safe_error(error)}{skip_note}")
 

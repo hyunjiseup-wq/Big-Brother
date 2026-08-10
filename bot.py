@@ -7,8 +7,8 @@
    - DECIDED : 필터만으로 등급 확정, AI 호출 없이 바로 제재 처리
    - NEEDS_AI: 애매한 경우만 큐에 넣어 워커가 비동기로 AI 판단
 2. AI 판단 전, cache에서 동일/반복 문구의 기존 판단 결과가 있는지 먼저 확인
-3. moderator.classify_message()가 Gemini를 우선 시도하고, 실패/한도초과 시 Groq로,
-   Groq까지 막히면 호출 한도가 없는 로컬 Ollama로 자동 폴백 (무료 한도 소진 시 무감시 방지)
+3. moderator.classify_message()가 설정된 순서(기본 Ollama→Gemini→Groq)로 판단하고,
+   모두 실패하면 메시지를 영속 재검사 큐에 보류 (무료 한도 소진 시 영구 무감시 방지)
 4. 위반 등급에 따라 점수 부여 (config.VIOLATION_LEVEL_POINTS)
 5. 누적 점수 -> config.STRIKE_THRESHOLDS 에 따라 조치 결정
    단, 커뮤니티 정책상 킥/밴은 판단 주체(필터/Gemini/Groq/Ollama) 무관하게 자동 실행하지 않고
@@ -39,6 +39,7 @@ import cache
 import learning
 from filters import FilterResult, extract_discord_invite_urls, fast_check
 import moderator
+import ollama_runtime
 import runtime_lock
 from moderator import classify_message, get_channel_note
 from batch_audit import prune_expired_reports, run_full_audit
@@ -365,7 +366,7 @@ async def send_public_sanction_log(guild: discord.Guild, level: str, rule_violat
 
 
 _PROVIDER_LABEL = {"gemini": "Gemini(1차)", "groq": "Groq(2차 폴백)",
-                   "ollama": "Ollama(3차 폴백·로컬)", "filter": "키워드 필터", "none": "판단 실패"}
+                   "ollama": "Ollama(로컬)", "filter": "키워드 필터", "none": "판단 실패"}
 
 
 async def _handle_violation_review_only(message: discord.Message, level: str, reason_text: str,
@@ -842,9 +843,8 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
         await send_public_sanction_log(message.guild, level, rule_violated, action)
 
 
-# AI 전량 장애 감지: Gemini/Groq/Ollama가 모두 실패하면 안전하게 NONE 처리되지만(무고한 제재
-# 방지) 콘솔에만 찍혀서 관리자가 무감시 상태를 모를 수 있다. 연속 실패가 임계치에 닿으면
-# 로그 채널에 경고를 올린다.
+# AI 전량 장애 감지: Gemini/Groq/Ollama가 모두 실패하면 메시지를 SQLite 보류 큐에 넣지만,
+# 복구 전까지 판단이 지연되는 사실을 관리자가 놓치지 않도록 연속 실패 시 로그 채널에 알린다.
 # 상태는 서버(guild)별로 따로 센다 — 전역 카운터로 두면 여러 서버에 들어가 있을 때
 # 한 서버의 성공이 다른 서버의 연속 실패를 초기화하고, 알림도 엉뚱한 서버로 갈 수 있다.
 # {guild_id: {"streak": int, "last_alert": datetime | None}}
@@ -898,7 +898,8 @@ async def _track_ai_outage(guild: discord.Guild, result):
         description=(
             f"{chain_text} **{state['streak']}회 연속 실패**했습니다.\n"
             f"최근 실패 유형: `{state['last_category']}`\n"
-            "실패한 메시지는 안전하게 '위반 없음' 처리되므로 지금 서버는 **키워드 필터만으로 감시 중**입니다.\n\n"
+            "실패한 메시지는 **내구성 재검사 큐에 보류**되며 제공자가 복구되면 다시 판단합니다. "
+            "복구 전까지 신규 판단은 지연되고 현재 즉시 감시는 키워드 필터만 동작합니다.\n\n"
             f"확인할 것:\n{checklist}"
         ),
         color=discord.Color.red(),
@@ -929,6 +930,9 @@ async def ai_worker(worker_id: int):
                 except (discord.Forbidden, discord.HTTPException):
                     latest = None
                 if latest is not None and latest.content == message.content:
+                    await database.delete_moderation_retry_for_message(
+                        message.guild.id, message.id
+                    )
                     continue
                 if latest is not None:
                     message = latest
@@ -946,6 +950,9 @@ async def ai_worker(worker_id: int):
             cached = cache.get(message.content, context=cache_context)
             if cached is not None:
                 level, rule_violated, reason_text, provider = cached
+                await database.delete_moderation_retry_for_message(
+                    message.guild.id, message.id
+                )
                 await handle_violation(
                     message, level, f"(캐시된 판단) {reason_text}",
                     rule_violated=rule_violated, provider=provider,
@@ -967,12 +974,153 @@ async def ai_worker(worker_id: int):
                     result.reason, result.provider, context=cache_context,
                 )
             await _track_ai_outage(message.guild, result)
+            if await _defer_ai_failure(message, result, f"worker-{worker_id}"):
+                continue
+            if result.provider != "none":
+                await database.delete_moderation_retry_for_message(
+                    message.guild.id, message.id
+                )
             await handle_violation(message, result.level, result.reason, result.rule_violated, provider=result.provider)
         except Exception as e:
             print(f"[worker-{worker_id}] 처리 중 오류: {e}")
         finally:
             _processing_keys.discard(processing_key)
             _message_queue.task_done()
+
+
+async def _defer_ai_failure(message: discord.Message, result, source: str) -> bool:
+    """전량 장애 결과를 영구 통과시키지 않고 재검사 큐에 저장했으면 True를 반환한다."""
+    if result.provider != "none" or not config.AI_RETRY_ENABLED:
+        return False
+    await database.enqueue_moderation_retry(
+        message.guild.id,
+        message.channel.id,
+        message.id,
+        result.failure_category or "unknown",
+        config.AI_RETRY_INITIAL_DELAY_SECONDS,
+    )
+    print(f"[{source}] AI 판단 실패 메시지 {message.id}를 재검사 큐에 보류했습니다.")
+    return True
+
+
+def _ai_retry_delay(attempts: int) -> float:
+    multiplier = 2 ** min(max(0, attempts), 8)
+    return min(
+        config.AI_RETRY_MAX_DELAY_SECONDS,
+        config.AI_RETRY_INITIAL_DELAY_SECONDS * multiplier,
+    )
+
+
+async def ai_retry_worker():
+    """SQLite에 보류한 AI 전량 장애 메시지를 제공자 복구 후 다시 판단한다."""
+    while True:
+        rows = await database.get_due_moderation_retries(config.AI_RETRY_BATCH_SIZE)
+        if not rows:
+            await asyncio.sleep(config.AI_RETRY_POLL_SECONDS)
+            continue
+
+        for retry_id, guild_id, channel_id, message_id, attempts, _ in rows:
+            guild = bot.get_guild(guild_id)
+            if guild is None:
+                await database.delete_moderation_retry(retry_id)
+                continue
+            channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await bot.fetch_channel(channel_id)
+                except discord.NotFound:
+                    await database.delete_moderation_retry(retry_id)
+                    continue
+                except (discord.Forbidden, discord.HTTPException):
+                    await database.reschedule_moderation_retry(
+                        retry_id, attempts + 1, "discord_channel_unavailable",
+                        _ai_retry_delay(attempts + 1),
+                    )
+                    continue
+
+            try:
+                message = await channel.fetch_message(message_id)
+            except discord.NotFound:
+                await database.delete_moderation_retry(retry_id)
+                continue
+            except (discord.Forbidden, discord.HTTPException):
+                await database.reschedule_moderation_retry(
+                    retry_id, attempts + 1, "discord_message_unavailable",
+                    _ai_retry_delay(attempts + 1),
+                )
+                continue
+
+            if getattr(message.author, "bot", False):
+                await database.delete_moderation_retry(retry_id)
+                continue
+            processing_key = _message_processing_key(message)
+            if processing_key in _processing_keys:
+                await database.reschedule_moderation_retry(
+                    retry_id, attempts, "already_processing", config.AI_RETRY_POLL_SECONDS
+                )
+                continue
+
+            _processing_keys.add(processing_key)
+            try:
+                if await learning.is_known_false_positive(
+                        guild.id, message.channel, message.content):
+                    await database.delete_moderation_retry(retry_id)
+                    continue
+
+                channel_note = get_channel_note(message.channel)
+                conversation_context = await _barter_conversation_context(message)
+                cache_context = channel_note or ""
+                if conversation_context:
+                    cache_context += "\x00" + json.dumps(
+                        conversation_context, ensure_ascii=False, sort_keys=True
+                    )
+                cached = cache.get(message.content, context=cache_context)
+                if cached is not None:
+                    level, rule_violated, reason_text, provider = cached
+                    await database.delete_moderation_retry(retry_id)
+                    await handle_violation(
+                        message, level, f"(재검사·캐시된 판단) {reason_text}",
+                        rule_violated=rule_violated, provider=provider,
+                    )
+                    continue
+
+                fp_examples = await learning.get_prompt_examples(guild.id, message.channel)
+                async with _ai_semaphore:
+                    result = await classify_message(
+                        message.content,
+                        channel_note=channel_note,
+                        fp_examples=fp_examples,
+                        conversation_context=conversation_context,
+                    )
+                await _track_ai_outage(guild, result)
+                if result.provider == "none":
+                    next_attempt = attempts + 1
+                    await database.reschedule_moderation_retry(
+                        retry_id,
+                        next_attempt,
+                        result.failure_category or "unknown",
+                        _ai_retry_delay(next_attempt),
+                    )
+                    continue
+
+                cache.set(
+                    message.content, result.level, result.rule_violated,
+                    result.reason, result.provider, context=cache_context,
+                )
+                await database.delete_moderation_retry(retry_id)
+                await handle_violation(
+                    message, result.level, f"(장애 복구 후 재판단) {result.reason}",
+                    result.rule_violated, provider=result.provider,
+                )
+            except Exception as error:
+                next_attempt = attempts + 1
+                await database.reschedule_moderation_retry(
+                    retry_id, next_attempt, type(error).__name__,
+                    _ai_retry_delay(next_attempt),
+                )
+                print(f"[retry-worker] 메시지 {message_id} 재검사 중 오류: {type(error).__name__}")
+            finally:
+                _processing_keys.discard(processing_key)
 
 
 # 매일 정해진 시각(한국 시간)에만 실행 — 시작 즉시 실행되는 hours= 방식과 달리
@@ -1036,6 +1184,8 @@ async def on_ready():
     if not _workers_started:
         for i in range(config.MAX_CONCURRENT_AI_CALLS):
             _spawn(ai_worker(i))
+        if config.AI_RETRY_ENABLED:
+            _spawn(ai_retry_worker())
         _workers_started = True
 
     if config.WATCHED_CHANNEL_IDS and not batch_audit_task.is_running():
@@ -1526,6 +1676,12 @@ async def show_status(ctx):
     embed.add_field(name="대기열", value=f"{gauge} {queued} / {config.MAX_QUEUE_SIZE} ({usage:.0f}%)", inline=True)
     embed.add_field(name="AI 워커 수", value=str(config.MAX_CONCURRENT_AI_CALLS), inline=True)
     embed.add_field(name="판단 폴백 사슬", value=_fallback_chain_status(), inline=False)
+    retry_count = await database.count_moderation_retries(ctx.guild.id)
+    embed.add_field(
+        name="AI 장애 재검사 대기",
+        value=(f"{retry_count}건" if retry_count else "없음"),
+        inline=True,
+    )
 
     total_dropped = _dropped_count + _expired_count
     drop_text = (f"큐 포화 {_dropped_count}건 · 대기 초과 {_expired_count}건"
@@ -1611,4 +1767,8 @@ def _acquire_single_instance_lock():
 if __name__ == "__main__":
     validate_runtime_environment()
     _instance_lock = _acquire_single_instance_lock()
+    ollama_ready, ollama_status = ollama_runtime.ensure_ollama_running()
+    print(f"[ollama] {ollama_status}")
+    if ollama_ready:
+        moderator.reset_ollama_breaker()
     bot.run(TOKEN)

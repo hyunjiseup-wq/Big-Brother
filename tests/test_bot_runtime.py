@@ -367,6 +367,61 @@ class AiOutageTests(unittest.IsolatedAsyncioTestCase):
         await bot._track_ai_outage(guild, self._result("gemini"))
         self.assertEqual(bot._ai_outage_state[1]["streak"], 0)
 
+    async def test_total_ai_failure_is_deferred_instead_of_treated_as_none(self):
+        message = _message()
+        result = SimpleNamespace(provider="none", failure_category="gemini:rate_limit")
+        with (
+            patch.object(bot.config, "AI_RETRY_ENABLED", True),
+            patch.object(bot.database, "enqueue_moderation_retry", new=AsyncMock()) as enqueue,
+        ):
+            deferred = await bot._defer_ai_failure(message, result, "test")
+        self.assertTrue(deferred)
+        enqueue.assert_awaited_once_with(
+            message.guild.id,
+            message.channel.id,
+            message.id,
+            "gemini:rate_limit",
+            bot.config.AI_RETRY_INITIAL_DELAY_SECONDS,
+        )
+
+    def test_retry_delay_is_bounded(self):
+        self.assertEqual(bot._ai_retry_delay(0), bot.config.AI_RETRY_INITIAL_DELAY_SECONDS)
+        self.assertLessEqual(bot._ai_retry_delay(100), bot.config.AI_RETRY_MAX_DELAY_SECONDS)
+
+
+class AiRetryWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deferred_message_is_reclassified_and_removed_after_recovery(self):
+        message = _message(content="재검사 대상")
+        message.author.bot = False
+        message.guild.get_channel = lambda channel_id: message.channel
+        verdict = bot.moderator.ModerationResult(
+            "MODERATE", "3", "재검사에서 위반 확인", provider="ollama"
+        )
+        due_rows = [[(7, message.guild.id, message.channel.id, message.id, 0, "rate_limit")]]
+        with (
+            patch.object(
+                bot.database, "get_due_moderation_retries",
+                new=AsyncMock(side_effect=due_rows + [asyncio.CancelledError()]),
+            ),
+            patch.object(bot.bot, "get_guild", return_value=message.guild),
+            patch.object(bot.learning, "is_known_false_positive",
+                         new=AsyncMock(return_value=False)),
+            patch.object(bot.learning, "get_prompt_examples",
+                         new=AsyncMock(return_value=[])),
+            patch.object(bot, "classify_message", new=AsyncMock(return_value=verdict)) as classify,
+            patch.object(bot, "_track_ai_outage", new=AsyncMock()),
+            patch.object(bot.database, "delete_moderation_retry", new=AsyncMock()) as delete,
+            patch.object(bot, "handle_violation", new=AsyncMock()) as handle,
+            patch.object(bot.cache, "get", return_value=None),
+            patch.object(bot.cache, "set"),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await bot.ai_retry_worker()
+        classify.assert_awaited_once()
+        delete.assert_awaited_once_with(7)
+        handle.assert_awaited_once()
+        self.assertEqual(handle.await_args.args[1], "MODERATE")
+
 
 class DropAlertTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

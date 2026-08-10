@@ -241,6 +241,10 @@ MAX_CONCURRENT_AI_CALLS = 8
 GEMINI_MAX_CONCURRENT_CALLS = 2
 GROQ_MAX_CONCURRENT_CALLS = 2
 
+# 429를 받은 제공자를 메시지마다 재호출하면 남은 제공자와 재검사 큐까지 함께 밀린다.
+# 제공자별로 이 시간 동안 회로를 열어 즉시 다음 판단망으로 넘긴다.
+CLOUD_RATE_LIMIT_COOLDOWN_SECONDS = 60
+
 # 실시간 판단 순서. 로컬 Ollama가 없거나 회로 차단 중이면 즉시 다음 클라우드로 넘어간다.
 REALTIME_PROVIDER_ORDER = _parse_provider_order(
     os.environ.get("REALTIME_PROVIDER_ORDER", "ollama,gemini,groq")
@@ -271,6 +275,14 @@ FALSE_POSITIVE_REFRESH_SECONDS = 300     # 오탐 사례 목록을 DB에서 다�
 AI_OUTAGE_ALERT_THRESHOLD = 5
 # 장애가 길어져도 이 간격(분)보다 자주 경고를 반복하지는 않음
 AI_OUTAGE_ALERT_COOLDOWN_MINUTES = 60
+
+# 모든 AI 제공자가 실패한 메시지는 위반 없음으로 버리지 않고 SQLite 보류 큐에 저장해
+# 제공자 복구 후 다시 판단한다. 재부팅되어도 큐가 유지된다.
+AI_RETRY_ENABLED = True
+AI_RETRY_INITIAL_DELAY_SECONDS = 30
+AI_RETRY_MAX_DELAY_SECONDS = 300
+AI_RETRY_POLL_SECONDS = 5
+AI_RETRY_BATCH_SIZE = 10
 
 # ── 메시지 누락(드롭) 알림 ───────────────────────────────────────────
 # 큐가 가득 차거나(MAX_QUEUE_SIZE 초과) 큐에서 너무 오래 대기해(MAX_QUEUE_AGE_SECONDS)
@@ -404,10 +416,10 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen3:14b"
 
 # ══════════════════════════════════════════════════════════════════
-# 실시간 판단의 3차 폴백: 로컬 Ollama
+# 실시간 판단의 호출 한도 없는 로컬 판단망: Ollama
 # Gemini도 Groq도 무료 티어라 일일 한도가 있고, 둘 다 소진되면 실시간 판단이 전부
-# 실패해 메시지가 "위반 없음"으로 통과한다(= 키워드 필터만 남은 사실상 무감시 상태).
-# 로컬 Ollama는 호출 한도가 없으므로 마지막 그물로 쓴다.
+# 실패할 수 있다. 로컬 Ollama는 호출 한도가 없으므로 기본 순서에서 먼저 사용하고,
+# 전 제공자 실패 메시지는 AI_RETRY 설정에 따라 복구 후 다시 판단한다.
 # 봇을 돌리는 PC에 Ollama가 떠 있어야 하며, 없으면 자동으로 건너뛰므로
 # (아래 UNAVAILABLE_COOLDOWN 참고) 켜 둔 채로 두어도 손해는 없다.
 # ══════════════════════════════════════════════════════════════════
@@ -428,6 +440,10 @@ OLLAMA_REALTIME_TIMEOUT_SECONDS = 60
 # 않는다. 매 메시지마다 죽은 주소로 연결을 시도하다 큐가 밀리는 것을 막는 회로 차단기다.
 # 0으로 두면 매번 시도한다.
 OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS = 300
+
+# 로컬 주소를 사용할 때 봇 시작 과정에서 Ollama 서버가 꺼져 있으면 자동으로 숨김 기동한다.
+OLLAMA_AUTO_START = True
+OLLAMA_STARTUP_TIMEOUT_SECONDS = 15
 
 # 완성된 리포트를 저장할 로컬 폴더 (Markdown 파일)
 REPORT_OUTPUT_DIR = "./reports"
@@ -466,6 +482,10 @@ def validate_config() -> None:
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"{name}는 1 이상의 정수여야 합니다.")
+    if (isinstance(CLOUD_RATE_LIMIT_COOLDOWN_SECONDS, bool)
+            or not isinstance(CLOUD_RATE_LIMIT_COOLDOWN_SECONDS, (int, float))
+            or CLOUD_RATE_LIMIT_COOLDOWN_SECONDS <= 0):
+        errors.append("CLOUD_RATE_LIMIT_COOLDOWN_SECONDS는 0보다 커야 합니다.")
     if (not REALTIME_PROVIDER_ORDER
             or len(set(REALTIME_PROVIDER_ORDER)) != len(REALTIME_PROVIDER_ORDER)
             or any(provider not in valid_realtime_providers
@@ -475,6 +495,21 @@ def validate_config() -> None:
         )
     if DROP_ALERT_THRESHOLD <= 0 or DROP_ALERT_COOLDOWN_MINUTES <= 0:
         errors.append("DROP_ALERT_THRESHOLD와 DROP_ALERT_COOLDOWN_MINUTES는 1 이상이어야 합니다.")
+    if not isinstance(AI_RETRY_ENABLED, bool):
+        errors.append("AI_RETRY_ENABLED는 True 또는 False여야 합니다.")
+    for name, value in (
+        ("AI_RETRY_INITIAL_DELAY_SECONDS", AI_RETRY_INITIAL_DELAY_SECONDS),
+        ("AI_RETRY_MAX_DELAY_SECONDS", AI_RETRY_MAX_DELAY_SECONDS),
+        ("AI_RETRY_POLL_SECONDS", AI_RETRY_POLL_SECONDS),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"{name}는 0보다 큰 숫자여야 합니다.")
+    if (isinstance(AI_RETRY_BATCH_SIZE, bool)
+            or not isinstance(AI_RETRY_BATCH_SIZE, int)
+            or AI_RETRY_BATCH_SIZE <= 0):
+        errors.append("AI_RETRY_BATCH_SIZE는 1 이상의 정수여야 합니다.")
+    if AI_RETRY_MAX_DELAY_SECONDS < AI_RETRY_INITIAL_DELAY_SECONDS:
+        errors.append("AI_RETRY_MAX_DELAY_SECONDS는 초기 지연보다 작을 수 없습니다.")
     if MAX_QUEUE_SIZE <= 0 or MAX_QUEUE_AGE_SECONDS <= 0:
         errors.append("큐 크기와 최대 대기시간은 1 이상이어야 합니다.")
     if CACHE_TTL_SECONDS <= 0 or CACHE_MAX_ENTRIES <= 0:
@@ -513,6 +548,12 @@ def validate_config() -> None:
         errors.append("OLLAMA_REALTIME_TIMEOUT_SECONDS는 0보다 커야 합니다.")
     if OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS < 0:
         errors.append("OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS는 0 이상이어야 합니다.")
+    if not isinstance(OLLAMA_AUTO_START, bool):
+        errors.append("OLLAMA_AUTO_START는 True 또는 False여야 합니다.")
+    if (isinstance(OLLAMA_STARTUP_TIMEOUT_SECONDS, bool)
+            or not isinstance(OLLAMA_STARTUP_TIMEOUT_SECONDS, (int, float))
+            or OLLAMA_STARTUP_TIMEOUT_SECONDS <= 0):
+        errors.append("OLLAMA_STARTUP_TIMEOUT_SECONDS는 0보다 커야 합니다.")
     if not all(isinstance(model, str) and model.strip()
                for model in (GEMINI_MODEL, GROQ_MODEL, OLLAMA_MODEL)):
         errors.append("AI 모델 이름은 비어 있지 않은 문자열이어야 합니다.")

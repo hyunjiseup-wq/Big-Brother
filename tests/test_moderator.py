@@ -92,6 +92,24 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         error = httpx.HTTPStatusError("secret response", request=response.request, response=response)
         self.assertEqual(moderator._error_category(error), "rate_limit")
 
+    async def test_rate_limited_cloud_provider_uses_cooldown_instead_of_repeated_calls(self):
+        response = httpx.Response(429, request=httpx.Request("POST", "https://example.test"))
+        error = httpx.HTTPStatusError("limited", request=response.request, response=response)
+        verdict = moderator.ModerationResult("NONE", "NONE", "", provider="groq")
+        moderator.reset_cloud_rate_limit_cooldowns()
+        self.addCleanup(moderator.reset_cloud_rate_limit_cooldowns)
+        with (
+            patch.object(moderator, "REALTIME_PROVIDER_ORDER", ("gemini", "groq")),
+            patch.object(moderator, "_classify_with_gemini",
+                         new=AsyncMock(side_effect=error)) as gemini,
+            patch.object(moderator, "_classify_with_groq",
+                         new=AsyncMock(return_value=verdict)) as groq,
+        ):
+            await moderator.classify_message("첫 번째")
+            await moderator.classify_message("두 번째")
+        self.assertEqual(gemini.await_count, 1)
+        self.assertEqual(groq.await_count, 2)
+
     async def test_gemini_uses_schema_without_dynamic_thinking(self):
         response = httpx.Response(
             200,
