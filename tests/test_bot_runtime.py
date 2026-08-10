@@ -315,6 +315,25 @@ class AutoModePointsTests(unittest.IsolatedAsyncioTestCase):
         message.author.send.assert_not_awaited()
         self.assertIn("DM 비활성화", detail)
 
+    async def test_enabled_sanction_dm_contains_message_evidence(self):
+        message = _message(content="제가 작성한 문제 메시지")
+        message.created_at = bot.datetime.datetime(
+            2026, 8, 10, 12, 34, tzinfo=bot.datetime.timezone.utc
+        )
+        message.author.send = AsyncMock()
+        with patch.object(bot.config, "USER_SANCTION_DM_ENABLED", True):
+            ok, detail = await bot.apply_action(message, "WARN", None, "관리자 확인 사유")
+        self.assertTrue(ok)
+        self.assertIn("DM 성공", detail)
+        sent = message.author.send.await_args.args[0]
+        self.assertIn("제가 작성한 문제 메시지", sent)
+        self.assertIn("#general", sent)
+        self.assertIn("작성 시각", sent)
+        self.assertIn(message.jump_url, sent)
+        self.assertIn("이의 제기", sent)
+        allowed_mentions = message.author.send.await_args.kwargs["allowed_mentions"]
+        self.assertFalse(allowed_mentions.everyone)
+
     async def test_optional_manual_notice_is_polite_and_not_a_warning(self):
         member = SimpleNamespace(send=AsyncMock())
         with patch.object(bot.config, "MANUAL_REVIEW_USER_NOTICE_ENABLED", True):
@@ -322,6 +341,78 @@ class AutoModePointsTests(unittest.IsolatedAsyncioTestCase):
         sent = member.send.await_args.args[0]
         self.assertIn("실제 경고나 제재가 아니며", sent)
         self.assertIn("불이익도 적용되지 않습니다", sent)
+
+
+class SanctionNoticeTests(unittest.TestCase):
+    def test_deleted_message_evidence_is_restored_from_ids(self):
+        created_at = bot.datetime.datetime(
+            2026, 8, 10, 9, 15, tzinfo=bot.datetime.timezone.utc
+        )
+        message_id = bot.discord.utils.time_snowflake(created_at)
+        notice = bot._build_user_sanction_notice(
+            "한국 타르코프", "60분 타임아웃", "관리자 수동 검수 확정",
+            guild_id=123, channel_id=456, message_id=message_id,
+            message_content="삭제 전 보존된 원문", channel_display="#팀원찾기",
+        )
+        self.assertIn("삭제 전 보존된 원문", notice)
+        self.assertIn("#팀원찾기 (ID: `456`)", notice)
+        self.assertIn(
+            f"https://discord.com/channels/123/456/{message_id}", notice
+        )
+        self.assertIn(f"<t:{int(created_at.timestamp())}:F>", notice)
+        self.assertLessEqual(len(notice), 2000)
+
+
+class ManualReviewSanctionEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_warning_uses_full_stored_evidence(self):
+        created_at = bot.datetime.datetime(
+            2026, 8, 10, 11, 20, tzinfo=bot.datetime.timezone.utc
+        )
+        target_message = SimpleNamespace(
+            content="DB와 Discord에서 확인한 전체 원문",
+            created_at=created_at,
+            jump_url="https://discord.com/channels/1/10/999",
+            delete=AsyncMock(),
+        )
+        channel = SimpleNamespace(
+            id=10, mention="#검수대상", name="검수대상",
+            fetch_message=AsyncMock(return_value=target_message),
+        )
+        member = SimpleNamespace(send=AsyncMock())
+        guild = SimpleNamespace(id=1, name="테스트 서버")
+        guild.get_member = lambda user_id: member
+        guild.get_channel = lambda channel_id: channel
+        guild.get_channel_or_thread = lambda channel_id: channel
+        embed = bot.discord.Embed()
+        embed.add_field(name="위반 등급", value="MODERATE")
+        embed.add_field(name="위반 규정", value="외부 광고")
+        embed.add_field(name="사유", value="관리자가 문맥을 확인함")
+        embed.add_field(name="원문", value="절단된 원문")
+        log_message = SimpleNamespace(embeds=[embed])
+        admin = SimpleNamespace(id=77, mention="<@77>")
+
+        with (
+            patch.object(bot.config, "USER_SANCTION_DM_ENABLED", True),
+            patch.object(bot.database, "claim_review", new=AsyncMock(return_value=True)),
+            patch.object(
+                bot.database, "get_violation_content",
+                new=AsyncMock(return_value="DB에 보존된 전체 원문"),
+            ),
+            patch.object(bot.database, "resolve_review", new=AsyncMock()),
+            patch.object(bot.database, "add_points", new=AsyncMock(return_value=3)),
+            patch.object(bot, "send_public_sanction_log", new=AsyncMock()),
+        ):
+            ok, result = await bot._apply_review_action(
+                guild, log_message, admin, "warn", 10, 999, 50, review_id=123
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("경고 전달", result)
+        notice = member.send.await_args.args[0]
+        self.assertIn("DB와 Discord에서 확인한 전체 원문", notice)
+        self.assertIn("#검수대상", notice)
+        self.assertIn(f"<t:{int(created_at.timestamp())}:F>", notice)
+        target_message.delete.assert_not_awaited()
 
 
 class AiOutageTests(unittest.IsolatedAsyncioTestCase):

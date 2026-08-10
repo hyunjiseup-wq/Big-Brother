@@ -267,22 +267,29 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
 
     # 사용자 제재 DM은 운영 설정으로 명시적으로 켠 경우에만 보낸다.
     if action != "NONE" and config.USER_SANCTION_DM_ENABLED:
-        try:
-            action_text = {
-                "WARN": "경고",
-                "DELETE": "메시지 삭제 및 경고",
-                "TIMEOUT": f"{duration_minutes}분 타임아웃",
-                "KICK": "서버에서 추방",
-                "BAN": "서버에서 영구 차단",
-            }.get(action, action)
-            await member.send(
-                f"'{guild.name}' 서버에서 규칙 위반으로 다음 조치가 적용되었습니다: **{action_text}**\n사유: {reason}"
-            )
+        action_text = {
+            "WARN": "경고",
+            "DELETE": "메시지 삭제 및 경고",
+            "TIMEOUT": f"{duration_minutes}분 타임아웃",
+            "KICK": "서버에서 추방",
+            "BAN": "서버에서 영구 차단",
+        }.get(action, action)
+        dm_ok = await _dm_member(
+            member, guild.name, action_text, reason,
+            guild_id=guild.id,
+            channel_id=message.channel.id,
+            message_id=message.id,
+            message_content=message.content,
+            channel_display=getattr(message.channel, "mention", None),
+            created_at=getattr(message, "created_at", None),
+            jump_url=getattr(message, "jump_url", None),
+        )
+        if dm_ok:
             details.append("DM 성공")
             if action == "WARN":
                 primary_ok = True
-        except (discord.Forbidden, discord.HTTPException) as e:
-            details.append(f"DM 실패: {type(e).__name__}")
+        else:
+            details.append("DM 실패: 사용자 DM 차단 또는 Discord API 오류")
     elif action == "WARN":
         # DM을 끈 상태의 WARN은 사용자 메시지 없이 내부 경고 기록/점수만 남기는 조치다.
         primary_ok = True
@@ -399,6 +406,11 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
     embed.add_field(name="위반 등급", value=level, inline=True)
     embed.add_field(name="위반 규정", value=str(rule_violated), inline=True)
     embed.add_field(name="판단 주체", value=_PROVIDER_LABEL.get(provider, provider), inline=True)
+    embed.add_field(
+        name="작성 시각",
+        value=f"{discord.utils.format_dt(message.created_at, 'F')} ({discord.utils.format_dt(message.created_at, 'R')})",
+        inline=True,
+    )
     embed.add_field(name="자동 모드였다면", value=f"{action_label} (점수 {would_be_points:.1f})", inline=False)
     embed.add_field(name="사유", value=reason_text or "-", inline=False)
     embed.add_field(name="원문", value=(message.content[:500] or "(내용 없음)"), inline=False)
@@ -444,7 +456,11 @@ async def post_batch_review_card(message: discord.Message, level: str, reason_te
     embed.add_field(name="위반 등급", value=level, inline=True)
     embed.add_field(name="위반 규정", value=str(rule_violated), inline=True)
     embed.add_field(name="판단 주체", value=_PROVIDER_LABEL.get(provider, provider), inline=True)
-    embed.add_field(name="작성 시각", value=discord.utils.format_dt(message.created_at, "f"), inline=True)
+    embed.add_field(
+        name="작성 시각",
+        value=f"{discord.utils.format_dt(message.created_at, 'F')} ({discord.utils.format_dt(message.created_at, 'R')})",
+        inline=True,
+    )
     embed.add_field(name="자동 모드였다면", value=f"{action_label} (점수 {would_be_points:.1f})", inline=False)
     embed.add_field(name="사유", value=reason_text or "-", inline=False)
     embed.add_field(name="원문", value=(message.content[:500] or "(내용 없음)"), inline=False)
@@ -507,13 +523,72 @@ def _embed_field(embed: discord.Embed, name: str, default: str = "") -> str:
     return default
 
 
-async def _dm_member(member: discord.Member, guild_name: str, action_text: str, reason_text: str):
+def _build_user_sanction_notice(
+        guild_name: str, action_text: str, reason_text: str, *,
+        guild_id: int = None, channel_id: int = None, message_id: int = None,
+        message_content: str = "",
+        channel_display: str = None, created_at=None, jump_url: str = None) -> str:
+    """관리자 확정 제재 DM에 사실관계 확인용 메시지 증거를 포함한다."""
+    guild_name = (guild_name or "서버")[:100]
+    action_text = (action_text or "운영 조치")[:100]
+    reason_text = (reason_text or "서버 운영 정책 위반")[:450]
+
+    if created_at is None and message_id:
+        try:
+            created_at = discord.utils.snowflake_time(int(message_id))
+        except (TypeError, ValueError, OverflowError):
+            created_at = None
+    if created_at is not None:
+        timestamp = int(created_at.timestamp())
+        time_text = f"<t:{timestamp}:F> (<t:{timestamp}:R>)"
+    else:
+        time_text = "확인 불가"
+
+    channel_text = (channel_display or "").strip()
+    if not channel_text:
+        channel_text = f"채널 ID `{channel_id}`" if channel_id else "확인 불가"
+    elif channel_id:
+        channel_text = f"{channel_text} (ID: `{channel_id}`)"
+
+    if not jump_url and guild_id and message_id and channel_id:
+        # 삭제된 메시지도 어느 서버/채널의 어떤 메시지였는지 식별할 수 있게 링크를 복원한다.
+        # 실제 메시지가 이미 삭제됐다면 Discord에서 링크가 열리지 않을 수 있다.
+        jump_url = f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+    link_text = jump_url or "확인 불가"
+
+    content = (message_content or "").strip()
+    content = content[:700] if content else "(텍스트 내용 없음)"
+    quoted_content = "\n".join(f"> {line}" for line in content.splitlines())
+
+    notice = (
+        f"안녕하세요. **{guild_name}** 서버 운영 정책에 따라 아래 메시지에 대해 조치가 적용되었습니다.\n\n"
+        f"- 적용 조치: **{action_text}**\n"
+        f"- 판단 사유: {reason_text}\n"
+        f"- 작성 채널: {channel_text}\n"
+        f"- 작성 시각: {time_text}\n"
+        f"- 메시지 바로가기: {link_text}\n\n"
+        f"확인된 메시지\n{quoted_content}\n\n"
+        "메시지가 이미 삭제된 경우 바로가기가 열리지 않을 수 있습니다. "
+        "작성 내용이 본인의 메시지와 다르거나 정황 설명 및 이의 제기가 필요하면 서버 운영진에게 문의해 주세요."
+    )
+    return notice[:2000]
+
+
+async def _dm_member(
+        member: discord.Member, guild_name: str, action_text: str, reason_text: str, *,
+        guild_id: int = None, channel_id: int = None, message_id: int = None,
+        message_content: str = "",
+        channel_display: str = None, created_at=None, jump_url: str = None):
     if not config.USER_SANCTION_DM_ENABLED:
         return True
     try:
-        await member.send(
-            f"'{guild_name}' 서버에서 규칙 위반으로 다음 조치가 적용되었습니다: **{action_text}**\n사유: {reason_text}"
+        notice = _build_user_sanction_notice(
+            guild_name, action_text, reason_text,
+            guild_id=guild_id, channel_id=channel_id, message_id=message_id,
+            message_content=message_content, channel_display=channel_display,
+            created_at=created_at, jump_url=jump_url,
         )
+        await member.send(notice, allowed_mentions=discord.AllowedMentions.none())
         return True
     except (discord.Forbidden, discord.HTTPException):
         return False
@@ -559,21 +634,40 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
         "to1": "60분 타임아웃", "to24": "24시간 타임아웃",
         "kick": "서버에서 추방", "ban": "서버에서 영구 차단",
     }.get(action) if config.USER_SANCTION_DM_ENABLED else None)
+    action_label = (
+        "경고 전달" if action == "warn" and config.USER_SANCTION_DM_ENABLED
+        else _REVIEW_ACTION_LABEL[action]
+    )
+
+    get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+    channel = get_channel(channel_id)
+    message_for_evidence = None
+    evidence_content = original_content
+    if dm_text and review_id:
+        stored_content = await database.get_violation_content(review_id, guild.id)
+        if stored_content:
+            evidence_content = stored_content
+
     # 원문 메시지 삭제 (정상/경고 제외 모든 조치에 포함)
     note = ""
-    if action in ("del", "to1", "to24", "kick", "ban"):
-        channel = guild.get_channel(channel_id)
+    if action in ("del", "to1", "to24", "kick", "ban") or dm_text:
         try:
-            msg = await channel.fetch_message(message_id) if channel and hasattr(channel, "fetch_message") else None
-            if msg is not None:
-                await msg.delete()
+            message_for_evidence = (
+                await channel.fetch_message(message_id)
+                if channel and hasattr(channel, "fetch_message") else None
+            )
+            if message_for_evidence is not None:
+                evidence_content = message_for_evidence.content or evidence_content
+                if action in ("del", "to1", "to24", "kick", "ban"):
+                    await message_for_evidence.delete()
         except discord.NotFound:
             if action == "del":
                 note = " (메시지가 이미 삭제되어 있었음)"
         except (discord.Forbidden, discord.HTTPException):
-            note = " / 메시지 삭제 실패 (봇 권한 확인)"
-            if action == "del":
-                return await fail("봇 권한이 부족해 메시지를 삭제하지 못했습니다.")
+            if action in ("del", "to1", "to24", "kick", "ban"):
+                note = " / 메시지 삭제 실패 (봇 권한 확인)"
+                if action == "del":
+                    return await fail("봇 권한이 부족해 메시지를 삭제하지 못했습니다.")
 
     try:
         if action in ("to1", "to24"):
@@ -592,18 +686,28 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
 
     dm_ok = True
     if dm_text and member is not None:
-        dm_ok = await _dm_member(member, guild.name, dm_text, reason_text)
+        channel_display = getattr(channel, "mention", None)
+        if not channel_display and getattr(channel, "name", None):
+            channel_display = f"#{channel.name}"
+        dm_ok = await _dm_member(
+            member, guild.name, dm_text, reason_text,
+            guild_id=guild.id, channel_id=channel_id, message_id=message_id,
+            message_content=evidence_content,
+            channel_display=channel_display,
+            created_at=getattr(message_for_evidence, "created_at", None),
+            jump_url=getattr(message_for_evidence, "jump_url", None),
+        )
         if action == "warn" and not dm_ok:
             return await fail("대상 유저에게 경고 DM을 보낼 수 없어 경고를 적용하지 못했습니다.")
 
-    applied = _REVIEW_ACTION_LABEL[action] + note
+    applied = action_label + note
 
     if action not in ("ok", "okg"):
         # 외부 조치가 성공한 즉시 검수를 확정해, 이후 점수/로그 오류가 나더라도
         # 같은 카드 재시도로 제재가 중복 실행되지 않게 한다.
         if review_id:
             await database.resolve_review(
-                review_id, guild.id, "confirmed", admin.id, _REVIEW_ACTION_LABEL[action]
+                review_id, guild.id, "confirmed", admin.id, action_label
             )
         points = config.VIOLATION_LEVEL_POINTS.get(level, 0)
         total = await database.add_points(guild.id, user_id, points)
@@ -611,7 +715,7 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
         if not review_id:
             await database.log_violation(
                 guild.id, user_id, channel_id, original_content, level,
-                f"관리자 검수 확정: {reason_text}", _REVIEW_ACTION_LABEL[action],
+                f"관리자 검수 확정: {reason_text}", action_label,
                 provider="admin", needs_review=False, message_id=message_id,
             )
         public_action = {"del": "DELETE", "warn": "WARN", "to1": "TIMEOUT",
@@ -626,7 +730,7 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
             if review_id:
                 learned = await learning.record_review_false_positive(
                     review_id, guild.id, channel_for_scope, admin.id,
-                    _REVIEW_ACTION_LABEL[action], server_wide=server_wide,
+                    action_label, server_wide=server_wide,
                 )
             else:
                 learned = await learning.record_false_positive(

@@ -161,6 +161,7 @@ if POLICY_FILE:
 MANUAL_REVIEW_MODE = True
 
 # 사용자에게 제재/경고 DM을 보내지 않는다. 관리자 검수 카드와 내부 로그는 계속 유지된다.
+# 향후 True로 켜면 관리자 확정 제재 DM에 원문·채널·시각·메시지 링크·사유가 함께 전달된다.
 USER_SANCTION_DM_ENABLED = False
 
 # 수동 검수 감지 때도 기본적으로 사용자에게 아무 메시지도 보내지 않는다.
