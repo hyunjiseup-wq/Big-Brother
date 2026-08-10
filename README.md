@@ -104,6 +104,9 @@ python -m pip install -r requirements.lock
      로컬 경로를 권장합니다. 비워두면 프로젝트 폴더의 `automod.db`를 사용합니다.
    - `WATCHED_CHANNEL_IDS`(선택): 배치 감사 대상 채널 ID를 쉼표로 구분합니다.
      `.env`에 이 키가 있으면 `config.py`의 기본 목록보다 우선하며, 빈 값이면 배치 감사를 비활성화합니다.
+   - `BARTER_CHANNEL_IDS` / `BARTER_CHANNEL_NAMES`: 물물교환 채널과 포럼 스레드를 식별합니다.
+     이 채널에서는 최근 대화 문맥을 함께 확인해 게임 내 플리마켓·게임 재화 거래는 허용하고,
+     실제 계좌·외부 결제 또는 개인 DM 거래 유도만 관리자 검수 대상으로 분류합니다.
 
 2. 현재 서버만 운영한다면 `config.py`의 `SERVER_RULES`를 실제 서버 규칙으로 수정하세요.
    다른 커뮤니티에 배포할 때는 `policy.example.json`을 복사해 규칙과 채널별 맥락을 작성하고,

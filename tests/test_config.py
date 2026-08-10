@@ -25,6 +25,25 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("출처 링크 없이 코드만 공유", config.SERVER_RULES)
         self.assertIn("추천인/제휴 보상", config.SERVER_RULES)
 
+    def test_barter_policy_distinguishes_game_currency_from_real_payment(self):
+        trade_note = config.CHANNEL_CONTEXT_NOTES[1526179570192093314]
+        self.assertIn("게임 내 플리마켓", trade_note)
+        self.assertIn("달러·루블·유로", trade_note)
+        self.assertIn("앞뒤 대화", trade_note)
+        self.assertIn("실제 계좌번호", trade_note)
+        self.assertIn("개인 DM", trade_note)
+
+    def test_invalid_barter_context_settings_are_rejected(self):
+        for name, value in (
+            ("BARTER_CHANNEL_IDS", [123, "bad"]),
+            ("BARTER_CHANNEL_NAMES", (123,)),
+            ("BARTER_CONTEXT_MESSAGE_LIMIT", 0),
+            ("BARTER_CONTEXT_MAX_CHARS", 0),
+        ):
+            with self.subTest(name=name), patch.object(config, name, value):
+                with self.assertRaisesRegex(ValueError, name):
+                    config.validate_config()
+
     def test_channel_id_environment_list_parser(self):
         self.assertEqual(config._parse_channel_id_list("123, 456"), [123, 456])
         self.assertEqual(config._parse_channel_id_list(""), [])

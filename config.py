@@ -63,11 +63,12 @@ SERVER_RULES = """
    - 현금 거래 유도 (게임 아이템/계정 등의 현금 거래 시도)
      ※ 현금 거래 판단 시 주의: "현금 거래"란 현실 재화(현금, 계좌이체, 문화상품권, 페이팔 등)로
        게임 아이템/계정을 사고파는 행위(RMT)만을 뜻함. 게임 내 화폐(루블/달러/유로)로 하는
-       아이템 시세·판매·구매 대화는 이 게임의 정상적인 콘텐츠이며 절대 위반이 아님.
+       아이템 시세·판매·구매 대화와 게임 내 플리마켓을 통한 교환은 정상적인 콘텐츠이며 절대 위반이 아님.
        한국 유저들은 게임 내 루블·달러·유로 금액을 관용적으로 모두 "원"이라 부르기도 함
        (예: "테라피스트한테 팔면 18만원 나와요" = 게임 내 상인에게 루블로 판매한다는 뜻, 위반 아님).
-       "원"이라는 단어만으로 현금 거래로 단정하지 말고, 현실 결제 수단 언급이나
-       디스코드 밖 연락 유도(카톡, 오픈채팅 등) 같은 명확한 정황이 있을 때만 위반으로 판단할 것.
+       "원"·"달러"·"루블"·"유로" 표기만으로 현금 거래로 단정하지 말 것. 채널 안의 앞뒤 거래
+       대화를 함께 확인하고, 실제 계좌번호·입금·송금 같은 현실 결제 수단을 공유하거나 개인 DM 및
+       디스코드 밖 연락(카톡, 오픈채팅 등)으로 거래를 옮기려는 명확한 정황이 있을 때만 위반으로 판단할 것.
 
 4. 건전한 분위기를 해치거나 불필요한 갈등·불편을 유발하는 행위
    - 타인을 자극하는 시비, 조롱, 분란 조장, 분탕 목적의 발언
@@ -108,13 +109,15 @@ CHANNEL_CONTEXT_NOTES = {
     # 물물교환 채널: 게임 내 화폐로 하는 아이템 거래 전용 채널
     1526179570192093314: (
         "이 채널은 게임 아이템을 게임 내 화폐(루블/달러/유로)로 사고팔거나 맞교환하는 "
-        "물물교환 전용 채널입니다. 아이템 판매/구매/교환 글과 가격 표기는 이 채널의 "
-        "정상적인 용도이므로 위반이 아닙니다. 한국 플레이어들은 유로든 루블이든 게임 내 "
-        "화폐 금액을 통상적으로 모두 '원'으로 표기하므로, '원' 표기만으로 현금 거래(RMT)로 "
-        "판단하지 마세요.\n"
-        "이 채널에서는 아래의 명확한 정황이 있을 때만 위반으로 판단합니다:\n"
-        "- 개인 DM이나 디스코드 밖 연락처(카톡, 오픈채팅 등)로 거래를 유도하는 경우\n"
-        "- 계좌번호 등 현실 결제 수단(계좌이체, 문화상품권, 페이팔 등)이 올라오는 경우"
+        "물물교환 전용 채널입니다. 거래 대화를 이 채널 안에서 공개적으로 이어가고 게임 내 "
+        "플리마켓과 게임 내 재화로 교환하는 방식은 정상이며 위반이 아닙니다. 한국 플레이어들은 "
+        "달러·루블·유로 등 게임 내 화폐 금액을 관용적으로 모두 '원'으로 표기하므로, 통화 단어나 "
+        "금액 표기만으로 현금 거래(RMT)로 판단하지 마세요. 반드시 현재 메시지와 같은 거래 글의 "
+        "앞뒤 대화를 함께 확인하세요.\n"
+        "아래의 의도가 대화 문맥에서 명확할 때만 규칙 3의 현금 거래 유도로 판단합니다:\n"
+        "- 거래 협의를 개인 DM 또는 디스코드 밖 연락처(카톡, 오픈채팅 등)로 옮기도록 유도하는 경우\n"
+        "- 실제 계좌번호·예금주를 공유하거나 입금·송금·계좌이체·문화상품권·페이팔 등 현실 결제를 요구하는 경우\n"
+        "단순히 해당 단어를 질문·부정·주의 안내로 언급한 것만으로는 위반이 아닙니다."
     ),
     # 핵 의심 신고 채널: 서버가 지정한 제보 채널이므로 의심 유저 지목 글이 정상
     1445049743150415923: (
@@ -321,6 +324,20 @@ BLOCK_DISCORD_INVITES = True
 INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
     "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", "1410654534769840209"
 ))
+
+# 물물교환 채널에서는 한 줄만 보고 게임 내 거래를 RMT로 오판하지 않도록 최근 대화도
+# AI 판단 문맥으로 함께 보낸다. 포럼 글/스레드는 부모 채널 ID·이름을 기준으로 매칭한다.
+BARTER_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
+    "BARTER_CHANNEL_IDS", "1526179570192093314"
+))
+BARTER_CHANNEL_NAMES = tuple(
+    name.strip() for name in os.environ.get("BARTER_CHANNEL_NAMES", "물물교환").split(",")
+    if name.strip()
+)
+# 보통의 거래 글 전체를 포함하되, 장기 대화로 API 토큰과 개인정보 노출이 불필요하게
+# 늘지 않도록 메시지 수와 총 글자 수를 이중 제한한다.
+BARTER_CONTEXT_MESSAGE_LIMIT = 100
+BARTER_CONTEXT_MAX_CHARS = 8000
 
 # 이 길이 이하의 메시지는 AI 호출 없이 바로 통과 (이모지, 짧은 반응 등 비용 절감)
 MIN_LENGTH_FOR_AI_CHECK = 4
@@ -551,6 +568,21 @@ def validate_config() -> None:
     if len(INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS) != len(
             set(INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS)):
         errors.append("INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0
+           for channel_id in BARTER_CHANNEL_IDS):
+        errors.append("BARTER_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다.")
+    if len(BARTER_CHANNEL_IDS) != len(set(BARTER_CHANNEL_IDS)):
+        errors.append("BARTER_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(not isinstance(name, str) or not name.strip() for name in BARTER_CHANNEL_NAMES):
+        errors.append("BARTER_CHANNEL_NAMES에는 비어 있지 않은 채널 이름만 사용할 수 있습니다.")
+    if (isinstance(BARTER_CONTEXT_MESSAGE_LIMIT, bool)
+            or not isinstance(BARTER_CONTEXT_MESSAGE_LIMIT, int)
+            or BARTER_CONTEXT_MESSAGE_LIMIT <= 0):
+        errors.append("BARTER_CONTEXT_MESSAGE_LIMIT는 1 이상의 정수여야 합니다.")
+    if (isinstance(BARTER_CONTEXT_MAX_CHARS, bool)
+            or not isinstance(BARTER_CONTEXT_MAX_CHARS, int)
+            or BARTER_CONTEXT_MAX_CHARS <= 0):
+        errors.append("BARTER_CONTEXT_MAX_CHARS는 1 이상의 정수여야 합니다.")
 
     if errors:
         raise ValueError("설정 오류:\n- " + "\n- ".join(errors))

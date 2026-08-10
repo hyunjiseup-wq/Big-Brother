@@ -162,6 +162,77 @@ class InternalVoiceInviteTests(unittest.IsolatedAsyncioTestCase):
         fetch.assert_not_awaited()
         self.assertEqual((result.decision, result.level), ("DECIDED", "MODERATE"))
 
+
+class BarterConversationContextTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def message(content="네 맞아요", channel_id=10, user_id=50, history_items=None):
+        items = history_items or []
+
+        async def history(**kwargs):
+            for item in items:
+                yield item
+
+        channel = SimpleNamespace(
+            id=channel_id,
+            parent_id=None,
+            parent=None,
+            name="물물교환",
+            history=history,
+        )
+        return SimpleNamespace(
+            id=999,
+            content=content,
+            channel=channel,
+            guild=SimpleNamespace(id=1),
+            author=SimpleNamespace(id=user_id),
+        )
+
+    async def test_short_dm_invitation_is_sent_to_ai_in_barter_channel(self):
+        message = self.message(content="디엠")
+        with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
+            result = await bot._fast_check_with_invite_context(message)
+        self.assertEqual(result.decision, "NEEDS_AI")
+
+    async def test_short_game_currency_text_is_not_treated_as_external_trade(self):
+        message = self.message(content="1원")
+        with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
+            result = await bot._fast_check_with_invite_context(message)
+        self.assertEqual(result.decision, "SKIP")
+
+    async def test_barter_history_is_chronological_and_anonymized(self):
+        # Discord history(oldest_first=False)는 최신 메시지부터 반환한다.
+        items = [
+            SimpleNamespace(
+                content="10만원 맞나요?", author=SimpleNamespace(id=50, bot=False)
+            ),
+            SimpleNamespace(
+                content="플리마켓에 올릴게요", author=SimpleNamespace(id=60, bot=False)
+            ),
+        ]
+        message = self.message(history_items=items)
+        with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
+            context = await bot._barter_conversation_context(message)
+        self.assertEqual(
+            context,
+            [
+                {"speaker": "other_user_1", "content": "플리마켓에 올릴게요"},
+                {"speaker": "current_user", "content": "10만원 맞나요?"},
+            ],
+        )
+        self.assertNotIn("50", str(context))
+        self.assertNotIn("60", str(context))
+
+    async def test_thread_inherits_barter_parent_identity(self):
+        channel = SimpleNamespace(
+            id=20,
+            parent_id=10,
+            parent=SimpleNamespace(id=10, name="물물교환"),
+            name="그래픽카드 교환",
+        )
+        with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
+            self.assertTrue(bot._is_barter_channel(channel))
+
+
 def _message(content="bad text", guild_id=1, user_id=50, message_id=999):
     channel = SimpleNamespace(id=10, mention="#general")
     message = SimpleNamespace(

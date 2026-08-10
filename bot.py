@@ -26,6 +26,8 @@ import os
 import sys
 import asyncio
 import time
+import json
+import re
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -934,7 +936,14 @@ async def ai_worker(worker_id: int):
             # 채널별 특수 규칙 (예: 물물교환 채널은 거래 글이 정상). 캐시 키에도 섞어서
             # 같은 문구가 규칙이 다른 채널의 판단 결과를 재사용하지 않게 한다.
             channel_note = get_channel_note(message.channel)
-            cached = cache.get(message.content, context=channel_note or "")
+            conversation_context = await _barter_conversation_context(message)
+            cache_context = channel_note or ""
+            if conversation_context:
+                # 같은 한 줄도 앞뒤 거래 문맥에 따라 정상/위반이 달라질 수 있으므로 캐시를 분리한다.
+                cache_context += "\x00" + json.dumps(
+                    conversation_context, ensure_ascii=False, sort_keys=True
+                )
+            cached = cache.get(message.content, context=cache_context)
             if cached is not None:
                 level, rule_violated, reason_text, provider = cached
                 await handle_violation(
@@ -947,14 +956,15 @@ async def ai_worker(worker_id: int):
             fp_examples = await learning.get_prompt_examples(message.guild.id, message.channel)
             async with _ai_semaphore:
                 result = await classify_message(message.content, channel_note=channel_note,
-                                                fp_examples=fp_examples)
+                                                fp_examples=fp_examples,
+                                                conversation_context=conversation_context)
 
             # 판단 실패(provider="none")는 캐시하지 않는다 — 캐시하면 AI가 복구된 뒤에도
             # 같은 내용의 메시지가 캐시 유효시간 동안 계속 무검사 통과하게 됨
             if result.provider != "none":
                 cache.set(
                     message.content, result.level, result.rule_violated,
-                    result.reason, result.provider, context=channel_note or "",
+                    result.reason, result.provider, context=cache_context,
                 )
             await _track_ai_outage(message.guild, result)
             await handle_violation(message, result.level, result.reason, result.rule_violated, provider=result.provider)
@@ -1110,11 +1120,106 @@ async def _alert_drops(guild: discord.Guild):
     await send_log(guild, embed, mention=config.ADMIN_REVIEW_MENTION or None)
 
 
+_BARTER_EXTERNAL_CONTACT_PATTERN = re.compile(
+    r"(?<![a-z])(?:dm|pm)(?![a-z])|디\s*엠|개인\s*(?:메시지|연락|톡)|쪽지|"
+    r"카카오?톡|오픈\s*채팅|텔레그램|계좌|예금주|입금|송금|문화\s*상품권|페이팔|paypal",
+    re.IGNORECASE,
+)
+
+
+def _normalize_channel_name(name: str) -> str:
+    return "".join(ch for ch in name if ch not in "-_ ").casefold()
+
+
+def _is_barter_channel(channel) -> bool:
+    """물물교환 포럼 자체와 그 아래의 각 거래 스레드를 함께 인식한다."""
+    if channel is None:
+        return False
+    parent = getattr(channel, "parent", None)
+    ids = {
+        getattr(channel, "id", None),
+        getattr(channel, "parent_id", None),
+        getattr(parent, "id", None),
+    }
+    if any(channel_id in config.BARTER_CHANNEL_IDS for channel_id in ids if channel_id):
+        return True
+    configured_names = {
+        _normalize_channel_name(name) for name in config.BARTER_CHANNEL_NAMES
+    }
+    return any(
+        _normalize_channel_name(name) in configured_names
+        for name in (getattr(channel, "name", None), getattr(parent, "name", None))
+        if name
+    )
+
+
+def _ensure_barter_contact_check(message: discord.Message, result: FilterResult) -> FilterResult:
+    """짧은 '디엠' 같은 외부 거래 신호가 길이 필터로 무검사 통과하지 않게 한다."""
+    if (result.decision == "SKIP" and _is_barter_channel(message.channel)
+            and _BARTER_EXTERNAL_CONTACT_PATTERN.search(message.content or "")):
+        return FilterResult("NEEDS_AI")
+    return result
+
+
+async def _barter_conversation_context(message: discord.Message) -> list[dict]:
+    """
+    물물교환 거래 글의 앞선 대화를 비식별 화자 표기로 수집한다.
+
+    최근 메시지부터 글자 예산을 채워 장기 스레드도 비용을 제한하며, Discord 조회에
+    실패하면 현재 메시지만으로 보수적으로 판단하도록 빈 문맥을 반환한다.
+    """
+    if not _is_barter_channel(message.channel):
+        return []
+    history = getattr(message.channel, "history", None)
+    if history is None:
+        return []
+
+    collected = []
+    remaining_chars = config.BARTER_CONTEXT_MAX_CHARS
+    try:
+        async for prior in history(
+                limit=config.BARTER_CONTEXT_MESSAGE_LIMIT,
+                before=message,
+                oldest_first=False):
+            if getattr(getattr(prior, "author", None), "bot", False):
+                continue
+            content = (getattr(prior, "content", "") or "").strip()
+            if not content:
+                continue
+            if len(content) > remaining_chars:
+                content = (
+                    "…" if remaining_chars == 1
+                    else "…" + content[-(remaining_chars - 1):]
+                )
+            collected.append((getattr(getattr(prior, "author", None), "id", None), content))
+            remaining_chars -= len(content)
+            if remaining_chars <= 0:
+                break
+    except (discord.Forbidden, discord.HTTPException):
+        return []
+
+    collected.reverse()
+    current_author_id = getattr(message.author, "id", None)
+    other_authors = {}
+    context = []
+    for author_id, content in collected:
+        if author_id is not None and author_id == current_author_id:
+            speaker = "current_user"
+        else:
+            author_key = author_id if author_id is not None else f"unknown_{len(other_authors)}"
+            if author_key not in other_authors:
+                other_authors[author_key] = f"other_user_{len(other_authors) + 1}"
+            speaker = other_authors[author_key]
+        context.append({"speaker": speaker, "content": content})
+    return context
+
+
 async def _fast_check_with_invite_context(message: discord.Message) -> FilterResult:
     """Allow only verified same-guild voice invites from configured team-finder channels."""
     invite_urls = extract_discord_invite_urls(message.content)
     if not invite_urls or not config.BLOCK_DISCORD_INVITES:
-        return fast_check(message.guild.id, message.author.id, message.content)
+        result = fast_check(message.guild.id, message.author.id, message.content)
+        return _ensure_barter_contact_check(message, result)
 
     if len(invite_urls) > 3:
         return FilterResult("DECIDED", "MODERATE", "한 메시지에 디스코드 초대 링크 과다 게시")
@@ -1141,10 +1246,11 @@ async def _fast_check_with_invite_context(message: discord.Message) -> FilterRes
             return FilterResult("DECIDED", "MODERATE", "팀원찾기 채널에는 같은 서버 음성채널 초대만 허용")
 
     # 링크 자체는 검증됐지만 함께 적힌 욕설·광고 등은 기존 필터와 AI가 계속 검사한다.
-    return fast_check(
+    result = fast_check(
         message.guild.id, message.author.id, message.content,
         allow_discord_invites=True,
     )
+    return _ensure_barter_contact_check(message, result)
 
 
 async def _run_moderation(message: discord.Message):
