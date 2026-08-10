@@ -334,6 +334,41 @@ class AutoModePointsTests(unittest.IsolatedAsyncioTestCase):
         allowed_mentions = message.author.send.await_args.kwargs["allowed_mentions"]
         self.assertFalse(allowed_mentions.everyone)
 
+    async def test_failed_primary_action_does_not_send_false_success_dm(self):
+        message = _message(content="제재 대상 메시지")
+        message.created_at = bot.datetime.datetime.now(bot.datetime.timezone.utc)
+        message.author.send = AsyncMock()
+        response = SimpleNamespace(status=403, reason="Forbidden")
+        message.author.timeout = AsyncMock(
+            side_effect=bot.discord.Forbidden(response, "권한 부족")
+        )
+        message.delete = AsyncMock()
+
+        with patch.object(bot.config, "USER_SANCTION_DM_ENABLED", True):
+            ok, detail = await bot.apply_action(message, "TIMEOUT", 60, "관리자 확인 사유")
+
+        self.assertFalse(ok)
+        self.assertIn("핵심 조치 실패로 사용자 DM 미전송", detail)
+        message.author.send.assert_not_awaited()
+
+    async def test_kick_uses_dm_channel_prepared_before_removal(self):
+        message = _message(content="제재 대상 메시지")
+        message.created_at = bot.datetime.datetime.now(bot.datetime.timezone.utc)
+        message.delete = AsyncMock()
+        message.author.kick = AsyncMock()
+        message.author.send = AsyncMock()
+        dm_channel = SimpleNamespace(send=AsyncMock())
+        message.author.create_dm = AsyncMock(return_value=dm_channel)
+
+        with patch.object(bot.config, "USER_SANCTION_DM_ENABLED", True):
+            ok, detail = await bot.apply_action(message, "KICK", None, "관리자 확인 사유")
+
+        self.assertTrue(ok)
+        self.assertIn("DM 성공", detail)
+        message.author.create_dm.assert_awaited_once()
+        dm_channel.send.assert_awaited_once()
+        message.author.send.assert_not_awaited()
+
     async def test_optional_manual_notice_is_polite_and_not_a_warning(self):
         member = SimpleNamespace(send=AsyncMock())
         with patch.object(bot.config, "MANUAL_REVIEW_USER_NOTICE_ENABLED", True):

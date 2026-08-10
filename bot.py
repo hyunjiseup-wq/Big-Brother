@@ -227,6 +227,12 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
     details = []
     delete_ok = True
     primary_ok = action in ("NONE",)
+    dm_destination = member
+
+    # 킥/밴 뒤에는 공통 서버가 사라져 새 DM 채널 생성이 거부될 수 있다.
+    # 조치 전 채널만 확보하고, 실제 메시지는 핵심 조치 성공 뒤에 보낸다.
+    if config.USER_SANCTION_DM_ENABLED and action in ("KICK", "BAN"):
+        dm_destination = await _prepare_dm_destination(member)
 
     if action in ("DELETE", "TIMEOUT", "KICK", "BAN"):
         try:
@@ -266,7 +272,8 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
         primary_ok = delete_ok
 
     # 사용자 제재 DM은 운영 설정으로 명시적으로 켠 경우에만 보낸다.
-    if action != "NONE" and config.USER_SANCTION_DM_ENABLED:
+    should_notify = action == "WARN" or primary_ok
+    if action != "NONE" and config.USER_SANCTION_DM_ENABLED and should_notify:
         action_text = {
             "WARN": "경고",
             "DELETE": "메시지 삭제 및 경고",
@@ -275,7 +282,7 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
             "BAN": "서버에서 영구 차단",
         }.get(action, action)
         dm_ok = await _dm_member(
-            member, guild.name, action_text, reason,
+            dm_destination, guild.name, action_text, reason,
             guild_id=guild.id,
             channel_id=message.channel.id,
             message_id=message.id,
@@ -290,6 +297,9 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
                 primary_ok = True
         else:
             details.append("DM 실패: 사용자 DM 차단 또는 Discord API 오류")
+    elif action != "NONE" and config.USER_SANCTION_DM_ENABLED and not should_notify:
+        # 실패한 조치를 성공한 것처럼 알리면 증거 통지 자체의 신뢰성이 무너진다.
+        details.append("핵심 조치 실패로 사용자 DM 미전송")
     elif action == "WARN":
         # DM을 끈 상태의 WARN은 사용자 메시지 없이 내부 경고 기록/점수만 남기는 조치다.
         primary_ok = True
@@ -574,8 +584,19 @@ def _build_user_sanction_notice(
     return notice[:2000]
 
 
+async def _prepare_dm_destination(member):
+    """강제 퇴장 전에 DM 채널을 확보하되 실패하면 기존 Member 전송 경로를 유지한다."""
+    create_dm = getattr(member, "create_dm", None)
+    if create_dm is None:
+        return member
+    try:
+        return await create_dm()
+    except (discord.Forbidden, discord.HTTPException):
+        return member
+
+
 async def _dm_member(
-        member: discord.Member, guild_name: str, action_text: str, reason_text: str, *,
+        destination, guild_name: str, action_text: str, reason_text: str, *,
         guild_id: int = None, channel_id: int = None, message_id: int = None,
         message_content: str = "",
         channel_display: str = None, created_at=None, jump_url: str = None):
@@ -588,7 +609,7 @@ async def _dm_member(
             message_content=message_content, channel_display=channel_display,
             created_at=created_at, jump_url=jump_url,
         )
-        await member.send(notice, allowed_mentions=discord.AllowedMentions.none())
+        await destination.send(notice, allowed_mentions=discord.AllowedMentions.none())
         return True
     except (discord.Forbidden, discord.HTTPException):
         return False
@@ -638,6 +659,9 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
         "경고 전달" if action == "warn" and config.USER_SANCTION_DM_ENABLED
         else _REVIEW_ACTION_LABEL[action]
     )
+    dm_destination = member
+    if dm_text and member is not None and action in ("kick", "ban"):
+        dm_destination = await _prepare_dm_destination(member)
 
     get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
     channel = get_channel(channel_id)
@@ -690,7 +714,7 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
         if not channel_display and getattr(channel, "name", None):
             channel_display = f"#{channel.name}"
         dm_ok = await _dm_member(
-            member, guild.name, dm_text, reason_text,
+            dm_destination, guild.name, dm_text, reason_text,
             guild_id=guild.id, channel_id=channel_id, message_id=message_id,
             message_content=evidence_content,
             channel_display=channel_display,
