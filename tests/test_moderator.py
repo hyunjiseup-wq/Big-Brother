@@ -27,6 +27,17 @@ class ModeratorBatchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
+    def test_video_share_channel_receives_its_allow_rule(self):
+        channel = SimpleNamespace(
+            id=1409874543295856710,
+            parent_id=None,
+            parent=None,
+            name="📺영상-공유",
+        )
+        note = moderator.get_channel_note(channel)
+        self.assertIn("유튜브 영상 링크", note)
+        self.assertIn("본인 채널", note)
+
     def test_invalid_level_is_not_silently_cached_as_none(self):
         with self.assertRaisesRegex(ValueError, "알 수 없는 위반 등급"):
             moderator._build_result(

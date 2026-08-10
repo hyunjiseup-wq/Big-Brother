@@ -33,6 +33,15 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("실제 계좌번호", trade_note)
         self.assertIn("개인 DM", trade_note)
 
+    def test_video_share_policy_allows_videos_and_youtube_channels(self):
+        video_note = config.CHANNEL_CONTEXT_NOTES[1409874543295856710]
+        self.assertIn("유튜브 영상 링크", video_note)
+        self.assertIn("유튜브 채널 링크", video_note)
+        self.assertIn("본인 채널", video_note)
+        self.assertIn("무단 홍보나 광고로 판단하지 마세요", video_note)
+        self.assertIn("피싱·악성 링크", video_note)
+        self.assertIn("다른 디스코드 서버 초대", video_note)
+
     def test_invalid_barter_context_settings_are_rejected(self):
         for name, value in (
             ("BARTER_CHANNEL_IDS", [123, "bad"]),
