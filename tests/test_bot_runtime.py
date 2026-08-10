@@ -93,6 +93,75 @@ class PermissionWarningTests(unittest.TestCase):
                 bot.validate_runtime_environment()
 
 
+class InternalVoiceInviteTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def message(source_channel_id=10, guild_id=1):
+        return SimpleNamespace(
+            content="같이 하실 분 https://discord.gg/team123",
+            guild=SimpleNamespace(id=guild_id),
+            channel=SimpleNamespace(id=source_channel_id),
+            author=SimpleNamespace(id=50),
+        )
+
+    async def test_same_guild_voice_invite_is_not_fast_blocked(self):
+        invite = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            channel=SimpleNamespace(type=bot.discord.ChannelType.voice),
+        )
+        with (
+            patch.object(bot.config, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", [10]),
+            patch.object(bot.bot, "fetch_invite", new=AsyncMock(return_value=invite)),
+        ):
+            result = await bot._fast_check_with_invite_context(self.message())
+        self.assertEqual(result.decision, "NEEDS_AI")
+
+    async def test_other_guild_invite_is_blocked(self):
+        invite = SimpleNamespace(
+            guild=SimpleNamespace(id=999),
+            channel=SimpleNamespace(type=bot.discord.ChannelType.voice),
+        )
+        with (
+            patch.object(bot.config, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", [10]),
+            patch.object(bot.bot, "fetch_invite", new=AsyncMock(return_value=invite)),
+        ):
+            result = await bot._fast_check_with_invite_context(self.message())
+        self.assertEqual((result.decision, result.level), ("DECIDED", "MODERATE"))
+        self.assertIn("다른", result.reason)
+
+    async def test_same_guild_text_channel_invite_is_blocked(self):
+        invite = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            channel=SimpleNamespace(type=bot.discord.ChannelType.text),
+        )
+        with (
+            patch.object(bot.config, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", [10]),
+            patch.object(bot.bot, "fetch_invite", new=AsyncMock(return_value=invite)),
+        ):
+            result = await bot._fast_check_with_invite_context(self.message())
+        self.assertEqual((result.decision, result.level), ("DECIDED", "MODERATE"))
+        self.assertIn("음성채널", result.reason)
+
+    async def test_many_invites_are_blocked_without_api_fanout(self):
+        message = self.message()
+        message.content = " ".join(f"https://discord.gg/code{i}" for i in range(4))
+        with (
+            patch.object(bot.config, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", [10]),
+            patch.object(bot.bot, "fetch_invite", new=AsyncMock()) as fetch,
+        ):
+            result = await bot._fast_check_with_invite_context(message)
+        fetch.assert_not_awaited()
+        self.assertEqual((result.decision, result.level), ("DECIDED", "MODERATE"))
+        self.assertIn("과다", result.reason)
+
+    async def test_invite_outside_team_finder_is_blocked_without_api_call(self):
+        with (
+            patch.object(bot.config, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", [10]),
+            patch.object(bot.bot, "fetch_invite", new=AsyncMock()) as fetch,
+        ):
+            result = await bot._fast_check_with_invite_context(self.message(source_channel_id=20))
+        fetch.assert_not_awaited()
+        self.assertEqual((result.decision, result.level), ("DECIDED", "MODERATE"))
+
 def _message(content="bad text", guild_id=1, user_id=50, message_id=999):
     channel = SimpleNamespace(id=10, mention="#general")
     message = SimpleNamespace(

@@ -12,7 +12,10 @@ from collections import defaultdict, deque
 
 import config
 
-INVITE_PATTERN = re.compile(r"(discord\.gg|discord(app)?\.com/invite)/\S+", re.IGNORECASE)
+INVITE_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/\S+",
+    re.IGNORECASE,
+)
 URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 ZERO_WIDTH_PATTERN = re.compile("[\u200b-\u200d\u2060\ufeff]")
 
@@ -75,7 +78,13 @@ def _normalize_text(content: str) -> str:
     return ZERO_WIDTH_PATTERN.sub("", normalized).strip()
 
 
-def fast_check(guild_id: int, user_id: int, content: str) -> FilterResult:
+def extract_discord_invite_urls(content: str) -> list[str]:
+    """Extract Discord invite URLs without attempting to decide their target guild."""
+    return [match.group(0).rstrip(").,]>}") for match in INVITE_PATTERN.finditer(content or "")]
+
+
+def fast_check(guild_id: int, user_id: int, content: str,
+               allow_discord_invites: bool = False) -> FilterResult:
     _maybe_cleanup()
     text = _normalize_text(content)
 
@@ -91,7 +100,8 @@ def fast_check(guild_id: int, user_id: int, content: str) -> FilterResult:
             return FilterResult("DECIDED", "SEVERE", f"금칙어 감지: 규칙 위반 단어 포함")
 
     # 초대 링크 (허용 안 하는 정책이면 즉시 MODERATE 처리)
-    if config.BLOCK_DISCORD_INVITES and INVITE_PATTERN.search(text):
+    if (config.BLOCK_DISCORD_INVITES and not allow_discord_invites
+            and INVITE_PATTERN.search(text)):
         return FilterResult("DECIDED", "MODERATE", "디스코드 초대 링크 무단 게시")
 
     # 도배/스팸 (동일 메시지 반복)

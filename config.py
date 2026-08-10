@@ -99,6 +99,12 @@ SERVER_RULES = """
 # '-'/'_'/공백/대소문자 차이를 무시한다 (예: "핵의심신고" ↔ #핵-의심-신고).
 # 채널 이름이 바뀌면 이름 키는 더 이상 매칭되지 않으므로, ID를 알면 ID 등록을 권장.
 CHANNEL_CONTEXT_NOTES = {
+    # 팀원찾기 채널: 같은 서버 음성채널 초대 링크 공유 허용
+    1410654534769840209: (
+        "이 채널은 같은 한국 타르코프 커뮤니티 서버의 음성채널로 팀원을 초대하는 곳입니다. "
+        "시스템이 대상 서버와 음성채널 여부를 확인한 내부 초대 링크는 정상이며, 링크 자체를 "
+        "무단 홍보로 판단하지 마세요. 다른 서버 초대 링크는 시스템이 AI 판단 전에 차단합니다."
+    ),
     # 물물교환 채널: 게임 내 화폐로 하는 아이템 거래 전용 채널
     1526179570192093314: (
         "이 채널은 게임 아이템을 게임 내 화폐(루블/달러/유로)로 사고팔거나 맞교환하는 "
@@ -296,6 +302,12 @@ SPAM_REPEAT_THRESHOLD = 10
 
 # 초대 링크/외부 링크 자동 감지 (정규식은 filters.py에서 사용)
 BLOCK_DISCORD_INVITES = True
+
+# 아래 채널에서는 Discord API로 대상 길드/채널을 확인한 뒤, 같은 서버의 음성·스테이지
+# 초대만 허용한다. 다른 서버 초대와 텍스트 채널 초대는 기존처럼 차단한다.
+INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
+    "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", "1410654534769840209"
+))
 
 # 이 길이 이하의 메시지는 AI 호출 없이 바로 통과 (이모지, 짧은 반응 등 비용 절감)
 MIN_LENGTH_FOR_AI_CHECK = 4
@@ -510,6 +522,14 @@ def validate_config() -> None:
         errors.append("WATCHED_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다.")
     if len(WATCHED_CHANNEL_IDS) != len(set(WATCHED_CHANNEL_IDS)):
         errors.append("WATCHED_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0
+           for channel_id in INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS):
+        errors.append(
+            "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다."
+        )
+    if len(INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS) != len(
+            set(INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS)):
+        errors.append("INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS에 중복 채널이 있습니다.")
 
     if errors:
         raise ValueError("설정 오류:\n- " + "\n- ".join(errors))

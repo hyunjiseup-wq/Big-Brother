@@ -42,6 +42,11 @@ class ConfigValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "WATCHED_CHANNEL_IDS"):
                 config.validate_config()
 
+    def test_invalid_internal_voice_invite_channel_id_is_rejected(self):
+        with patch.object(config, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", [123, "bad"]):
+            with self.assertRaisesRegex(ValueError, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS"):
+                config.validate_config()
+
     def test_timeout_without_positive_duration_is_rejected(self):
         with patch.object(config, "STRIKE_THRESHOLDS", [(1, "TIMEOUT", None)]):
             with self.assertRaisesRegex(ValueError, "TIMEOUT"):

@@ -35,7 +35,7 @@ import config
 import database
 import cache
 import learning
-from filters import fast_check
+from filters import FilterResult, extract_discord_invite_urls, fast_check
 import moderator
 import runtime_lock
 from moderator import classify_message, get_channel_note
@@ -1089,13 +1089,50 @@ async def _alert_drops(guild: discord.Guild):
     await send_log(guild, embed, mention=config.ADMIN_REVIEW_MENTION or None)
 
 
-def _run_moderation(message: discord.Message):
+async def _fast_check_with_invite_context(message: discord.Message) -> FilterResult:
+    """Allow only verified same-guild voice invites from configured team-finder channels."""
+    invite_urls = extract_discord_invite_urls(message.content)
+    if not invite_urls or not config.BLOCK_DISCORD_INVITES:
+        return fast_check(message.guild.id, message.author.id, message.content)
+
+    if len(invite_urls) > 3:
+        return FilterResult("DECIDED", "MODERATE", "한 메시지에 디스코드 초대 링크 과다 게시")
+
+    if message.channel.id not in config.INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS:
+        return FilterResult("DECIDED", "MODERATE", "허용되지 않은 채널의 디스코드 초대 링크")
+
+    for url in invite_urls:
+        try:
+            invite = await bot.fetch_invite(url, with_counts=False, with_expiration=False)
+        except discord.NotFound:
+            # 만료·삭제된 초대는 실제로 다른 서버에 들어갈 수 없으므로 링크만으로 제재하지 않는다.
+            continue
+        except (discord.Forbidden, discord.HTTPException) as error:
+            # Discord 장애/한도 때문에 내부 링크를 외부 홍보로 오판하지 않도록 fail-open한다.
+            print(f"[invite-check] 초대 대상 확인 실패로 링크 제재 보류: {type(error).__name__}")
+            continue
+
+        target_guild_id = getattr(getattr(invite, "guild", None), "id", None)
+        target_type = getattr(getattr(invite, "channel", None), "type", None)
+        if target_guild_id != message.guild.id:
+            return FilterResult("DECIDED", "MODERATE", "다른 디스코드 서버 초대 링크 무단 게시")
+        if target_type not in (discord.ChannelType.voice, discord.ChannelType.stage_voice):
+            return FilterResult("DECIDED", "MODERATE", "팀원찾기 채널에는 같은 서버 음성채널 초대만 허용")
+
+    # 링크 자체는 검증됐지만 함께 적힌 욕설·광고 등은 기존 필터와 AI가 계속 검사한다.
+    return fast_check(
+        message.guild.id, message.author.id, message.content,
+        allow_discord_invites=True,
+    )
+
+
+async def _run_moderation(message: discord.Message):
     """1차 필터 → (필요 시) AI 큐 투입. 새 메시지와 수정된 메시지가 같은 경로를 탄다."""
     processing_key = _message_processing_key(message)
     if processing_key in _processing_keys:
         return
 
-    result = fast_check(message.guild.id, message.author.id, message.content)
+    result = await _fast_check_with_invite_context(message)
 
     if result.decision == "SKIP":
         pass  # 정상 메시지, 아무 조치 없음
@@ -1123,7 +1160,7 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
         return
 
-    _run_moderation(message)
+    await _run_moderation(message)
     # 명령어는 위에서 조기 처리되므로 여기서는 process_commands를 다시 호출하지 않는다
 
 
@@ -1155,7 +1192,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
     if not _is_moderation_target(message):
         return
-    _run_moderation(message)
+    await _run_moderation(message)
 
 
 # ── 관리자용 명령어 ──────────────────────────────────────────────────
