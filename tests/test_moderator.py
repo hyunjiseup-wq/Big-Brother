@@ -25,6 +25,29 @@ class ModeratorBatchTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(moderator.BatchClassificationError):
                 await moderator.classify_batch(messages, backend="gemini")
 
+    async def test_barter_batch_applies_prior_conversation_guard(self):
+        messages = [
+            {"index": 0, "author_ref": "user_1", "content": "10만원 맞나요?"}
+        ]
+        response = [{
+            "index": 0,
+            "level": "MODERATE",
+            "rule_violated": "3",
+            "reason": "만원 단위의 현금 거래 유도",
+        }]
+        with patch.object(
+            moderator, "_classify_batch_with_ollama", new=AsyncMock(return_value=response)
+        ):
+            results = await moderator.classify_batch(
+                messages,
+                backend="ollama",
+                barter_context=True,
+                conversation_context=[
+                    {"speaker": "user_2", "content": "게임 내 플리마켓에 올려주세요"}
+                ],
+            )
+        self.assertEqual(results[0].level, "NONE")
+
 
 class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
     def test_video_share_channel_receives_its_allow_rule(self):
@@ -68,6 +91,57 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"content": "플리마켓에 올릴게요"', prompt)
         self.assertIn("[판단 대상", prompt)
         self.assertTrue(prompt.rstrip().endswith('{"content": "네 맞아요"}'))
+
+    def test_barter_prompt_requires_whole_conversation_judgment(self):
+        prompt = moderator._user_prompt(
+            "10만원 맞나요?",
+            "물물교환 전용 채널",
+            conversation_context=[
+                {"speaker": "other_user_1", "content": "플리마켓에 올렸어요"}
+            ],
+        )
+        self.assertIn("한 문장으로 떼어 보지 말고", prompt)
+        self.assertIn("질문·부정·금지 안내", prompt)
+
+    def test_barter_guard_clears_currency_only_rmt_false_positive(self):
+        result = moderator.ModerationResult(
+            "MODERATE", "3", "만원 표현을 사용한 현금 거래 유도", "ollama"
+        )
+        guarded = moderator.apply_barter_conversation_guard(
+            result,
+            "10만원 맞나요?",
+            [{"speaker": "other_user_1", "content": "게임 내 플리마켓에 올렸어요"}],
+        )
+        self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+
+    def test_barter_guard_keeps_clear_dm_or_account_trade(self):
+        for content in (
+            "디엠으로 계좌 알려드릴게요", "그럼 계좌번호 보내주세요",
+            "현금 5만원에 팝니다", "카톡 아이디 알려드릴게요",
+        ):
+            with self.subTest(content=content):
+                result = moderator.ModerationResult(
+                    "MODERATE", "3", "개인 DM과 계좌 거래 유도", "ollama"
+                )
+                guarded = moderator.apply_barter_conversation_guard(result, content, [])
+                self.assertEqual(guarded.level, "MODERATE")
+
+    def test_barter_guard_does_not_treat_prohibition_as_trade(self):
+        result = moderator.ModerationResult(
+            "MODERATE", "3", "계좌 및 개인 연락 언급", "ollama"
+        )
+        guarded = moderator.apply_barter_conversation_guard(
+            result, "계좌는 쓰지 말고 DM도 하지 말고 여기서 거래해요", []
+        )
+        self.assertEqual(guarded.level, "NONE")
+
+    def test_barter_guard_preserves_non_trade_violation(self):
+        result = moderator.ModerationResult(
+            "MODERATE", "3", "상대방에게 명백한 욕설을 함", "ollama"
+        )
+        self.assertIs(
+            moderator.apply_barter_conversation_guard(result, "심한 욕설", []), result
+        )
 
     async def test_transient_rate_limit_is_retried_once(self):
         url = "https://example.test/classify"

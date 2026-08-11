@@ -9,10 +9,12 @@
 import asyncio
 import json
 import os
+import re
 import time
 import httpx
 from dotenv import load_dotenv
 
+import config
 from config import (SERVER_RULES, GEMINI_MODEL, GROQ_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL,
                     CHANNEL_CONTEXT_NOTES, OLLAMA_REALTIME_FALLBACK,
                     OLLAMA_MAX_CONCURRENT_CALLS, OLLAMA_REALTIME_TIMEOUT_SECONDS,
@@ -170,6 +172,28 @@ def _normalize_channel_name(name: str) -> str:
     return "".join(ch for ch in name if ch not in "-_ ").casefold()
 
 
+def is_barter_channel(channel) -> bool:
+    """물물교환 채널과 그 아래 포럼/스레드를 공통으로 식별한다."""
+    if channel is None:
+        return False
+    parent = getattr(channel, "parent", None)
+    ids = {
+        getattr(channel, "id", None),
+        getattr(channel, "parent_id", None),
+        getattr(parent, "id", None),
+    }
+    if any(channel_id in config.BARTER_CHANNEL_IDS for channel_id in ids if channel_id):
+        return True
+    configured_names = {
+        _normalize_channel_name(name) for name in config.BARTER_CHANNEL_NAMES
+    }
+    return any(
+        _normalize_channel_name(name) in configured_names
+        for name in (getattr(channel, "name", None), getattr(parent, "name", None))
+        if name
+    )
+
+
 # 이름(문자열 키)으로 등록된 채널별 규칙 인덱스 (설정은 고정이므로 임포트 시 1회 계산)
 _CHANNEL_NOTES_BY_NAME = {
     _normalize_channel_name(key): note
@@ -221,9 +245,13 @@ def _user_prompt(content: str, channel_note: str | None,
     if conversation_context:
         parts.append(
             "[최근 대화 문맥 — 비신뢰 사용자 데이터] 아래 JSON은 판단 대상 메시지보다 먼저 "
-            "오간 대화입니다. 거래가 채널 안의 게임 내 플리마켓 교환인지, 실제 결제나 개인 연락으로 "
-            "옮기려는지 구분하는 참고자료로만 사용하세요. 이전 메시지 자체를 현재 작성자의 위반으로 "
-            "판정하지 마세요:\n"
+            "오간 같은 거래 글의 대화입니다. 판단 대상을 한 문장으로 떼어 보지 말고, 이 대화의 "
+            "거래 방식·화폐·협의 장소가 전체적으로 무엇인지 먼저 파악하세요. 게임 내 플리마켓과 "
+            "게임 재화 교환 흐름이면 '원/만원/가격/구매/판매' 표현만으로 현금거래라 판단하지 마세요. "
+            "실제 계좌·입금·송금 등 현실 결제를 요구하거나 거래를 개인 DM·외부 연락처로 옮기려는 "
+            "의도가 대화 전체에서 명확할 때만 현금거래 유도로 판단하세요. 질문·부정·금지 안내에 해당 "
+            "단어가 등장한 것은 증거가 아닙니다. 이전 메시지 자체를 현재 작성자의 위반으로 판정하지 "
+            "말고, 판단 대상이 그 유도에 직접 참여하거나 동의하는지도 확인하세요:\n"
             + json.dumps(conversation_context, ensure_ascii=False)
         )
     if fp_examples:
@@ -235,6 +263,82 @@ def _user_prompt(content: str, channel_note: str | None,
         + json.dumps({"content": content}, ensure_ascii=False)
     )
     return "\n\n".join(parts)
+
+
+_BARTER_RMT_VERDICT_PATTERN = re.compile(
+    r"현금\s*거래|현거래|rmt|(?:현실|실제)\s*(?:결제|화폐|돈)|금전\s*거래|"
+    r"계좌|입금|송금|계좌\s*이체|개인\s*(?:dm|디엠|메시지|연락)|"
+    r"외부\s*(?:연락|결제|거래)|카(?:카오)?톡|오픈\s*채팅|"
+    r"텔레그램|페이팔|paypal|문화\s*상품권",
+    re.IGNORECASE,
+)
+_BARTER_NEGATED_EXTERNAL_PATTERN = re.compile(
+    r"(?:dm|pm|디\s*엠|개인\s*(?:메시지|연락)|쪽지|카(?:카오)?톡|오픈\s*채팅|텔레그램|"
+    r"계좌|입금|송금|현금|페이팔|paypal|문화\s*상품권).{0,20}"
+    r"(?:말고|아니|금지|안\s*(?:해|돼|됨)|하지\s*마|필요\s*없)|"
+    r"(?:말고|아니|금지|안\s*(?:해|돼|됨)|하지\s*마|필요\s*없).{0,20}"
+    r"(?:dm|pm|디\s*엠|개인\s*(?:메시지|연락)|쪽지|카(?:카오)?톡|오픈\s*채팅|텔레그램|"
+    r"계좌|입금|송금|현금|페이팔|paypal|문화\s*상품권)",
+    re.IGNORECASE,
+)
+_BARTER_CLEAR_EXTERNAL_PATTERN = re.compile(
+    r"(?:dm|pm|디\s*엠|개인\s*(?:메시지|연락)|쪽지|카(?:카오)?톡|오픈\s*채팅|텔레그램)"
+    r".{0,20}(?:으로|로|에서|주세요|주세|보내|연락|문의|얘기|거래|아이디|id|링크|추가|ㄱㄱ|고고)|"
+    r"(?:연락|문의|얘기|거래|협의).{0,20}"
+    r"(?:dm|pm|디\s*엠|개인\s*(?:메시지|연락)|쪽지|카(?:카오)?톡|오픈\s*채팅|텔레그램)|"
+    r"(?:계좌(?:\s*번호)?|예금주).{0,24}(?:\d{4,}|알려|보내|주세요|입금|송금|으로)|"
+    r"(?:국민|신한|우리|하나|농협|카카오\s*뱅크|토스\s*뱅크).{0,12}\d{6,}|"
+    r"(?:입금|송금|계좌\s*이체|현금\s*결제|토스|페이팔|paypal|문화\s*상품권)"
+    r".{0,20}(?:해|해주세요|보내|받|결제|거래|가능|할까요|부탁)|"
+    r"(?:현금|현실\s*돈|실제\s*돈|금전).{0,20}(?:판매|구매|거래|팝니다|삽니다|드려|받)|"
+    r"(?:판매|구매|거래|팝니다|삽니다).{0,20}(?:현금|현실\s*돈|실제\s*돈|금전)",
+    re.IGNORECASE,
+)
+_BARTER_AGREEMENT_PATTERN = re.compile(
+    r"^\s*(?:네|넵|넹|예|예스|좋아요|알겠습니다|그렇게\s*해요|그럼\s*그렇게|ok|okay)"
+    r"[\s.!?~]*$",
+    re.IGNORECASE,
+)
+
+
+def apply_barter_conversation_guard(
+        result: "ModerationResult", content: str,
+        conversation_context: list[dict] | None = None) -> "ModerationResult":
+    """
+    물물교환 RMT 판정에는 현재 발화의 명확한 외부 거래 증거를 요구한다.
+
+    AI가 금액 단위만 보고 현금거래로 오판했을 때 안전하게 NONE으로 되돌리되,
+    욕설·혐오 등 거래와 무관한 다른 규칙 위반은 그대로 유지한다.
+    """
+    if result.level == "NONE":
+        return result
+    verdict_text = f"{result.rule_violated} {result.reason}"
+    if not _BARTER_RMT_VERDICT_PATTERN.search(verdict_text):
+        return result
+
+    target = (content or "").strip()
+    target_is_negated = bool(_BARTER_NEGATED_EXTERNAL_PATTERN.search(target))
+    clear_target_evidence = (
+        bool(_BARTER_CLEAR_EXTERNAL_PATTERN.search(target)) and not target_is_negated
+    )
+
+    # "네"처럼 짧은 동의문은 바로 앞 대화가 명백한 외부 결제/연락 제안일 때만 인정한다.
+    clear_agreement = False
+    if _BARTER_AGREEMENT_PATTERN.fullmatch(target):
+        for turn in (conversation_context or [])[-3:]:
+            prior = str(turn.get("content", ""))
+            if (_BARTER_CLEAR_EXTERNAL_PATTERN.search(prior)
+                    and not _BARTER_NEGATED_EXTERNAL_PATTERN.search(prior)):
+                clear_agreement = True
+                break
+
+    if clear_target_evidence or clear_agreement:
+        return result
+    return ModerationResult(
+        "NONE", "NONE",
+        "물물교환 대화 전체에서 현실 결제 또는 개인 연락 거래 유도의 명확한 증거가 없어 정상 처리",
+        provider=result.provider,
+    )
 
 
 class ModerationResult:
@@ -438,7 +542,8 @@ async def _classify_with_ollama(content: str, channel_note: str | None = None,
 
 async def classify_message(content: str, channel_note: str | None = None,
                            fp_examples: list[dict] | None = None,
-                           conversation_context: list[dict] | None = None) -> ModerationResult:
+                           conversation_context: list[dict] | None = None,
+                           barter_context: bool = False) -> ModerationResult:
     """
     config.REALTIME_PROVIDER_ORDER 순서로 제공자를 시도한다. 기본은 로컬 Ollama →
     Gemini → Groq이며, 로컬이 없거나 실패하면 클라우드로 넘어간다. 모두 실패하면
@@ -450,6 +555,8 @@ async def classify_message(content: str, channel_note: str | None = None,
     fp_examples: 관리자가 오탐으로 확정한 과거 사례 목록(learning.get_prompt_examples).
     conversation_context: 판단 대상보다 먼저 오간 비식별 대화 문맥.
     값이 있으면 서버 규칙과 함께 AI에게 전달되어 판단 정확도를 높인다.
+    barter_context: 물물교환 대화이면 AI 결과에 명확한 현실 결제/개인 연락 증거 기준을
+    추가 적용해 금액 단위만으로 발생하는 오탐을 차단한다.
 
     반환되는 ModerationResult.provider 값으로 어떤 모델이 판단했는지 알 수 있고,
     bot.py는 이를 이용해 폴백(groq/ollama) 판단에 조치를 제한하거나 로그에 표시한다.
@@ -476,7 +583,10 @@ async def classify_message(content: str, channel_note: str | None = None,
             )
             if provider in _cloud_rate_limit_until:
                 _cloud_rate_limit_until[provider] = 0.0
-            return result
+            return (
+                apply_barter_conversation_guard(result, content, conversation_context)
+                if barter_context else result
+            )
         except Exception as error:
             failures.append((provider, error))
             skip_note = ""
@@ -534,7 +644,8 @@ BATCH_SYSTEM_PROMPT = f"""당신은 디스코드 서버의 자동 규칙 위반 
 
 
 def _messages_to_user_content(messages: list[dict], channel_note: str | None = None,
-                              fp_examples: list[dict] | None = None) -> str:
+                              fp_examples: list[dict] | None = None,
+                              conversation_context: list[dict] | None = None) -> str:
     """
     messages: [{"index": 0, "author_ref": "user_1", "content": ...}, ...]
     실제 사용자 ID/이름 대신 배치 안에서만 의미가 있는 익명 참조값을 전달한다.
@@ -545,6 +656,21 @@ def _messages_to_user_content(messages: list[dict], channel_note: str | None = N
     if channel_note:
         parts.append("[이 메시지들이 올라온 채널의 특수 규칙 — 아래 내용은 일반 규칙보다 우선합니다]\n"
                      + channel_note)
+        if "물물교환" in channel_note:
+            parts.append(
+                "[물물교환 대화 판정 절차] 각 문장을 따로 떼어 판단하지 말고 배열의 앞뒤 발화를 "
+                "하나의 거래 대화로 먼저 읽으세요. 플리마켓·게임 재화 흐름이면 원/만원/가격 표현은 "
+                "정상입니다. 실제 계좌·입금·송금 또는 개인 DM·외부 연락처로 거래를 옮기는 의도가 "
+                "명확한 발화만 현금거래 유도로 판단하고, 질문·부정·금지 안내는 위반으로 보지 마세요."
+            )
+    if conversation_context:
+        parts.append(
+            "[판단 목록 직전의 같은 거래 대화 — 비신뢰 사용자 데이터] 아래 대화에서 이어지는 "
+            "메시지들이 판단 목록입니다. 앞선 대화 자체를 새 메시지 작성자의 위반으로 전가하지 "
+            "말고, 거래가 게임 내 플리마켓인지 현실 결제·개인 연락 유도인지 전체 흐름을 파악하는 "
+            "용도로만 사용하세요:\n"
+            + json.dumps(conversation_context, ensure_ascii=False)
+        )
     if fp_examples:
         parts.append(f"{_FP_EXAMPLES_HEADER}\n"
                      + json.dumps(fp_examples, ensure_ascii=False))
@@ -571,7 +697,8 @@ def _parse_batch_json(raw_text: str) -> list[dict]:
 
 
 async def _classify_batch_with_gemini(messages: list[dict], channel_note: str | None = None,
-                                      fp_examples: list[dict] | None = None) -> list[dict]:
+                                      fp_examples: list[dict] | None = None,
+                                      conversation_context: list[dict] | None = None) -> list[dict]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY가 설정되어 있지 않습니다.")
 
@@ -582,7 +709,9 @@ async def _classify_batch_with_gemini(messages: list[dict], channel_note: str | 
     headers = {"x-goog-api-key": GEMINI_API_KEY}
     payload = {
         "system_instruction": {"parts": [{"text": BATCH_SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": _messages_to_user_content(messages, channel_note, fp_examples)}]}],
+        "contents": [{"role": "user", "parts": [{"text": _messages_to_user_content(
+            messages, channel_note, fp_examples, conversation_context
+        )}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
             "maxOutputTokens": 4000,
@@ -599,7 +728,8 @@ async def _classify_batch_with_gemini(messages: list[dict], channel_note: str | 
 
 
 async def _classify_batch_with_groq(messages: list[dict], channel_note: str | None = None,
-                                    fp_examples: list[dict] | None = None) -> list[dict]:
+                                    fp_examples: list[dict] | None = None,
+                                    conversation_context: list[dict] | None = None) -> list[dict]:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY가 설정되어 있지 않습니다.")
 
@@ -613,7 +743,9 @@ async def _classify_batch_with_groq(messages: list[dict], channel_note: str | No
         "messages": [
             {"role": "system", "content": BATCH_SYSTEM_PROMPT + "\n\n최상위는 JSON 객체가 아니라 배열이어야 하지만, "
                                                                   "형식상 배열을 지원하지 않는다면 {\"results\": [...]} 형태로 감싸도 됩니다."},
-            {"role": "user", "content": _messages_to_user_content(messages, channel_note, fp_examples)},
+            {"role": "user", "content": _messages_to_user_content(
+                messages, channel_note, fp_examples, conversation_context
+            )},
         ],
     }
 
@@ -626,7 +758,8 @@ async def _classify_batch_with_groq(messages: list[dict], channel_note: str | No
 
 
 async def _classify_batch_with_ollama(messages: list[dict], channel_note: str | None = None,
-                                      fp_examples: list[dict] | None = None) -> list[dict]:
+                                      fp_examples: list[dict] | None = None,
+                                      conversation_context: list[dict] | None = None) -> list[dict]:
     if not OLLAMA_BASE_URL or not OLLAMA_MODEL:
         raise RuntimeError("OLLAMA_BASE_URL/OLLAMA_MODEL이 설정되어 있지 않습니다.")
 
@@ -635,7 +768,9 @@ async def _classify_batch_with_ollama(messages: list[dict], channel_note: str | 
         "model": OLLAMA_MODEL,
         "messages": [
             {"role": "system", "content": BATCH_SYSTEM_PROMPT},
-            {"role": "user", "content": _messages_to_user_content(messages, channel_note, fp_examples)},
+            {"role": "user", "content": _messages_to_user_content(
+                messages, channel_note, fp_examples, conversation_context
+            )},
         ],
         "format": "json",
         "stream": False,
@@ -653,7 +788,9 @@ async def _classify_batch_with_ollama(messages: list[dict], channel_note: str | 
 
 async def classify_batch(messages: list[dict], backend: str = "auto",
                          channel_note: str | None = None,
-                         fp_examples: list[dict] | None = None) -> list["ModerationResult"]:
+                         fp_examples: list[dict] | None = None,
+                         barter_context: bool = False,
+                         conversation_context: list[dict] | None = None) -> list["ModerationResult"]:
     """
     여러 메시지를 한 번에 판단한다 (배치 감사 전용, 실시간 경로에서는 사용하지 않음).
 
@@ -665,6 +802,7 @@ async def classify_batch(messages: list[dict], backend: str = "auto",
 
     channel_note: 이 메시지들이 올라온 채널의 특수 규칙(config.CHANNEL_CONTEXT_NOTES).
     fp_examples: 관리자가 오탐으로 확정한 과거 사례 목록(learning.get_prompt_examples).
+    barter_context: 배열의 앞선 거래 대화를 문맥으로 사용하고 RMT 명확 증거 기준을 적용한다.
 
     반환값은 입력 messages와 같은 길이/순서의 ModerationResult 리스트.
     일부 항목이 누락되거나 파싱이 실패해도 해당 항목만 안전하게 NONE 처리한다.
@@ -675,18 +813,28 @@ async def classify_batch(messages: list[dict], backend: str = "auto",
     provider = backend
     try:
         if backend == "ollama":
-            raw_results = await _classify_batch_with_ollama(messages, channel_note, fp_examples)
+            raw_results = await _classify_batch_with_ollama(
+                messages, channel_note, fp_examples, conversation_context
+            )
         elif backend == "gemini":
-            raw_results = await _classify_batch_with_gemini(messages, channel_note, fp_examples)
+            raw_results = await _classify_batch_with_gemini(
+                messages, channel_note, fp_examples, conversation_context
+            )
         elif backend == "groq":
-            raw_results = await _classify_batch_with_groq(messages, channel_note, fp_examples)
+            raw_results = await _classify_batch_with_groq(
+                messages, channel_note, fp_examples, conversation_context
+            )
         else:  # auto
             try:
-                raw_results = await _classify_batch_with_gemini(messages, channel_note, fp_examples)
+                raw_results = await _classify_batch_with_gemini(
+                    messages, channel_note, fp_examples, conversation_context
+                )
                 provider = "gemini"
             except Exception as e:
                 print(f"[moderator] 배치 Gemini 실패, Groq로 폴백: {_safe_error(e)}")
-                raw_results = await _classify_batch_with_groq(messages, channel_note, fp_examples)
+                raw_results = await _classify_batch_with_groq(
+                    messages, channel_note, fp_examples, conversation_context
+                )
                 provider = "groq"
     except Exception as e:
         message = _safe_error(e)
@@ -713,5 +861,17 @@ async def classify_batch(messages: list[dict], backend: str = "auto",
         item = by_index.get(i)
         if item is None:
             raise BatchClassificationError(f"배치 응답에서 index {i}가 누락되었습니다.")
-        results.append(_build_result(item, provider=provider))
+        result = _build_result(item, provider=provider)
+        if barter_context:
+            prior_context = list(conversation_context or []) + [
+                {
+                    "speaker": prior.get("author_ref", "other_user"),
+                    "content": prior.get("content", ""),
+                }
+                for prior in messages[:i]
+            ]
+            result = apply_barter_conversation_guard(
+                result, messages[i].get("content", ""), prior_context
+            )
+        results.append(result)
     return results

@@ -357,10 +357,10 @@ BARTER_CHANNEL_NAMES = tuple(
     name.strip() for name in os.environ.get("BARTER_CHANNEL_NAMES", "물물교환").split(",")
     if name.strip()
 )
-# 보통의 거래 글 전체를 포함하되, 장기 대화로 API 토큰과 개인정보 노출이 불필요하게
-# 늘지 않도록 메시지 수와 총 글자 수를 이중 제한한다.
-BARTER_CONTEXT_MESSAGE_LIMIT = 100
-BARTER_CONTEXT_MAX_CHARS = 8000
+# 보통의 거래 글 전체를 포함하고 포럼 시작 글은 별도로 항상 보존하되, 장기 대화로
+# API 토큰과 개인정보 노출이 불필요하게 늘지 않도록 메시지 수와 총 글자 수를 이중 제한한다.
+BARTER_CONTEXT_MESSAGE_LIMIT = 200
+BARTER_CONTEXT_MAX_CHARS = 16000
 
 # 이 길이 이하의 메시지는 AI 호출 없이 바로 통과 (이모지, 짧은 반응 등 비용 절감)
 MIN_LENGTH_FOR_AI_CHECK = 4

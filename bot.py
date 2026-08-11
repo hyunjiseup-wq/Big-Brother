@@ -1068,8 +1068,12 @@ async def ai_worker(worker_id: int):
             # 채널별 특수 규칙 (예: 물물교환 채널은 거래 글이 정상). 캐시 키에도 섞어서
             # 같은 문구가 규칙이 다른 채널의 판단 결과를 재사용하지 않게 한다.
             channel_note = get_channel_note(message.channel)
+            barter_context = _is_barter_channel(message.channel)
             conversation_context = await _barter_conversation_context(message)
             cache_context = channel_note or ""
+            if barter_context:
+                # 이전 단일 문장 기준 캐시와 새 대화 증거 기준 캐시를 분리한다.
+                cache_context += "\x00barter-conversation-v2"
             if conversation_context:
                 # 같은 한 줄도 앞뒤 거래 문맥에 따라 정상/위반이 달라질 수 있으므로 캐시를 분리한다.
                 cache_context += "\x00" + json.dumps(
@@ -1092,7 +1096,8 @@ async def ai_worker(worker_id: int):
             async with _ai_semaphore:
                 result = await classify_message(message.content, channel_note=channel_note,
                                                 fp_examples=fp_examples,
-                                                conversation_context=conversation_context)
+                                                conversation_context=conversation_context,
+                                                barter_context=barter_context)
 
             # 판단 실패(provider="none")는 캐시하지 않는다 — 캐시하면 AI가 복구된 뒤에도
             # 같은 내용의 메시지가 캐시 유효시간 동안 계속 무검사 통과하게 됨
@@ -1196,8 +1201,11 @@ async def ai_retry_worker():
                     continue
 
                 channel_note = get_channel_note(message.channel)
+                barter_context = _is_barter_channel(message.channel)
                 conversation_context = await _barter_conversation_context(message)
                 cache_context = channel_note or ""
+                if barter_context:
+                    cache_context += "\x00barter-conversation-v2"
                 if conversation_context:
                     cache_context += "\x00" + json.dumps(
                         conversation_context, ensure_ascii=False, sort_keys=True
@@ -1219,6 +1227,7 @@ async def ai_retry_worker():
                         channel_note=channel_note,
                         fp_examples=fp_examples,
                         conversation_context=conversation_context,
+                        barter_context=barter_context,
                     )
                 await _track_ai_outage(guild, result)
                 if result.provider == "none":
@@ -1400,7 +1409,7 @@ async def _alert_drops(guild: discord.Guild):
 
 _BARTER_EXTERNAL_CONTACT_PATTERN = re.compile(
     r"(?<![a-z])(?:dm|pm)(?![a-z])|디\s*엠|개인\s*(?:메시지|연락|톡)|쪽지|"
-    r"카카오?톡|오픈\s*채팅|텔레그램|계좌|예금주|입금|송금|문화\s*상품권|페이팔|paypal",
+    r"카(?:카오)?톡|오픈\s*채팅|텔레그램|계좌|예금주|입금|송금|문화\s*상품권|페이팔|paypal",
     re.IGNORECASE,
 )
 
@@ -1454,12 +1463,38 @@ async def _barter_conversation_context(message: discord.Message) -> list[dict]:
 
     collected = []
     remaining_chars = config.BARTER_CONTEXT_MAX_CHARS
+    starter_entry = None
+    starter_id = None
+
+    # 포럼 글/스레드는 첫 게시물이 거래 조건의 핵심인 경우가 많다. 대화가 길어져 최근
+    # 200개 밖으로 밀려도 시작 글은 별도로 확보해 전체 거래 방식 판단에서 빠지지 않게 한다.
+    if getattr(message.channel, "parent", None) is not None:
+        fetch_message = getattr(message.channel, "fetch_message", None)
+        if fetch_message is not None and getattr(message.channel, "id", None) != message.id:
+            try:
+                starter = await fetch_message(message.channel.id)
+                starter_content = (getattr(starter, "content", "") or "").strip()
+                if starter_content and not getattr(getattr(starter, "author", None), "bot", False):
+                    starter_content = starter_content[:min(2000, remaining_chars)]
+                    starter_id = getattr(starter, "id", None)
+                    starter_entry = (
+                        getattr(getattr(starter, "author", None), "id", None),
+                        starter_content,
+                    )
+                    remaining_chars -= len(starter_content)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
     try:
         async for prior in history(
                 limit=config.BARTER_CONTEXT_MESSAGE_LIMIT,
                 before=message,
                 oldest_first=False):
+            if remaining_chars <= 0:
+                break
             if getattr(getattr(prior, "author", None), "bot", False):
+                continue
+            if starter_id is not None and getattr(prior, "id", None) == starter_id:
                 continue
             content = (getattr(prior, "content", "") or "").strip()
             if not content:
@@ -1477,6 +1512,8 @@ async def _barter_conversation_context(message: discord.Message) -> list[dict]:
         return []
 
     collected.reverse()
+    if starter_entry is not None:
+        collected.insert(0, starter_entry)
     current_author_id = getattr(message.author, "id", None)
     other_authors = {}
     context = []

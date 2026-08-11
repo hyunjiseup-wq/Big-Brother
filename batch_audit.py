@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 import config
 import database
 import learning
-from moderator import classify_batch, get_channel_note
+from moderator import classify_batch, get_channel_note, is_barter_channel
 
 load_dotenv()
 
@@ -69,6 +69,56 @@ def _chunk(lst, size):
         yield lst[i:i + size]
 
 
+async def collect_barter_conversation_context(channel, before_message) -> list[tuple]:
+    """체크포인트·배치 경계를 넘어 물물교환 글의 선행 대화를 제한된 크기로 가져온다."""
+    remaining_chars = config.BARTER_CONTEXT_MAX_CHARS
+    collected = []
+    starter_entry = None
+    starter_id = None
+
+    if getattr(channel, "parent", None) is not None:
+        fetch_message = getattr(channel, "fetch_message", None)
+        if fetch_message is not None and getattr(channel, "id", None) != before_message.id:
+            try:
+                starter = await fetch_message(channel.id)
+                content = (getattr(starter, "content", "") or "").strip()
+                if content and not getattr(getattr(starter, "author", None), "bot", False):
+                    content = content[:min(2000, remaining_chars)]
+                    starter_id = getattr(starter, "id", None)
+                    starter_entry = (
+                        getattr(getattr(starter, "author", None), "id", None), content
+                    )
+                    remaining_chars -= len(content)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    try:
+        async for prior in channel.history(
+                limit=config.BARTER_CONTEXT_MESSAGE_LIMIT,
+                before=before_message,
+                oldest_first=False):
+            if remaining_chars <= 0:
+                break
+            if getattr(getattr(prior, "author", None), "bot", False):
+                continue
+            if starter_id is not None and getattr(prior, "id", None) == starter_id:
+                continue
+            content = (getattr(prior, "content", "") or "").strip()
+            if not content:
+                continue
+            if len(content) > remaining_chars:
+                content = "…" if remaining_chars == 1 else "…" + content[-(remaining_chars - 1):]
+            collected.append((getattr(getattr(prior, "author", None), "id", None), content))
+            remaining_chars -= len(content)
+    except (discord.Forbidden, discord.HTTPException):
+        return [starter_entry] if starter_entry else []
+
+    collected.reverse()
+    if starter_entry:
+        collected.insert(0, starter_entry)
+    return collected
+
+
 async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
     """한 채널을 감사하고 결과(검토 건수 + 플래그된 메시지 목록)를 반환한다."""
     checkpoint = await database.get_checkpoint(channel.guild.id, channel.id)
@@ -79,6 +129,7 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
                 "period_start": None, "period_end": None}
 
     channel_note = get_channel_note(channel)  # 채널별 특수 규칙 (없으면 None)
+    barter_mode = is_barter_channel(channel)
     # 과거 오탐 사례를 프롬프트에 포함해 같은 유형의 오탐을 줄인다
     fp_examples = await learning.get_prompt_examples(channel.guild.id, channel)
     flagged = []
@@ -86,16 +137,32 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
     failure = None
     for batch in _chunk(messages, config.BATCH_SIZE):
         # 확정 오탐은 AI에 보내지 않아 재오탐과 API 비용을 함께 줄인다.
-        candidates = [
-            m for m in batch
-            if not await learning.is_known_false_positive(
-                channel.guild.id, channel, m.content
-            )
+        known_false_positives = [
+            await learning.is_known_false_positive(channel.guild.id, channel, m.content)
+            for m in batch
         ]
-        if not candidates:
+        if all(known_false_positives):
             processed_messages.extend(batch)
             continue
+
+        # 물물교환에서는 정상 확정 메시지도 대화 의미를 구성할 수 있으므로 현재 묶음 전체를
+        # 문맥에 남기고, 결과를 기록할 때만 확정 오탐 항목을 제외한다.
+        if barter_mode:
+            candidates = list(batch)
+            candidate_known_flags = known_false_positives
+        else:
+            candidates = [m for m, known in zip(batch, known_false_positives) if not known]
+            candidate_known_flags = [False] * len(candidates)
+
         author_refs = {}
+        context_turns = []
+        if barter_mode:
+            prior_turns = await collect_barter_conversation_context(channel, batch[0])
+            for author_id, content in prior_turns:
+                author_ref = author_refs.setdefault(
+                    author_id, f"user_{len(author_refs) + 1}"
+                )
+                context_turns.append({"speaker": author_ref, "content": content})
         payload = [
             {
                 "index": i,
@@ -106,14 +173,16 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
         ]
         try:
             results = await classify_batch(payload, backend=backend,
-                                           channel_note=channel_note, fp_examples=fp_examples)
+                                           channel_note=channel_note, fp_examples=fp_examples,
+                                           barter_context=barter_mode,
+                                           conversation_context=context_turns)
         except Exception as e:
             failure = str(e)[:500]
             print(f"[batch_audit] #{channel.name} 배치 판단 실패, 체크포인트 보류: {failure}")
             break
 
-        for r, m in zip(results, candidates):
-            if r.level == "NONE":
+        for r, m, known in zip(results, candidates, candidate_known_flags):
+            if known or r.level == "NONE":
                 continue
             flagged.append({
                 "message": m,

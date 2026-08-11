@@ -188,10 +188,12 @@ class BarterConversationContextTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_short_dm_invitation_is_sent_to_ai_in_barter_channel(self):
-        message = self.message(content="디엠")
-        with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
-            result = await bot._fast_check_with_invite_context(message)
-        self.assertEqual(result.decision, "NEEDS_AI")
+        for content in ("디엠", "카톡"):
+            with self.subTest(content=content):
+                message = self.message(content=content)
+                with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
+                    result = await bot._fast_check_with_invite_context(message)
+                self.assertEqual(result.decision, "NEEDS_AI")
 
     async def test_short_game_currency_text_is_not_treated_as_external_trade(self):
         message = self.message(content="1원")
@@ -221,6 +223,37 @@ class BarterConversationContextTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("50", str(context))
         self.assertNotIn("60", str(context))
+
+    async def test_forum_starter_is_kept_with_recent_barter_context(self):
+        starter = SimpleNamespace(
+            id=20,
+            content="시작 조건: 게임 내 플리마켓으로 교환합니다",
+            author=SimpleNamespace(id=60, bot=False),
+        )
+        recent = SimpleNamespace(
+            id=998,
+            content="10만원에 올리면 되나요?",
+            author=SimpleNamespace(id=50, bot=False),
+        )
+
+        async def history(**kwargs):
+            yield recent
+
+        channel = SimpleNamespace(
+            id=20, parent_id=10, parent=SimpleNamespace(id=10, name="물물교환"),
+            name="그래픽카드 교환", history=history,
+            fetch_message=AsyncMock(return_value=starter),
+        )
+        message = SimpleNamespace(
+            id=999, content="네", channel=channel, guild=SimpleNamespace(id=1),
+            author=SimpleNamespace(id=50),
+        )
+        with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
+            context = await bot._barter_conversation_context(message)
+
+        self.assertEqual(context[0]["content"], starter.content)
+        self.assertEqual(context[-1]["content"], recent.content)
+        channel.fetch_message.assert_awaited_once_with(20)
 
     async def test_thread_inherits_barter_parent_identity(self):
         channel = SimpleNamespace(
