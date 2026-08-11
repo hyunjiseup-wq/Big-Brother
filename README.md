@@ -18,6 +18,7 @@ discord-automod/
 ├── config.py             # 서버 규칙, 제재 단계, 모델/한도, 배치 감사 설정 (여기를 주로 수정)
 ├── run_bot.bat           # Windows 실행기 (환경/DB 점검, 재시작 횟수 제한)
 ├── register_startup.bat  # Windows 시작프로그램 바로가기 등록
+├── run_bot_hidden.vbs    # 자동 시작 시 콘솔 창 없이 봇 실행
 ├── 봇실행.bat             # run_bot.bat을 호출하는 한국어 바로가기
 ├── 시작프로그램_등록.bat   # register_startup.bat을 호출하는 한국어 바로가기
 ├── tests/                # 필터·DB·폴백 사슬·배치 실패 처리 회귀 테스트
@@ -144,7 +145,8 @@ python -m pip install -r requirements.lock
   무결성을 검사합니다. Discord 토큰이나 AI 키 검증과 독립적으로 실행되므로 환경설정 장애 중에도
   백업할 수 있습니다. 백업에는 메시지 원문이 포함될 수 있으므로 필요한 시점에만 실행하고 안전하게 보관하세요.
 - 로컬 실행 상태 확인: `run_bot.bat --status` (Discord/API 접속 없이 단일 인스턴스 잠금 상태만 확인)
-- 자동 시작 등록: `register_startup.bat`을 한 번 실행합니다.
+- 자동 시작 등록: `register_startup.bat`을 한 번 실행합니다. 자동 시작은 `wscript.exe`를 통해
+  콘솔 창 없이 실행되며, 진단 출력은 `logs/bot_runtime.log`에 기록됩니다.
 - 자동 시작 상태만 확인: `register_startup.bat --check` (등록하거나 변경하지 않음)
 - 실행기는 오류 종료가 연속될 때만 최대 5회 재시작합니다. 정상 종료는 다시 실행하지 않으며,
   5분 이상 안정적으로 실행한 뒤 발생한 종료는 이전 실패 횟수와 합산하지 않습니다.

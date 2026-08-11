@@ -9,7 +9,7 @@ set "PYTHON=%LOCALAPPDATA%\DiscordAutoMod\venv-3.13\Scripts\python.exe"
 if not exist "%PYTHON%" (
     echo [ERROR] Bot Python environment was not found: %PYTHON%
     echo Complete the installation before running the bot.
-    pause
+    if not defined AUTOMOD_HEADLESS pause
     exit /b 1
 )
 
@@ -17,7 +17,7 @@ if not exist "%PYTHON%" (
 if errorlevel 1 (
     echo [ERROR] Required packages are missing or the environment is damaged.
     echo Reinstall requirements.lock and try again.
-    pause
+    if not defined AUTOMOD_HEADLESS pause
     exit /b 2
 )
 
@@ -35,7 +35,7 @@ if /i "%~1"=="--status" (
 if errorlevel 1 (
     echo [ERROR] The database could not be initialized or failed its integrity check.
     echo Check AUTOMOD_DB_PATH, folder permissions, and database backups. The detailed error is shown above.
-    pause
+    if not defined AUTOMOD_HEADLESS pause
     exit /b 4
 )
 
@@ -43,7 +43,7 @@ if errorlevel 1 (
 if errorlevel 1 (
     echo [ERROR] Required values in .env are missing or invalid.
     echo Review the detailed error above and update .env.
-    pause
+    if not defined AUTOMOD_HEADLESS pause
     exit /b 5
 )
 
@@ -87,11 +87,11 @@ exit /b 0
 
 :duplicate
 echo [INFO] The bot is already running.
-pause
+if not defined AUTOMOD_HEADLESS pause
 exit /b 3
 
 :failed
 echo [ERROR] Bot stopped five times. Automatic restart has been disabled.
 echo Review the console error and configuration.
-pause
+if not defined AUTOMOD_HEADLESS pause
 exit /b %BOT_EXIT%
