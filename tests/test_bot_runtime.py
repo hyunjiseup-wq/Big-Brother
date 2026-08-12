@@ -266,6 +266,110 @@ class BarterConversationContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bot._is_barter_channel(channel))
 
 
+class SplitMessageContextTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        bot._split_message_buffers.clear()
+        bot._processing_keys.clear()
+
+    @staticmethod
+    def message(message_id=3, content="점이 어디예요?", user_id=50):
+        return SimpleNamespace(
+            id=message_id,
+            content=content,
+            guild=SimpleNamespace(id=1),
+            channel=SimpleNamespace(id=10),
+            author=SimpleNamespace(id=user_id),
+        )
+
+    async def test_context_preserves_multiple_speakers_without_merging_them(self):
+        now = 100.0
+        bot._split_message_buffers[(1, 10)].extend((
+            (1, 50, now - 20, "오래된 같은 사용자"),
+            (2, 60, now + 1, "다른 사용자 끼어듦"),
+            (3, 50, now + 2, "시발"),
+            (4, 50, now + 3, "점이 어디예요?"),
+            (5, 50, now + 4, "알려주세요"),
+        ))
+        message = self.message(message_id=4)
+        with patch.object(bot.config, "SPLIT_MESSAGE_SETTLE_SECONDS", 0):
+            context = await bot._split_message_context(message, settle=True)
+        self.assertEqual(
+            context,
+            [
+                {"speaker": "other_user_1", "relation": "before", "content": "다른 사용자 끼어듦"},
+                {"speaker": "current_user", "relation": "before", "content": "시발"},
+                {"speaker": "current_user", "relation": "after", "content": "알려주세요"},
+            ],
+        )
+        self.assertNotIn("오래된", str(context))
+
+    async def test_other_author_is_context_not_a_current_user_fragment(self):
+        now = 200.0
+        bot._split_message_buffers[(1, 10)].extend((
+            (10, 50, now, "판단 대상"),
+            (11, 60, now + 1, "다른 사용자의 답변"),
+            (12, 50, now + 2, "원래 사용자의 다음 말"),
+        ))
+        context = await bot._split_message_context(
+            self.message(message_id=10, content="판단 대상")
+        )
+        self.assertEqual(context, [
+            {"speaker": "other_user_1", "relation": "after", "content": "다른 사용자의 답변"},
+            {"speaker": "current_user", "relation": "after", "content": "원래 사용자의 다음 말"},
+        ])
+
+    def test_fragmented_keyword_uses_only_same_discord_user_id(self):
+        now = 300.0
+        bot._split_message_buffers[(1, 10)].extend((
+            (20, 50, now, "니"),
+            (21, 60, now + 1, "왜요?"),
+            (22, 50, now + 2, "애미"),
+        ))
+        self.assertTrue(bot._split_candidate_contains_keyword(
+            self.message(message_id=22, content="애미", user_id=50)
+        ))
+        self.assertFalse(bot._split_candidate_contains_keyword(
+            self.message(message_id=21, content="왜요?", user_id=60)
+        ))
+
+    async def test_keyword_filter_decision_is_deferred_to_contextual_ai(self):
+        message = self.message(message_id=9, content="시발")
+        queue = asyncio.Queue()
+        with (
+            patch.object(bot, "_message_queue", queue),
+            patch.object(
+                bot, "_fast_check_with_invite_context",
+                new=AsyncMock(return_value=bot.FilterResult(
+                    "DECIDED", "MINOR", "경미 금칙어 감지"
+                )),
+            ),
+            patch.object(bot.config, "SPLIT_MESSAGE_CONTEXT_ENABLED", True),
+        ):
+            await bot._run_moderation(message)
+        queued_message, _, processing_key, settle = queue.get_nowait()
+        self.assertIs(queued_message, message)
+        self.assertTrue(settle)
+        bot._processing_keys.discard(processing_key)
+
+    async def test_split_keyword_that_was_individually_skipped_is_sent_to_ai(self):
+        first = self.message(message_id=30, content="니", user_id=50)
+        second = self.message(message_id=31, content="애미", user_id=50)
+        bot._record_split_message(first)
+        queue = asyncio.Queue()
+        with (
+            patch.object(bot, "_message_queue", queue),
+            patch.object(
+                bot, "_fast_check_with_invite_context",
+                new=AsyncMock(return_value=bot.FilterResult("SKIP")),
+            ),
+        ):
+            await bot._run_moderation(second)
+        queued_message, _, processing_key, settle = queue.get_nowait()
+        self.assertIs(queued_message, second)
+        self.assertTrue(settle)
+        bot._processing_keys.discard(processing_key)
+
+
 def _message(content="bad text", guild_id=1, user_id=50, message_id=999):
     channel = SimpleNamespace(id=10, mention="#general")
     message = SimpleNamespace(
@@ -481,6 +585,66 @@ class ManualReviewSanctionEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("#검수대상", notice)
         self.assertIn(f"<t:{int(created_at.timestamp())}:F>", notice)
         target_message.delete.assert_not_awaited()
+
+
+class ReviewCompletionCardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recent_card_is_edited_in_place(self):
+        channel = SimpleNamespace(send=AsyncMock())
+        message = SimpleNamespace(
+            created_at=bot.discord.utils.utcnow(),
+            edit=AsyncMock(),
+            delete=AsyncMock(),
+            channel=channel,
+        )
+
+        status = await bot._publish_review_completion(message, bot.discord.Embed())
+
+        self.assertEqual(status, "edited")
+        message.edit.assert_awaited_once()
+        channel.send.assert_not_awaited()
+        message.delete.assert_not_awaited()
+
+    async def test_old_card_is_reposted_before_original_is_deleted(self):
+        calls = []
+
+        async def send(**kwargs):
+            calls.append("send")
+
+        async def delete():
+            calls.append("delete")
+
+        channel = SimpleNamespace(send=AsyncMock(side_effect=send))
+        message = SimpleNamespace(
+            created_at=bot.discord.utils.utcnow() - bot.datetime.timedelta(hours=2),
+            edit=AsyncMock(),
+            delete=AsyncMock(side_effect=delete),
+            channel=channel,
+        )
+
+        status = await bot._publish_review_completion(message, bot.discord.Embed())
+
+        self.assertEqual(status, "replaced")
+        self.assertEqual(calls, ["send", "delete"])
+        message.edit.assert_not_awaited()
+
+    async def test_failed_repost_keeps_original_card(self):
+        response = SimpleNamespace(status=429, reason="Too Many Requests")
+        error = bot.discord.HTTPException(
+            response,
+            {"code": 30046, "message": "old message edit limit"},
+        )
+        channel = SimpleNamespace(send=AsyncMock(side_effect=error))
+        message = SimpleNamespace(
+            created_at=bot.discord.utils.utcnow() - bot.datetime.timedelta(hours=2),
+            edit=AsyncMock(),
+            delete=AsyncMock(),
+            channel=channel,
+        )
+
+        status = await bot._publish_review_completion(message, bot.discord.Embed())
+
+        self.assertEqual(status, "failed")
+        message.delete.assert_not_awaited()
 
 
 class AiOutageTests(unittest.IsolatedAsyncioTestCase):

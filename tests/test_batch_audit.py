@@ -119,6 +119,51 @@ class BatchAuditCheckpointTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class BatchAuditTargetExpansionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expands_forum_into_active_and_recent_archived_threads(self):
+        active = SimpleNamespace(id=11, name="active", history=object())
+        recent = SimpleNamespace(
+            id=12,
+            name="recent",
+            history=object(),
+            archive_timestamp=datetime.datetime.now(datetime.UTC),
+        )
+        old = SimpleNamespace(
+            id=13,
+            name="old",
+            history=object(),
+            archive_timestamp=datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=30),
+        )
+
+        async def archived_threads(*, limit):
+            self.assertIsNone(limit)
+            yield recent
+            yield old
+
+        forum = SimpleNamespace(
+            id=10,
+            name="물물교환",
+            threads=[active],
+            archived_threads=archived_threads,
+        )
+        guild = SimpleNamespace(get_channel=lambda channel_id: forum if channel_id == 10 else None)
+        with (
+            patch.object(batch_audit.config, "WATCHED_CHANNEL_IDS", [10]),
+            patch.object(batch_audit.config, "BATCH_FIRST_RUN_LOOKBACK_DAYS", 7),
+        ):
+            targets = await batch_audit._expand_audit_targets(guild)
+
+        self.assertEqual([target.id for target in targets], [11, 12])
+
+    async def test_keeps_normal_text_channel_and_deduplicates_targets(self):
+        channel = SimpleNamespace(id=20, name="자유", history=object())
+        guild = SimpleNamespace(get_channel=lambda channel_id: channel)
+        with patch.object(batch_audit.config, "WATCHED_CHANNEL_IDS", [20, 20]):
+            targets = await batch_audit._expand_audit_targets(guild)
+
+        self.assertEqual(targets, [channel])
+
+
 class ReportRetentionTests(unittest.TestCase):
     def test_prunes_only_old_matching_report_files(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(

@@ -28,6 +28,8 @@ import asyncio
 import time
 import json
 import re
+import unicodedata
+from collections import defaultdict, deque
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -175,6 +177,122 @@ _last_drop_alert_at: datetime.datetime | None = None
 _workers_started = False  # on_ready는 재연결 시마다 다시 호출되므로 워커 중복 생성 방지용
 _processing_keys: set[tuple[int, int, str]] = set()
 _background_tasks: set[asyncio.Task] = set()
+
+# 채널별 최근 메시지를 Discord API 재조회 없이 잠깐 보관한다. 분할 발화 판단에만 쓰며
+# 작성자 ID는 AI에 전달하지 않고 current_user/other_user 표기로 바꾼다.
+_split_message_buffers: dict[tuple[int, int], deque] = defaultdict(
+    lambda: deque(maxlen=128)
+)
+_split_buffer_record_count = 0
+
+
+def _record_split_message(message: discord.Message) -> None:
+    """분할 발화 문맥용으로 채널의 최신 메시지를 중복 없이 기록한다."""
+    if not config.SPLIT_MESSAGE_CONTEXT_ENABLED:
+        return
+    global _split_buffer_record_count
+    key = (int(message.guild.id), int(message.channel.id))
+    now = time.monotonic()
+    entries = _split_message_buffers[key]
+    message_id = int(message.id)
+    for index, entry in enumerate(entries):
+        if entry[0] == message_id:
+            entries[index] = (message_id, int(message.author.id), now, message.content)
+            break
+    else:
+        entries.append((message_id, int(message.author.id), now, message.content))
+
+    _split_buffer_record_count += 1
+    if _split_buffer_record_count % 1000 == 0:
+        stale_before = now - max(300.0, config.SPLIT_MESSAGE_WINDOW_SECONDS * 4)
+        stale_keys = [
+            buffer_key for buffer_key, buffer in _split_message_buffers.items()
+            if not buffer or buffer[-1][2] < stale_before
+        ]
+        for buffer_key in stale_keys:
+            del _split_message_buffers[buffer_key]
+
+
+async def _split_message_context(message: discord.Message, *, settle: bool = False) -> list[dict]:
+    """짧은 시간의 다자 대화를 화자별로 분리해 대상 메시지의 앞뒤 문맥으로 반환한다."""
+    if not config.SPLIT_MESSAGE_CONTEXT_ENABLED:
+        return []
+    key = (int(message.guild.id), int(message.channel.id))
+    entries = _split_message_buffers.get(key)
+    if not entries:
+        return []
+
+    message_id = int(message.id)
+    current = next((entry for entry in entries if entry[0] == message_id), None)
+    if current is None:
+        return []
+    if settle:
+        remaining = config.SPLIT_MESSAGE_SETTLE_SECONDS - (time.monotonic() - current[2])
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    snapshot = list(_split_message_buffers.get(key, ()))
+    try:
+        current_index = next(i for i, entry in enumerate(snapshot) if entry[0] == message_id)
+    except StopIteration:
+        return []
+
+    current = snapshot[current_index]
+    author_id = current[1]
+    selected_before = [
+        entry for entry in snapshot[:current_index]
+        if current[2] - entry[2] <= config.SPLIT_MESSAGE_WINDOW_SECONDS
+    ][-(config.SPLIT_MESSAGE_MAX_MESSAGES - 1):]
+    remaining_slots = config.SPLIT_MESSAGE_MAX_MESSAGES - 1 - len(selected_before)
+    selected_after = [
+        entry for entry in snapshot[current_index + 1:]
+        if entry[2] - current[2] <= config.SPLIT_MESSAGE_WINDOW_SECONDS
+    ][:remaining_slots]
+
+    remaining_chars = config.SPLIT_MESSAGE_MAX_CHARS
+    context = []
+    other_authors = {}
+    for relation, group in (("before", selected_before), ("after", selected_after)):
+        for _, entry_author_id, _, raw_content in group:
+            content = (raw_content or "").strip()
+            if not content or remaining_chars <= 0:
+                continue
+            content = content[:remaining_chars]
+            remaining_chars -= len(content)
+            if entry_author_id == author_id:
+                speaker = "current_user"
+            else:
+                speaker = other_authors.setdefault(
+                    entry_author_id, f"other_user_{len(other_authors) + 1}"
+                )
+            context.append({
+                "speaker": speaker,
+                "relation": relation,
+                "content": content,
+            })
+    return context
+
+
+def _split_candidate_contains_keyword(message: discord.Message) -> bool:
+    """현재 사용자 자신의 최근 조각을 합쳤을 때 금칙어가 만들어지는지 확인한다."""
+    key = (int(message.guild.id), int(message.channel.id))
+    entries = list(_split_message_buffers.get(key, ()))
+    current = next((entry for entry in reversed(entries) if entry[0] == int(message.id)), None)
+    if current is None:
+        return False
+    own_parts = [
+        str(entry[3]) for entry in entries
+        if (entry[1] == current[1]
+            and 0 <= current[2] - entry[2] <= config.SPLIT_MESSAGE_WINDOW_SECONDS)
+    ][-config.SPLIT_MESSAGE_MAX_MESSAGES:]
+    if len(own_parts) < 2:
+        return False
+    joined = unicodedata.normalize("NFKC", "".join(own_parts)).casefold()
+    return any(
+        unicodedata.normalize("NFKC", word).casefold() in joined
+        for word in (*config.BANNED_WORDS_SEVERE, *config.BANNED_WORDS_MODERATE)
+        if word
+    )
 
 
 def _spawn(coro):
@@ -783,6 +901,43 @@ def _finalize_review_embed(embed: discord.Embed, action: str, result_text: str, 
     embed.add_field(name="검수 결과", value=f"{result_text}\n처리자: {admin.mention}", inline=False)
 
 
+async def _publish_review_completion(log_message: discord.Message,
+                                     embed: discord.Embed) -> str:
+    """검수 완료 카드를 남기되 오래된 메시지 PATCH 제한을 선제적으로 피한다."""
+    created_at = getattr(log_message, "created_at", None)
+    is_old = (
+        created_at is not None
+        and created_at <= discord.utils.utcnow() - datetime.timedelta(minutes=55)
+    )
+
+    if not is_old:
+        try:
+            await log_message.edit(embed=embed, view=None)
+            return "edited"
+        except (discord.Forbidden, discord.HTTPException) as e:
+            # Discord가 최근 카드에도 일시적인 편집 제한을 반환할 수 있으므로 아래의
+            # 새 카드 게시 경로로 전환한다. 관리자 조치 자체는 이미 DB에 확정된 상태다.
+            print(f"[review] 완료 카드 편집 실패, 새 카드로 대체: {type(e).__name__}")
+
+    channel = getattr(log_message, "channel", None)
+    if channel is None or not hasattr(channel, "send"):
+        return "failed"
+    try:
+        await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"[review] 완료 카드 대체 게시 실패: {type(e).__name__}")
+        return "failed"
+
+    # 새 완료 카드가 안전하게 게시된 뒤에만 버튼이 남은 기존 카드를 정리한다.
+    # 삭제 실패 시에도 DB의 claim_review가 중복 조치를 차단한다.
+    try:
+        await log_message.delete()
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"[review] 처리된 기존 카드 정리 실패: {type(e).__name__}")
+        return "reposted"
+    return "replaced"
+
+
 class _DangerConfirmView(discord.ui.View):
     """킥/밴은 되돌리기 어려우므로 한 번 더 확인을 거친다 (60초 안에 응답)."""
 
@@ -808,11 +963,15 @@ class _DangerConfirmView(discord.ui.View):
             return
         embed = self.log_message.embeds[0]
         _finalize_review_embed(embed, self.action, text, interaction.user)
-        try:
-            await self.log_message.edit(embed=embed, view=None)
-        except discord.HTTPException:
-            pass
-        await interaction.edit_original_response(content=f"✅ 완료: {text}", view=None)
+        card_status = await _publish_review_completion(self.log_message, embed)
+        card_note = ""
+        if card_status == "failed":
+            card_note = "\n⚠️ 조치는 완료됐지만 검토 카드 화면을 갱신하지 못했습니다."
+        elif card_status == "reposted":
+            card_note = "\nℹ️ 새 완료 카드는 게시됐으며 기존 버튼은 DB에서 재사용이 차단됩니다."
+        await interaction.edit_original_response(
+            content=f"✅ 완료: {text}{card_note}", view=None
+        )
         self.stop()
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
@@ -873,7 +1032,25 @@ async def on_interaction(interaction: discord.Interaction):
         return
     embed = interaction.message.embeds[0]
     _finalize_review_embed(embed, action, text, interaction.user)
-    await interaction.message.edit(embed=embed, view=None)
+    card_status = await _publish_review_completion(interaction.message, embed)
+    if card_status == "failed":
+        await interaction.followup.send(
+            "✅ 관리자 조치는 완료됐지만 Discord 제한으로 검토 카드 화면을 갱신하지 못했습니다. "
+            "같은 검수 건의 중복 조치는 DB에서 차단됩니다.",
+            ephemeral=True,
+        )
+    elif card_status == "replaced":
+        await interaction.followup.send(
+            "✅ 처리가 완료됐습니다. 오래된 검토 카드는 Discord 편집 제한을 피하도록 "
+            "새 완료 카드로 교체했습니다.",
+            ephemeral=True,
+        )
+    elif card_status == "reposted":
+        await interaction.followup.send(
+            "✅ 처리가 완료되어 새 완료 카드를 게시했습니다. 기존 카드의 버튼을 다시 눌러도 "
+            "중복 조치는 적용되지 않습니다.",
+            ephemeral=True,
+        )
 
 
 async def handle_violation(message: discord.Message, level: str, reason_text: str,
@@ -1039,7 +1216,7 @@ async def _track_ai_outage(guild: discord.Guild, result):
 async def ai_worker(worker_id: int):
     """큐에서 메시지를 꺼내 캐시 확인 후 필요하면 AI(Gemini→Groq→Ollama)로 판단하는 워커."""
     while True:
-        message, enqueued_at, processing_key = await _message_queue.get()
+        message, enqueued_at, processing_key, settle_for_burst = await _message_queue.get()
         try:
             queue_age = time.monotonic() - enqueued_at
             if queue_age > config.MAX_QUEUE_AGE_SECONDS:
@@ -1069,7 +1246,17 @@ async def ai_worker(worker_id: int):
             # 같은 문구가 규칙이 다른 채널의 판단 결과를 재사용하지 않게 한다.
             channel_note = get_channel_note(message.channel)
             barter_context = _is_barter_channel(message.channel)
-            conversation_context = await _barter_conversation_context(message)
+            burst_context = await _split_message_context(
+                message, settle=settle_for_burst
+            )
+            if barter_context:
+                conversation_context = await _barter_conversation_context(message)
+                # 기존 물물교환 선행 대화에, 대상 뒤에 이어진 동일 작성자의 분할 조각만 보탠다.
+                conversation_context.extend(
+                    turn for turn in burst_context if turn.get("relation") == "after"
+                )
+            else:
+                conversation_context = burst_context
             cache_context = channel_note or ""
             if barter_context:
                 # 이전 단일 문장 기준 캐시와 새 대화 증거 기준 캐시를 분리한다.
@@ -1094,10 +1281,22 @@ async def ai_worker(worker_id: int):
             # 과거 오탐 사례를 프롬프트에 포함해 같은 유형의 오탐을 줄인다
             fp_examples = await learning.get_prompt_examples(message.guild.id, message.channel)
             async with _ai_semaphore:
+                split_assessment = None
+                if settle_for_burst and burst_context:
+                    try:
+                        split_assessment = await moderator.assess_split_utterance(
+                            message.content, burst_context
+                        )
+                    except Exception as error:
+                        print(
+                            "[split-context] 분할 발화 전용 판단 실패, 일반 판단 유지: "
+                            f"{type(error).__name__}"
+                        )
                 result = await classify_message(message.content, channel_note=channel_note,
                                                 fp_examples=fp_examples,
                                                 conversation_context=conversation_context,
                                                 barter_context=barter_context)
+            result = moderator.apply_split_utterance_guard(result, split_assessment)
 
             # 판단 실패(provider="none")는 캐시하지 않는다 — 캐시하면 AI가 복구된 뒤에도
             # 같은 내용의 메시지가 캐시 유효시간 동안 계속 무검사 통과하게 됨
@@ -1202,7 +1401,14 @@ async def ai_retry_worker():
 
                 channel_note = get_channel_note(message.channel)
                 barter_context = _is_barter_channel(message.channel)
-                conversation_context = await _barter_conversation_context(message)
+                burst_context = await _split_message_context(message)
+                if barter_context:
+                    conversation_context = await _barter_conversation_context(message)
+                    conversation_context.extend(
+                        turn for turn in burst_context if turn.get("relation") == "after"
+                    )
+                else:
+                    conversation_context = burst_context
                 cache_context = channel_note or ""
                 if barter_context:
                     cache_context += "\x00barter-conversation-v2"
@@ -1574,18 +1780,33 @@ async def _run_moderation(message: discord.Message):
     if processing_key in _processing_keys:
         return
 
+    _record_split_message(message)
+
     result = await _fast_check_with_invite_context(message)
 
-    if result.decision == "SKIP":
+    # 욕설 키워드 한 조각만 보고 즉시 확정하면 "시발" + "점이 어디예요?" 같은 한국어
+    # 분할 발화를 오판한다. 초대 링크·도배처럼 문맥과 무관한 확정 규칙은 그대로 유지하고,
+    # 금칙어 결정만 짧게 뒤 문장을 기다린 뒤 AI가 앞뒤 조각과 함께 판단하게 한다.
+    keyword_needs_context = (
+        config.SPLIT_MESSAGE_CONTEXT_ENABLED
+        and (
+            (result.decision == "DECIDED" and "금칙어" in (result.reason or ""))
+            or (result.decision == "SKIP" and _split_candidate_contains_keyword(message))
+        )
+    )
+
+    if result.decision == "SKIP" and not keyword_needs_context:
         pass  # 정상 메시지, 아무 조치 없음
-    elif result.decision == "DECIDED":
+    elif result.decision == "DECIDED" and not keyword_needs_context:
         # 이벤트 핸들러를 막지 않도록 별도 태스크로 처리 (도배 레이드 시 지연 방지)
         _processing_keys.add(processing_key)
         _spawn(_handle_decided(message, result, processing_key))
     else:  # NEEDS_AI -> 큐에 넣어 워커가 비동기 처리 (여기서 기다리지 않음)
         _processing_keys.add(processing_key)
         try:
-            _message_queue.put_nowait((message, time.monotonic(), processing_key))
+            _message_queue.put_nowait((
+                message, time.monotonic(), processing_key, keyword_needs_context
+            ))
         except asyncio.QueueFull:
             _processing_keys.discard(processing_key)
             _note_drop(message.guild)

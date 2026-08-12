@@ -48,6 +48,24 @@ class ModeratorBatchTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(results[0].level, "NONE")
 
+    async def test_batch_clears_tarkov_information_link_ad_false_positive(self):
+        messages = [{
+            "index": 0,
+            "author_ref": "user_1",
+            "content": "이 퀘스트 위치는 https://tarkov.dev/quest/123 에 정리돼 있어요",
+        }]
+        response = [{
+            "index": 0,
+            "level": "MODERATE",
+            "rule_violated": "2",
+            "reason": "외부 사이트 홍보 링크",
+        }]
+        with patch.object(
+            moderator, "_classify_batch_with_ollama", new=AsyncMock(return_value=response)
+        ):
+            results = await moderator.classify_batch(messages, backend="ollama")
+        self.assertEqual((results[0].level, results[0].rule_violated), ("NONE", "NONE"))
+
 
 class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
     def test_video_share_channel_receives_its_allow_rule(self):
@@ -92,6 +110,106 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[판단 대상", prompt)
         self.assertTrue(prompt.rstrip().endswith('{"content": "네 맞아요"}'))
 
+    def test_split_korean_utterance_context_is_joined_without_transferring_blame(self):
+        prompt = moderator._user_prompt(
+            "점이 어디예요?",
+            None,
+            conversation_context=[
+                {"speaker": "current_user", "relation": "before", "content": "시발"},
+                {"speaker": "current_user", "relation": "after", "content": "알려주세요"},
+            ],
+        )
+        self.assertIn("여러 메시지로 나눠", prompt)
+        self.assertIn("중간 대화를 고려해 실제로 한 발화가 이어진 경우", prompt)
+        self.assertIn("정상적인 질문·설명·고유명사라면 위반이 아닙니다", prompt)
+        self.assertIn("위반을 판단 대상에게 전가하지 마세요", prompt)
+        self.assertIn('"without_spaces": "시발점이 어디예요?알려주세요"', prompt)
+
+    async def test_split_utterance_assessor_uses_dedicated_local_prompt(self):
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {
+            "message": {"content": (
+                '{"joined":"시발점이 어디예요?",'
+                '"continuation":true,"abusive":false}'
+            )}
+        }
+        client = SimpleNamespace(post=AsyncMock(return_value=response))
+        with patch.object(moderator, "_get_http_client", return_value=client):
+            assessment = await moderator.assess_split_utterance(
+                "시발",
+                [
+                    {"speaker": "other_user_1", "relation": "after", "content": "무슨 말이에요?"},
+                    {"speaker": "current_user", "relation": "after", "content": "점이 어디예요?"},
+                ],
+            )
+        self.assertEqual(assessment, {
+            "joined": "시발점이 어디예요?", "continuation": True, "abusive": False,
+        })
+        payload = client.post.await_args.kwargs["json"]
+        self.assertIs(payload["think"], False)
+        self.assertIn("한국어 다자 채팅의 분할 발화 복원기", payload["messages"][0]["content"])
+        self.assertIn("other_user_1", payload["messages"][1]["content"])
+
+    def test_split_utterance_guard_corrects_only_language_violation(self):
+        false_positive = moderator.ModerationResult(
+            "MINOR", "3", "욕설 표현이 포함됨", "ollama"
+        )
+        guarded = moderator.apply_split_utterance_guard(
+            false_positive,
+            {"joined": "시발점이 어디예요?", "continuation": True, "abusive": False},
+        )
+        self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+
+        politeness = moderator.ModerationResult("MINOR", "3", "반말 사용", "ollama")
+        self.assertIs(
+            moderator.apply_split_utterance_guard(
+                politeness,
+                {"joined": "이거 어디", "continuation": True, "abusive": False},
+            ),
+            politeness,
+        )
+
+        missed_abuse = moderator.apply_split_utterance_guard(
+            moderator.ModerationResult("NONE", "NONE", "", "ollama"),
+            {"joined": "니애미", "continuation": True, "abusive": True},
+        )
+        self.assertEqual((missed_abuse.level, missed_abuse.rule_violated), ("SEVERE", "3"))
+
+        separate_turns = moderator.ModerationResult("MINOR", "3", "욕설 표현", "ollama")
+        self.assertIs(
+            moderator.apply_split_utterance_guard(
+                separate_turns,
+                {"joined": "시발 점", "continuation": False, "abusive": False},
+            ),
+            separate_turns,
+        )
+
+    def test_batch_prompt_reconstructs_same_author_split_utterances(self):
+        self.assertIn("author_ref가 같은 사용자의 연속 항목", moderator.BATCH_SYSTEM_PROMPT)
+        self.assertIn("시발점이 어디예요?", moderator.BATCH_SYSTEM_PROMPT)
+        self.assertIn("분할 전송으로 우회한 위반", moderator.BATCH_SYSTEM_PROMPT)
+
+    def test_casual_speech_guard_allows_agreed_styles_only(self):
+        verdict = moderator.ModerationResult("MINOR", "3", "반말 말투 사용", "ollama")
+        for content in (
+            "확인했음", "지금 가는 중임", "그런 듯", "가능함", "뭐함",
+            "감사요", "알겠어용", "알겠습니당", "넹",
+        ):
+            with self.subTest(content=content):
+                guarded = moderator.apply_casual_speech_guard(verdict, content)
+                self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+
+    def test_casual_speech_guard_preserves_abuse_and_other_rule_three_violations(self):
+        politeness = moderator.ModerationResult("MINOR", "3", "반말 말투 사용", "ollama")
+        for content in ("너 바보임", "병신임", "닥쳐용"):
+            with self.subTest(content=content):
+                self.assertIs(
+                    moderator.apply_casual_speech_guard(politeness, content), politeness
+                )
+        rmt = moderator.ModerationResult("MODERATE", "3", "현금 거래 유도", "ollama")
+        self.assertIs(moderator.apply_casual_speech_guard(rmt, "계좌 거래 가능함"), rmt)
+
     def test_barter_prompt_requires_whole_conversation_judgment(self):
         prompt = moderator._user_prompt(
             "10만원 맞나요?",
@@ -135,12 +253,93 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(guarded.level, "NONE")
 
+    def test_barter_guard_allows_full_rules_notice_but_not_bypass(self):
+        verdict = moderator.ModerationResult(
+            "MODERATE", "3", "개인 DM과 현금·계좌 거래 유도", "ollama"
+        )
+        notice = (
+            "이용 안내: 현금 거래 예방 및 안전한 거래를 위해 개인 DM으로 연락해 달라는 "
+            "문구의 사용을 전면 금지합니다. 개인 DM 거래 X, 게시글 안에서 대화해주세요. "
+            "본 커뮤니티는 인게임 거래를 중개하거나 보증하지 않습니다. "
+            "현금·상품권·계좌 등 현물 거래 관련 내용은 즉시 삭제되며 제재될 수 있습니다."
+        )
+        guarded = moderator.apply_barter_conversation_guard(verdict, notice, [])
+        self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+
+        bypass = "DM 거래는 금지지만 규정 무시하고 몰래 DM으로 연락 주세요"
+        self.assertIs(
+            moderator.apply_barter_conversation_guard(verdict, bypass, []), verdict
+        )
+
+    def test_barter_verification_channel_link_is_allowed_without_domain_spoofing(self):
+        verdict = moderator.ModerationResult(
+            "MODERATE", "2", "외부 사이트 홍보", "ollama"
+        )
+        for content in (
+            "오버롤 인증은 https://discord.com/channels/719020590341685258/1445045515971592294",
+            "인증글 https://discord.com/channels/719020590341685258/1445045515971592294/123456",
+        ):
+            with self.subTest(content=content):
+                guarded = moderator.apply_barter_verification_link_guard(verdict, content)
+                self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+
+        for content in (
+            "https://evil.example/discord.com/channels/719020590341685258/1445045515971592294",
+            "https://discord.com/channels/719020590341685258/999999999",
+            "https://discord.com/channels/719020590341685258/1445045515971592294 그리고 https://example.com",
+            "https://discord.com/channels/719020590341685258/1445045515971592294 보고 현금 거래는 DM 주세요",
+        ):
+            with self.subTest(content=content):
+                self.assertIs(
+                    moderator.apply_barter_verification_link_guard(verdict, content), verdict
+                )
+
     def test_barter_guard_preserves_non_trade_violation(self):
         result = moderator.ModerationResult(
             "MODERATE", "3", "상대방에게 명백한 욕설을 함", "ollama"
         )
         self.assertIs(
             moderator.apply_barter_conversation_guard(result, "심한 욕설", []), result
+        )
+
+    def test_tarkov_information_links_clear_only_rule_two_false_positives(self):
+        verdict = moderator.ModerationResult(
+            "MODERATE", "규정 2", "외부 정보 사이트 홍보", "ollama"
+        )
+        for content in (
+            "아이템 정보는 https://tarkov.dev/items/abc 여기서 보세요",
+            "맵은 https://mapgenie.io/tarkov/maps/customs 가 보기 편해요",
+            "관련 글 https://www.reddit.com/r/EscapefromTarkov/comments/abc",
+            "시세 확인 https://tarkov-market.com/item/abc",
+        ):
+            with self.subTest(content=content):
+                guarded = moderator.apply_tarkov_info_link_guard(verdict, content)
+                self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+
+    def test_tarkov_link_guard_rejects_mixed_or_commercial_links(self):
+        verdict = moderator.ModerationResult(
+            "MODERATE", "2", "외부 사이트 또는 서버 홍보", "ollama"
+        )
+        for content in (
+            "https://tarkov.dev/items/abc 보고 https://discord.gg/other 로 오세요",
+            "https://tarkov.dev/items/abc 가입하고 추천인 코드 넣어주세요",
+            "https://tarkov.dev/items/abc 와 https://example.com/buy 같이 보세요",
+            "https://tarkov.dev/items/abc 계정 판매합니다",
+            "https://tarkov.dev/items/abc 현금 거래 받습니다",
+            "타르코프 정보 https://evil-tarkov.dev/phishing",
+        ):
+            with self.subTest(content=content):
+                self.assertIs(moderator.apply_tarkov_info_link_guard(verdict, content), verdict)
+
+    def test_tarkov_link_guard_preserves_other_rule_violations(self):
+        verdict = moderator.ModerationResult(
+            "SEVERE", "4", "링크와 함께 특정인을 괴롭힘", "ollama"
+        )
+        self.assertIs(
+            moderator.apply_tarkov_info_link_guard(
+                verdict, "https://tarkov.dev/items/abc"
+            ),
+            verdict,
         )
 
     async def test_transient_rate_limit_is_retried_once(self):
@@ -216,14 +415,14 @@ class RealtimeOllamaFallbackTests(unittest.IsolatedAsyncioTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    async def test_ollama_judges_when_both_free_apis_are_exhausted(self):
+    async def test_ollama_applies_casual_speech_policy_when_cloud_is_exhausted(self):
         verdict = moderator.ModerationResult("MODERATE", "3", "반말", provider="ollama")
         with patch.object(moderator, "_classify_with_ollama",
                           new=AsyncMock(return_value=verdict)) as ollama:
             result = await moderator.classify_message("뭐함")
         ollama.assert_awaited_once()
         self.assertEqual(result.provider, "ollama")
-        self.assertEqual(result.level, "MODERATE")
+        self.assertEqual(result.level, "NONE")
 
     async def test_default_order_uses_local_before_cloud(self):
         verdict = moderator.ModerationResult("NONE", "NONE", "", provider="ollama")

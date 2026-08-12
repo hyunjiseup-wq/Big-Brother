@@ -25,13 +25,39 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("출처 링크 없이 코드만 공유", config.SERVER_RULES)
         self.assertIn("추천인/제휴 보상", config.SERVER_RULES)
 
+    def test_default_policy_allows_tarkov_information_sites(self):
+        self.assertIn("타르코프 정보 사이트 예외", config.SERVER_RULES)
+        self.assertIn("퀘스트·맵·아이템·탄약·시세", config.SERVER_RULES)
+        self.assertIn("공식 사이트가 아니거나 작성자 본인 사이트", config.SERVER_RULES)
+        self.assertTrue(config.TARKOV_INFO_LINK_EXEMPTION_ENABLED)
+        self.assertIn("tarkov.dev", config.TARKOV_INFO_SITE_DOMAINS)
+        self.assertIn("mapgenie.io", config.TARKOV_INFO_SITE_PATH_PREFIXES)
+
+    def test_default_policy_requires_korean_split_utterance_reconstruction(self):
+        self.assertIn("한국어 분할 발화 판단", config.SERVER_RULES)
+        self.assertIn("시발점이 어디예요?", config.SERVER_RULES)
+        self.assertIn("결합한 전체 발화가 명백한 모욕", config.SERVER_RULES)
+
+    def test_default_policy_allows_agreed_casual_polite_styles(self):
+        self.assertIn("용용체·음슴체·경미한 경어", config.SERVER_RULES)
+        self.assertIn("확인했음", config.SERVER_RULES)
+        self.assertIn("뭐함", config.SERVER_RULES)
+        self.assertIn("실제 모욕·욕설·시비", config.SERVER_RULES)
+
     def test_barter_policy_distinguishes_game_currency_from_real_payment(self):
         trade_note = config.CHANNEL_CONTEXT_NOTES[1526179570192093314]
         self.assertIn("게임 내 플리마켓", trade_note)
         self.assertIn("달러·루블·유로", trade_note)
         self.assertIn("앞뒤 대화", trade_note)
-        self.assertIn("실제 계좌번호", trade_note)
-        self.assertIn("개인 DM", trade_note)
+        self.assertIn("오버롤 인증 게시판", trade_note)
+        self.assertIn("게시글 안에서 공개적으로 진행", trade_note)
+        self.assertIn("개인 DM으로 연락해 달라", trade_note)
+        self.assertIn("현금·상품권·계좌", trade_note)
+        self.assertIn("인게임 거래를 중개하거나 보증하지 않습니다", trade_note)
+        self.assertEqual(
+            config.BARTER_VERIFICATION_CHANNEL_URL_PREFIXES,
+            ("https://discord.com/channels/719020590341685258/1445045515971592294",),
+        )
 
     def test_video_share_policy_allows_videos_and_youtube_channels(self):
         video_note = config.CHANNEL_CONTEXT_NOTES[1409874543295856710]
@@ -48,6 +74,19 @@ class ConfigValidationTests(unittest.TestCase):
             ("BARTER_CHANNEL_NAMES", (123,)),
             ("BARTER_CONTEXT_MESSAGE_LIMIT", 0),
             ("BARTER_CONTEXT_MAX_CHARS", 0),
+            ("BARTER_VERIFICATION_CHANNEL_URL_PREFIXES", ("https://example.com",)),
+        ):
+            with self.subTest(name=name), patch.object(config, name, value):
+                with self.assertRaisesRegex(ValueError, name):
+                    config.validate_config()
+
+    def test_invalid_split_message_context_settings_are_rejected(self):
+        for name, value in (
+            ("SPLIT_MESSAGE_CONTEXT_ENABLED", "true"),
+            ("SPLIT_MESSAGE_SETTLE_SECONDS", -1),
+            ("SPLIT_MESSAGE_WINDOW_SECONDS", 0),
+            ("SPLIT_MESSAGE_MAX_MESSAGES", 1),
+            ("SPLIT_MESSAGE_MAX_CHARS", 0),
         ):
             with self.subTest(name=name), patch.object(config, name, value):
                 with self.assertRaisesRegex(ValueError, name):
@@ -84,6 +123,16 @@ class ConfigValidationTests(unittest.TestCase):
         with patch.object(config, "WATCHED_CHANNEL_IDS", [123, "not-an-id"]):
             with self.assertRaisesRegex(ValueError, "WATCHED_CHANNEL_IDS"):
                 config.validate_config()
+
+    def test_default_audit_targets_include_special_operation_channels(self):
+        expected = {
+            1410654534769840209,  # 팀원찾기
+            1526179570192093314,  # 물물교환
+            1409874543295856710,  # 영상공유
+            1445049743150415923,  # 핵 의심 신고
+            1445045515971592294,  # 오버롤 인증 게시판
+        }
+        self.assertTrue(expected.issubset(set(config.WATCHED_CHANNEL_IDS)))
 
     def test_invalid_internal_voice_invite_channel_id_is_rejected(self):
         with patch.object(config, "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS", [123, "bad"]):

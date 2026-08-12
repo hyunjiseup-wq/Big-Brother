@@ -31,8 +31,15 @@ class LearningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_thread_uses_parent_channel_scope_and_nfkc(self):
         thread = SimpleNamespace(id=101, parent_id=10)
-        await learning.record_false_positive(1, thread, "Ａ\u200bＢ", "MINOR", "wrong", 99)
-        self.assertTrue(await learning.is_known_false_positive(1, 10, "ab"))
+        await learning.record_false_positive(1, thread, "Ａ\u200bＢ normal", "MINOR", "wrong", 99)
+        self.assertTrue(await learning.is_known_false_positive(1, 10, "ab normal"))
+
+    async def test_short_or_keyword_false_positive_requires_context_again(self):
+        await learning.record_false_positive(1, 10, "네", "MINOR", "wrong", 99)
+        await learning.record_false_positive(1, 10, "시발", "MINOR", "wrong", 99)
+        self.assertFalse(await learning.is_known_false_positive(1, 10, "네"))
+        self.assertFalse(await learning.is_known_false_positive(1, 10, "시발"))
+        self.assertIsNone(await learning.get_prompt_examples(1, 10))
 
     async def test_prompt_examples_are_sanitized_and_rule_can_be_removed(self):
         rule_id = await learning.record_false_positive(

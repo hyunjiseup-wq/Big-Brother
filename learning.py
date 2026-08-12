@@ -41,6 +41,18 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(_normalize(content).encode("utf-8")).hexdigest()
 
 
+def _requires_contextual_judgment(content: str) -> bool:
+    """짧은 동의·연락 조각이나 금칙어 포함 문장은 과거 정상 사례만으로 자동 통과시키지 않는다."""
+    normalized = _normalize(content)
+    if len(normalized) < config.MIN_LENGTH_FOR_AI_CHECK:
+        return True
+    for word in (*config.BANNED_WORDS_SEVERE, *config.BANNED_WORDS_MODERATE):
+        normalized_word = _normalize(word)
+        if normalized_word and normalized_word in normalized:
+            return True
+    return False
+
+
 def _safe_prompt_snippet(content: str) -> str:
     """프롬프트 예시는 비신뢰 데이터로 축약하고 멘션/URL/제어문자를 제거한다."""
     text = unicodedata.normalize("NFKC", content)
@@ -91,6 +103,10 @@ async def _ensure_loaded():
 
 async def is_known_false_positive(guild_id: int, channel_or_id, content: str) -> bool:
     if not content or not _normalize(content):
+        return False
+    # "시발"+"점"이나 물물교환의 "네"처럼 문맥에 따라 의미가 바뀌는 짧은 조각은
+    # 과거 한 번 정상 처리됐더라도 단독 해시만 보고 영구 통과시키지 않는다.
+    if _requires_contextual_judgment(content):
         return False
     await _ensure_loaded()
     scope_id = channel_scope_id(channel_or_id)
@@ -161,7 +177,7 @@ async def get_prompt_examples(guild_id: int, channel_or_id) -> list[dict] | None
             "previous_level": wrong_level or "UNKNOWN",
         }
         for _, row_scope, content, wrong_level, _ in rows
-        if _safe_prompt_snippet(content)
+        if _safe_prompt_snippet(content) and not _requires_contextual_judgment(content)
     ] or None
     _examples_cache[key] = (now + config.FALSE_POSITIVE_REFRESH_SECONDS, examples)
     return examples

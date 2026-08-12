@@ -41,6 +41,12 @@ SERVER_RULES = """
 
 2. 커뮤니티 무단 홍보
    - 허가받지 않은 서버 초대 링크, 외부 사이트/채널 홍보, 광고성 게시
+   - [타르코프 정보 사이트 예외] Escape from Tarkov의 퀘스트·맵·아이템·탄약·시세·플리마켓·
+     패치·이벤트·공략·위키 정보를 확인하거나 공유하는 사이트 링크는 정상적인 게임 정보 공유임.
+     공식 사이트가 아니거나 작성자 본인 사이트라는 이유만으로 무단 홍보로 판단하지 말 것.
+     링크의 실제 내용과 게시 문맥이 타르코프 정보 제공·질문·답변·추천이라면 규정 위반이 아님.
+     단, 타르코프를 내세우더라도 다른 디스코드 서버 입장, 추천인·제휴 보상, 유료 상품 구매·결제,
+     계정·현금 거래, 피싱 또는 실행파일 다운로드를 유도하면 이 예외를 적용하지 말 것.
    - [타르코프 이벤트 코드 예외] BSG 런처 또는 Escape from Tarkov 공식 사이트의
      "Activate Code / Activate Promo Code" 메뉴에서 입력하는 게임 이벤트·보상 코드를
      유저끼리 공유하는 행위는 정상적인 게임 정보 공유이며 광고가 아님.
@@ -52,12 +58,25 @@ SERVER_RULES = """
      링크가 있다는 사실만으로 제재하지 말고, 도메인과 가입·구매·추천 유도 문맥을 함께 볼 것.
 
 3. 채팅 예절 미준수
-   - 반말 (서버는 존댓말 사용을 기본 예절로 함)
-     ※ 반말 판단 시 주의: 존댓말 어미를 장난스럽게/귀엽게 변형한 표현은 존댓말로 취급하며 위반이 아님.
+   - [한국어 분할 발화 판단] 같은 사용자가 짧은 시간에 연속 전송한 메시지 조각은 각각을
+     독립 문장으로 보지 말고, 제공된 before → 판단 대상 → after 순서로 붙여 하나의 발화로 해석할 것.
+     여러 사용자가 끼어든 경우 speaker가 같은 조각끼리만 결합 후보로 보고, 다른 speaker의 말은
+     질문·답변 흐름을 파악하는 문맥으로만 사용할 것. 다른 사용자의 발언이나 위반을 전가하지 말 것.
+     같은 speaker의 조각도 중간 대화상 별개의 답변·새 발화라면 억지로 이어 붙이지 말 것.
+     조각을 공백 없이 붙인 형태와 띄어 붙인 형태를 모두 읽고 실제 문법·의도를 판단할 것.
+     예: `시발` + `점이 어디예요?`는 `시발점이 어디예요?`라는 정상 질문이며 욕설이 아님.
+     정상 합성어·질문·설명의 일부에 금칙어 문자열이 포함됐다는 이유만으로 위반 처리하지 말 것.
+     반대로 `니` + `애미`처럼 결합한 전체 발화가 명백한 모욕이면 분할 전송이어도 위반임.
+   - 무례하거나 공격적인 반말 (서버는 존댓말 사용을 기본 예절로 함)
+     ※ 관리자 합의에 따라 용용체·음슴체·경미한 경어와 짧고 친근한 응답은 암묵적으로 허용하며
+       말투 형식만으로는 규정 위반이 아님. 실제 모욕·욕설·시비·명령조 공격이 있어야 위반으로 판단할 것.
+     ※ 존댓말 어미를 장난스럽게/귀엽게 변형한 표현은 존댓말로 취급하며 위반이 아님.
        예: "~하세용", "~하나용", "알겠어용" 등 어미에 ㅇ을 붙인 용용체,
            "알겠습니당", "감사합니당" 등 "~습니다"를 "~습니당"으로 변형한 것,
            "넵", "넹", "옙" 같은 "네"의 변형.
-       기본 어미가 존댓말(요/니다/네)이면 변형이 있어도 반말이 아님.
+     ※ "확인했음", "지금 가는 중임", "그런 듯", "가능함", "뭐함" 같은 음슴체·메모체와
+       "감사요", "확인요", "괜찮아요" 같은 경미한 경어도 정상적인 채팅 말투로 허용함.
+       기본 어미가 존댓말(요/니다/네)이거나 위 허용 말투이면 변형이 있어도 위반이 아님.
    - 과도한 친목 행위 (특정 유저들끼리만 어울리며 배타적인 분위기 조성)
    - 정치적 발언 (정치인, 정당, 정치 이슈에 대한 논쟁적 발언)
    - 현금 거래 유도 (게임 아이템/계정 등의 현금 거래 시도)
@@ -85,7 +104,8 @@ SERVER_RULES = """
 [제재 원칙]
 - 위 사항은 정도에 따라 경고(2회 누적 시 제재) ~ 즉시 제재까지 차등 적용됩니다.
 - 명백하고 심각한 위반(혐오발언, 신상 공개, 성적/폭력적 콘텐츠, 위협, 핵 사용 조장 등)은 경고 단계 없이 바로 강한 조치가 필요할 수 있습니다.
-- 경미한 예절 위반(가벼운 반말, 사소한 친목 발언 등)은 낮은 등급으로 판단하세요.
+- 허용된 용용체·음슴체·경미한 경어는 예절 위반으로 분류하지 말고, 실제 무례·시비가 있는
+  경미한 예절 위반만 낮은 등급으로 판단하세요.
 - [증거 기준] 이 커뮤니티는 "합리적인 의심이 없는 정도의 증명"을 제재 기준으로 삼습니다.
   메시지 내용이 단순 의혹 제기·정황 언급 수준인지, 명백한 규정 위반 발언인지 구분하고,
   애매하면 낮은 등급으로 보수적으로 판단하세요. 다만 "의혹 제기" 형식을 빌린
@@ -114,10 +134,18 @@ CHANNEL_CONTEXT_NOTES = {
         "달러·루블·유로 등 게임 내 화폐 금액을 관용적으로 모두 '원'으로 표기하므로, 통화 단어나 "
         "금액 표기만으로 현금 거래(RMT)로 판단하지 마세요. 반드시 현재 메시지와 같은 거래 글의 "
         "앞뒤 대화를 함께 확인하세요.\n"
-        "아래의 의도가 대화 문맥에서 명확할 때만 규칙 3의 현금 거래 유도로 판단합니다:\n"
-        "- 거래 협의를 개인 DM 또는 디스코드 밖 연락처(카톡, 오픈채팅 등)로 옮기도록 유도하는 경우\n"
-        "- 실제 계좌번호·예금주를 공유하거나 입금·송금·계좌이체·문화상품권·페이팔 등 현실 결제를 요구하는 경우\n"
-        "단순히 해당 단어를 질문·부정·주의 안내로 언급한 것만으로는 위반이 아닙니다."
+        "물물교환 게시글을 이용하려면 서버가 지정한 오버롤 인증 게시판에서 인증하며, 해당 내부 "
+        "게시판 링크와 인증 안내를 공유하는 것은 정상입니다. 본 커뮤니티는 인게임 거래를 중개하거나 "
+        "보증하지 않습니다.\n"
+        "[물물교환 게시글 필수 규정]\n"
+        "- 거래 관련 질문·가격 협의·전달 방법 등 모든 대화는 해당 물물교환 게시글 안에서 공개적으로 진행합니다.\n"
+        "- '개인 DM으로 연락해 달라', '디엠 주세요' 등 거래를 개인 DM으로 옮기는 문구는 전면 금지합니다.\n"
+        "- 카톡·오픈채팅·텔레그램 등 외부 연락처로 거래를 옮기는 것도 금지합니다.\n"
+        "- 현금·상품권·계좌·입금·송금·계좌이체·페이팔 등 현실 재화나 결제 수단을 이용한 거래는 금지합니다.\n"
+        "위 금지 행위를 실제로 제안·요청·동의하는 경우에만 규칙 3 위반입니다. 규정을 공지하거나, "
+        "금지 사실을 설명·질문·인용하거나, 'DM 거래 X', '게시글 안에서 대화해주세요'라고 제지하는 "
+        "메시지는 정상이며 위반이 아닙니다. 다만 금지 안내를 언급한 뒤에도 '몰래', '그래도', "
+        "'규정 무시' 등의 표현으로 실제 DM·현물 거래를 유도하면 위반입니다."
     ),
     # 영상공유 채널: 영상과 유튜브 채널 소개·공유 허용
     1409874543295856710: (
@@ -261,6 +289,16 @@ MAX_QUEUE_AGE_SECONDS = 120
 CACHE_TTL_SECONDS = 600
 CACHE_MAX_ENTRIES = 20000
 
+# 한국어 채팅의 분할 발화("이거", "진짜", "좋네"처럼 숨 쉬는 타이밍마다 전송)를
+# 한 문장처럼 판단하기 위한 짧은 문맥 버퍼. 같은 채널에서 같은 작성자가 연속으로 보낸
+# 메시지 후보만 결합한다. 사이에 끼어든 다른 사용자의 메시지는 별도 화자로 함께 제공해
+# 질문·답변 흐름을 보존하며, 절대로 현재 사용자의 문장 조각으로 붙이지 않는다.
+SPLIT_MESSAGE_CONTEXT_ENABLED = True
+SPLIT_MESSAGE_SETTLE_SECONDS = 2.5
+SPLIT_MESSAGE_WINDOW_SECONDS = 12
+SPLIT_MESSAGE_MAX_MESSAGES = 8
+SPLIT_MESSAGE_MAX_CHARS = 800
+
 # ── 오탐 학습 (검수 카드의 "✅ 정상 (조치 안 함)" 버튼과 연동) ──────────
 # 관리자가 오탐으로 확정한 메시지는 DB에 저장되어 (봇 재시작에도 유지):
 # 1) 동일한 내용(공백/대소문자 무시)이 다시 올라오면 감지 자체를 건너뛰고,
@@ -342,6 +380,26 @@ SPAM_REPEAT_THRESHOLD = 10
 # 초대 링크/외부 링크 자동 감지 (정규식은 filters.py에서 사용)
 BLOCK_DISCORD_INVITES = True
 
+# 기본 타르코프 정책에서만 적용되는 정보 사이트 오탐 방지 목록이다. 서브도메인은 자동 허용한다.
+# POLICY_FILE로 다른 커뮤니티 정책을 연결하면 타르코프 전용 후처리는 자동으로 꺼진다.
+TARKOV_INFO_LINK_EXEMPTION_ENABLED = not bool(POLICY_FILE)
+TARKOV_INFO_SITE_DOMAINS = (
+    "escapefromtarkov.com",
+    "tarkov.dev",
+    "escapefromtarkov.fandom.com",
+    "tarkov-market.com",
+    "tarkov.help",
+    "tarkovtracker.io",
+    "tarkov-changes.com",
+    "eft-ammo.com",
+    "eft.monster",
+    "tarkov-ballistics.com",
+)
+TARKOV_INFO_SITE_PATH_PREFIXES = {
+    "mapgenie.io": ("/tarkov/",),
+    "reddit.com": ("/r/escapefromtarkov", "/r/tarkov"),
+}
+
 # 아래 채널에서는 Discord API로 대상 길드/채널을 확인한 뒤, 같은 서버의 음성·스테이지
 # 초대만 허용한다. 다른 서버 초대와 텍스트 채널 초대는 기존처럼 차단한다.
 INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
@@ -362,6 +420,11 @@ BARTER_CHANNEL_NAMES = tuple(
 BARTER_CONTEXT_MESSAGE_LIMIT = 200
 BARTER_CONTEXT_MAX_CHARS = 16000
 
+# 서버가 지정한 물물교환 오버롤 인증 게시판. 정확한 서버/채널 경로와 그 아래 메시지 링크만 허용한다.
+BARTER_VERIFICATION_CHANNEL_URL_PREFIXES = (
+    "https://discord.com/channels/719020590341685258/1445045515971592294",
+)
+
 # 이 길이 이하의 메시지는 AI 호출 없이 바로 통과 (이모지, 짧은 반응 등 비용 절감)
 MIN_LENGTH_FOR_AI_CHECK = 4
 
@@ -379,6 +442,11 @@ _DEFAULT_WATCHED_CHANNEL_IDS = [
     1412298919043661924,  # PVE
     1412299355431632987,  # Arena
     1475842559275438161,  # PVE-TTS
+    1410654534769840209,  # 팀원찾기
+    1526179570192093314,  # 물물교환(포럼/게시글 포함)
+    1409874543295856710,  # 영상공유
+    1445049743150415923,  # 핵 의심 신고
+    1445045515971592294,  # 물물교환 오버롤 인증 게시판
 ]
 _watched_channel_ids_env = os.environ.get("WATCHED_CHANNEL_IDS")
 WATCHED_CHANNEL_IDS = (
@@ -515,6 +583,24 @@ def validate_config() -> None:
         errors.append("큐 크기와 최대 대기시간은 1 이상이어야 합니다.")
     if CACHE_TTL_SECONDS <= 0 or CACHE_MAX_ENTRIES <= 0:
         errors.append("캐시 TTL과 최대 항목 수는 1 이상이어야 합니다.")
+    if not isinstance(SPLIT_MESSAGE_CONTEXT_ENABLED, bool):
+        errors.append("SPLIT_MESSAGE_CONTEXT_ENABLED는 True/False여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_SETTLE_SECONDS, bool)
+            or not isinstance(SPLIT_MESSAGE_SETTLE_SECONDS, (int, float))
+            or SPLIT_MESSAGE_SETTLE_SECONDS < 0):
+        errors.append("SPLIT_MESSAGE_SETTLE_SECONDS는 0 이상의 숫자여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_WINDOW_SECONDS, bool)
+            or not isinstance(SPLIT_MESSAGE_WINDOW_SECONDS, (int, float))
+            or SPLIT_MESSAGE_WINDOW_SECONDS <= 0):
+        errors.append("SPLIT_MESSAGE_WINDOW_SECONDS는 0보다 큰 숫자여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_MAX_MESSAGES, bool)
+            or not isinstance(SPLIT_MESSAGE_MAX_MESSAGES, int)
+            or SPLIT_MESSAGE_MAX_MESSAGES < 2):
+        errors.append("SPLIT_MESSAGE_MAX_MESSAGES는 2 이상의 정수여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_MAX_CHARS, bool)
+            or not isinstance(SPLIT_MESSAGE_MAX_CHARS, int)
+            or SPLIT_MESSAGE_MAX_CHARS <= 0):
+        errors.append("SPLIT_MESSAGE_MAX_CHARS는 1 이상의 정수여야 합니다.")
     if (FALSE_POSITIVE_PROMPT_EXAMPLES < 0 or FALSE_POSITIVE_EXAMPLE_MAX_CHARS <= 0
             or FALSE_POSITIVE_REFRESH_SECONDS <= 0):
         errors.append("오탐 학습 설정(FALSE_POSITIVE_*) 값이 올바르지 않습니다.")
@@ -635,6 +721,12 @@ def validate_config() -> None:
             or not isinstance(BARTER_CONTEXT_MAX_CHARS, int)
             or BARTER_CONTEXT_MAX_CHARS <= 0):
         errors.append("BARTER_CONTEXT_MAX_CHARS는 1 이상의 정수여야 합니다.")
+    if (not isinstance(BARTER_VERIFICATION_CHANNEL_URL_PREFIXES, tuple)
+            or not BARTER_VERIFICATION_CHANNEL_URL_PREFIXES
+            or any(not isinstance(url, str)
+                   or not url.startswith("https://discord.com/channels/")
+                   for url in BARTER_VERIFICATION_CHANNEL_URL_PREFIXES)):
+        errors.append("BARTER_VERIFICATION_CHANNEL_URL_PREFIXES에는 Discord 채널 URL을 설정해야 합니다.")
 
     if errors:
         raise ValueError("설정 오류:\n- " + "\n- ".join(errors))

@@ -11,6 +11,9 @@ import json
 import os
 import re
 import time
+import unicodedata
+from urllib.parse import urlsplit
+
 import httpx
 from dotenv import load_dotenv
 
@@ -20,7 +23,9 @@ from config import (SERVER_RULES, GEMINI_MODEL, GROQ_MODEL, OLLAMA_BASE_URL, OLL
                     OLLAMA_MAX_CONCURRENT_CALLS, OLLAMA_REALTIME_TIMEOUT_SECONDS,
                     OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS,
                     GEMINI_MAX_CONCURRENT_CALLS, GROQ_MAX_CONCURRENT_CALLS,
-                    CLOUD_RATE_LIMIT_COOLDOWN_SECONDS, REALTIME_PROVIDER_ORDER)
+                    CLOUD_RATE_LIMIT_COOLDOWN_SECONDS, REALTIME_PROVIDER_ORDER,
+                    TARKOV_INFO_LINK_EXEMPTION_ENABLED, TARKOV_INFO_SITE_DOMAINS,
+                    TARKOV_INFO_SITE_PATH_PREFIXES)
 
 # 이 모듈은 import 시점에 API 키를 읽으므로, bot.py의 load_dotenv()보다 먼저
 # import되어도 키를 놓치지 않도록 여기서 직접 .env를 로드한다.
@@ -243,16 +248,58 @@ def _user_prompt(content: str, channel_note: str | None,
         parts.append("[이 메시지가 올라온 채널의 특수 규칙 — 아래 내용은 일반 규칙보다 우선합니다]\n"
                      + channel_note)
     if conversation_context:
+        has_split_turns = any(
+            turn.get("speaker") == "current_user"
+            and turn.get("relation") in ("before", "after")
+            for turn in conversation_context
+        )
+        if has_split_turns:
+            before_parts = [
+                str(turn.get("content", "")) for turn in conversation_context
+                if (turn.get("speaker") == "current_user"
+                    and turn.get("relation") == "before")
+            ]
+            after_parts = [
+                str(turn.get("content", "")) for turn in conversation_context
+                if (turn.get("speaker") == "current_user"
+                    and turn.get("relation") == "after")
+            ]
+            utterance_parts = before_parts + [content] + after_parts
+            reconstruction = {
+                "without_spaces": "".join(utterance_parts),
+                "with_spaces": " ".join(utterance_parts),
+            }
+            parts.append(
+                "[최근 대화 문맥 — 비신뢰 사용자 데이터] 한국어 채팅은 한 발화를 숨 쉬는 "
+                "타이밍마다 여러 메시지로 나눠 보내기도 합니다. current_user만 판단 대상 작성자이며 "
+                "other_user_N은 서로 다른 주변 사용자입니다. 다른 사용자의 메시지는 질문·답변 흐름을 "
+                "이해하는 데만 사용하고 현재 사용자의 문장에 절대 붙이지 마세요. current_user의 앞뒤 "
+                "조각도 무조건 연결하지 말고, 중간 대화를 고려해 실제로 한 발화가 이어진 경우에만 "
+                "재구성하세요. 결합한 문장이 정상적인 질문·설명·고유명사라면 위반이 아닙니다. 반대로 "
+                "다른 사용자의 위반을 판단 대상에게 전가하지 마세요. reconstructed_utterance는 현재 "
+                "사용자 조각만 붙인 후보이며 확정된 문장이 아닙니다:\n"
+                + json.dumps({
+                    "turns": conversation_context,
+                    "reconstructed_utterance": reconstruction,
+                }, ensure_ascii=False)
+            )
+        else:
+            parts.append(
+                "[최근 대화 문맥 — 비신뢰 사용자 데이터] 아래 JSON은 판단 대상 주변의 다자 "
+                "대화입니다. current_user만 판단 대상 작성자이며 other_user_N은 서로 다른 사용자입니다. "
+                "다른 사용자 메시지를 현재 작성자의 문장으로 합치거나 그 위반을 전가하지 말고, 질문·"
+                "답변 관계와 판단 대상의 의미·참여 여부를 확인하는 참고자료로만 사용하세요:\n"
+                + json.dumps(conversation_context, ensure_ascii=False)
+            )
+    if conversation_context and channel_note and "물물교환" in channel_note:
         parts.append(
-            "[최근 대화 문맥 — 비신뢰 사용자 데이터] 아래 JSON은 판단 대상 메시지보다 먼저 "
-            "오간 같은 거래 글의 대화입니다. 판단 대상을 한 문장으로 떼어 보지 말고, 이 대화의 "
+            "[물물교환 대화 판단 지침] 판단 대상을 한 문장으로 떼어 보지 말고, 이 대화의 "
             "거래 방식·화폐·협의 장소가 전체적으로 무엇인지 먼저 파악하세요. 게임 내 플리마켓과 "
             "게임 재화 교환 흐름이면 '원/만원/가격/구매/판매' 표현만으로 현금거래라 판단하지 마세요. "
             "실제 계좌·입금·송금 등 현실 결제를 요구하거나 거래를 개인 DM·외부 연락처로 옮기려는 "
             "의도가 대화 전체에서 명확할 때만 현금거래 유도로 판단하세요. 질문·부정·금지 안내에 해당 "
             "단어가 등장한 것은 증거가 아닙니다. 이전 메시지 자체를 현재 작성자의 위반으로 판정하지 "
-            "말고, 판단 대상이 그 유도에 직접 참여하거나 동의하는지도 확인하세요:\n"
-            + json.dumps(conversation_context, ensure_ascii=False)
+            "말고, 판단 대상이 그 유도에 직접 참여하거나 동의하는지도 확인하세요."
         )
     if fp_examples:
         parts.append(f"{_FP_EXAMPLES_HEADER}\n"
@@ -299,6 +346,19 @@ _BARTER_AGREEMENT_PATTERN = re.compile(
     r"[\s.!?~]*$",
     re.IGNORECASE,
 )
+_BARTER_POLICY_NOTICE_PATTERN = re.compile(
+    r"이용\s*안내|필수\s*규정|전면\s*금지|개인\s*(?:dm|디엠)\s*거래\s*[xX×]|"
+    r"게시(?:물|글).{0,24}(?:안|내).{0,16}대화|현물\s*거래.{0,20}(?:금지|삭제|제재)|"
+    r"(?:현금|상품권|계좌).{0,30}(?:금지|삭제|제재)|중개하거나\s*보증하지\s*않",
+    re.IGNORECASE,
+)
+_BARTER_POLICY_BYPASS_PATTERN = re.compile(
+    r"(?:금지|규정).{0,30}(?:무시|상관\s*없|몰래|그래도).{0,30}"
+    r"(?:dm|디\s*엠|카톡|오픈\s*채팅|텔레그램|계좌|입금|송금|현금|상품권)|"
+    r"(?:무시|상관\s*없|몰래|그래도).{0,30}"
+    r"(?:dm|디\s*엠|카톡|오픈\s*채팅|텔레그램|계좌|입금|송금|현금|상품권)",
+    re.IGNORECASE,
+)
 
 
 def apply_barter_conversation_guard(
@@ -317,7 +377,17 @@ def apply_barter_conversation_guard(
         return result
 
     target = (content or "").strip()
-    target_is_negated = bool(_BARTER_NEGATED_EXTERNAL_PATTERN.search(target))
+    policy_bypass = bool(_BARTER_POLICY_BYPASS_PATTERN.search(target))
+    if (_BARTER_POLICY_NOTICE_PATTERN.search(target)
+            and not policy_bypass):
+        return ModerationResult(
+            "NONE", "NONE",
+            "물물교환 게시글의 DM·현물 거래 금지 규정을 공지·설명·인용한 정상 안내",
+            provider=result.provider,
+        )
+    target_is_negated = (
+        bool(_BARTER_NEGATED_EXTERNAL_PATTERN.search(target)) and not policy_bypass
+    )
     clear_target_evidence = (
         bool(_BARTER_CLEAR_EXTERNAL_PATTERN.search(target)) and not target_is_negated
     )
@@ -341,6 +411,42 @@ def apply_barter_conversation_guard(
     )
 
 
+def _is_barter_verification_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url.rstrip(").,]>}"))
+    except ValueError:
+        return False
+    if (parsed.scheme.lower() != "https"
+            or (parsed.hostname or "").lower() != "discord.com"):
+        return False
+    normalized = f"https://discord.com{parsed.path.rstrip('/')}"
+    return any(
+        normalized == prefix.rstrip("/")
+        or normalized.startswith(prefix.rstrip("/") + "/")
+        for prefix in config.BARTER_VERIFICATION_CHANNEL_URL_PREFIXES
+    )
+
+
+def apply_barter_verification_link_guard(
+        result: "ModerationResult", content: str) -> "ModerationResult":
+    """지정된 오버롤 인증 게시판 링크를 외부 홍보로 오판한 결과만 정상으로 되돌린다."""
+    if (result.level == "NONE"
+            or not re.search(r"(?<!\d)2(?!\d)", str(result.rule_violated))):
+        return result
+    urls = _HTTP_URL_PATTERN.findall(content or "")
+    if not urls or not all(_is_barter_verification_url(url) for url in urls):
+        return result
+    target = content or ""
+    if (_BARTER_POLICY_BYPASS_PATTERN.search(target)
+            or (_BARTER_CLEAR_EXTERNAL_PATTERN.search(target)
+                and not _BARTER_NEGATED_EXTERNAL_PATTERN.search(target))):
+        return result
+    return ModerationResult(
+        "NONE", "NONE", "서버가 지정한 물물교환 오버롤 인증 게시판 내부 링크 안내",
+        provider=result.provider,
+    )
+
+
 class ModerationResult:
     def __init__(self, level: str, rule_violated: str, reason: str, provider: str,
                  failure_category: str | None = None):
@@ -354,6 +460,205 @@ class ModerationResult:
     def __repr__(self):
         return (f"<ModerationResult level={self.level} rule={self.rule_violated} "
                 f"provider={self.provider} reason={self.reason!r}>")
+
+
+_HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_TARKOV_LINK_RISK_PATTERN = re.compile(
+    r"discord(?:app)?\.com/invite|discord\.gg|추천인|레퍼럴|referral|affiliate|제휴|"
+    r"쿠폰|할인\s*코드|가입.{0,12}(?:보상|포인트|캐시)|결제|입금|송금|계좌|paypal|"
+    r"현금\s*거래|계정.{0,8}(?:판매|구매|거래)|피싱|"
+    r"카카오?톡|오픈\s*채팅|텔레그램|\.exe(?:\W|$)|\.msi(?:\W|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_tarkov_info_url(url: str) -> bool:
+    """정확한 호스트/경로로 신뢰 가능한 타르코프 정보 URL인지 확인한다."""
+    try:
+        parsed = urlsplit(url.rstrip(").,]>}"))
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    if any(host == domain or host.endswith(f".{domain}")
+           for domain in TARKOV_INFO_SITE_DOMAINS):
+        return True
+    for domain, prefixes in TARKOV_INFO_SITE_PATH_PREFIXES.items():
+        if host == domain or host.endswith(f".{domain}"):
+            path = (parsed.path or "/").lower()
+            return any(path.startswith(prefix.lower()) for prefix in prefixes)
+    return False
+
+
+def apply_tarkov_info_link_guard(
+        result: "ModerationResult", content: str) -> "ModerationResult":
+    """
+    타르코프 정보 사이트 공유를 규정 2번 무단 홍보로 오판한 결과만 정상으로 되돌린다.
+
+    모든 URL이 신뢰 목록에 속하고 가입 보상·결제·외부 초대 같은 위험 문맥이 없을 때만
+    적용하므로, 정보 링크에 광고나 피싱 링크를 섞는 우회에는 사용되지 않는다.
+    """
+    rule_text = str(result.rule_violated).strip()
+    if (not TARKOV_INFO_LINK_EXEMPTION_ENABLED or result.level == "NONE"
+            or not re.search(r"(?<!\d)2(?!\d)", rule_text)):
+        return result
+    urls = _HTTP_URL_PATTERN.findall(content or "")
+    if (not urls or not all(_is_tarkov_info_url(url) for url in urls)
+            or _TARKOV_LINK_RISK_PATTERN.search(content or "")):
+        return result
+    return ModerationResult(
+        "NONE", "NONE",
+        "타르코프 정보 사이트의 공략·맵·시세·퀘스트 등 정상적인 게임 정보 링크 공유",
+        provider=result.provider,
+    )
+
+
+_SPLIT_LANGUAGE_VIOLATION_PATTERN = re.compile(
+    r"욕설|비속어|모욕|패드립|금칙어|부적절한\s*(?:말|언어|표현)",
+    re.IGNORECASE,
+)
+
+
+def _split_utterance_parts(content: str, conversation_context: list[dict]) -> list[str]:
+    before = [
+        str(turn.get("content", "")) for turn in conversation_context
+        if turn.get("speaker") == "current_user" and turn.get("relation") == "before"
+    ]
+    after = [
+        str(turn.get("content", "")) for turn in conversation_context
+        if turn.get("speaker") == "current_user" and turn.get("relation") == "after"
+    ]
+    return [part for part in before + [content] + after if part]
+
+
+async def assess_split_utterance(
+        content: str, conversation_context: list[dict] | None) -> dict | None:
+    """로컬 모델의 짧은 전용 프롬프트로 분할 발화의 결합 의미만 재검증한다."""
+    if not conversation_context or not OLLAMA_BASE_URL or not OLLAMA_MODEL:
+        return None
+    parts = _split_utterance_parts(content, conversation_context)
+    if len(parts) < 2:
+        return None
+    dialogue = [dict(turn) for turn in conversation_context if turn.get("relation") == "before"]
+    dialogue.append({"speaker": "current_user", "relation": "target", "content": content})
+    dialogue.extend(
+        dict(turn) for turn in conversation_context if turn.get("relation") == "after"
+    )
+    system = (
+        "당신은 한국어 다자 채팅의 분할 발화 복원기입니다. current_user만 판단 대상 작성자이고 "
+        "other_user_N은 각각 다른 사용자입니다. 다른 사용자의 문장을 current_user 문장에 절대 "
+        "붙이지 마세요. 전체 대화 순서를 보고 current_user의 조각들이 실제 한 발화의 연속인지 "
+        "판단하세요. 다른 사용자가 중간에 말했더라도 current_user 조각들이 자연스럽게 한 문구·"
+        "합성어를 완성하면 continuation=true이며, 단순히 끼어든 사람이 있다는 이유로 false로 "
+        "판정하면 안 됩니다. 문법과 질문·답변 관계상 별개의 새 발화일 때만 continuation=false입니다. "
+        "실제 연속일 때 결합한 완성 문장의 의미로 욕설 여부를 판단하세요. 예: 시발 + 점이 "
+        "어디예요? 는 continuation=true, 시발점이 어디예요?이므로 욕설 아님. 니 + (다른 사용자의 "
+        "말) + 애미 는 continuation=true, 가족 모욕이므로 욕설. "
+        "joined 문자열, continuation 불리언, abusive 불리언 필드가 있는 JSON만 응답하세요."
+    )
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps({
+                "dialogue": dialogue,
+                "current_user_parts": parts,
+            }, ensure_ascii=False)},
+        ],
+        "format": "json",
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0},
+    }
+    async with _ollama_semaphore:
+        response = await _get_http_client().post(
+            f"{OLLAMA_BASE_URL}/api/chat", json=payload,
+            timeout=OLLAMA_REALTIME_TIMEOUT_SECONDS,
+        )
+    response.raise_for_status()
+    data = _parse_json_response(response.json()["message"]["content"])
+    if (not isinstance(data.get("joined"), str)
+            or not isinstance(data.get("continuation"), bool)
+            or not isinstance(data.get("abusive"), bool)):
+        raise ValueError("분할 발화 응답 형식이 올바르지 않습니다.")
+    return {
+        "joined": data["joined"][:2000],
+        "continuation": data["continuation"],
+        "abusive": data["abusive"],
+    }
+
+
+def apply_split_utterance_guard(
+        result: "ModerationResult", assessment: dict | None) -> "ModerationResult":
+    """분할 복원 전용 판정으로 일반 모델의 욕설 부분문자열 오판·누락만 보정한다."""
+    if not assessment or assessment.get("continuation") is not True:
+        return result
+    joined = str(assessment.get("joined", ""))
+    abusive = assessment.get("abusive")
+    if abusive is True:
+        if result.level != "NONE":
+            return result
+        joined_normalized = joined.casefold()
+        severe = any(word.casefold() in joined_normalized for word in config.BANNED_WORDS_SEVERE)
+        return ModerationResult(
+            "SEVERE" if severe else "MINOR", "3",
+            "같은 작성자의 연속 메시지를 결합하면 명백한 모욕·욕설 발화임",
+            provider="ollama",
+        )
+    if abusive is False:
+        verdict_text = f"{result.rule_violated} {result.reason}"
+        if (result.level != "NONE"
+                and re.search(r"(?<!\d)3(?!\d)", str(result.rule_violated))
+                and _SPLIT_LANGUAGE_VIOLATION_PATTERN.search(verdict_text)):
+            return ModerationResult(
+                "NONE", "NONE",
+                "같은 작성자의 연속 메시지를 결합한 완성 문장이 정상적인 질문·설명임",
+                provider=result.provider,
+            )
+    return result
+
+
+_CASUAL_POLITENESS_VERDICT_PATTERN = re.compile(
+    r"반말|존댓말|경어|말투|어투|용용체|음슴체|메모체",
+    re.IGNORECASE,
+)
+_CASUAL_ALLOWED_STYLE_PATTERN = re.compile(
+    r"(?:요|용|욤|염|당|네|넵|넹|옙|음|슴|임|함|됨|였음|했음|겠음|중임|"
+    r"인\s*듯|듯|듯함|같음|없음|있음|모름|아님|맞음|가능함|불가능함)"
+    r"[\s.!?~ㅋㅎㅠㅜ]*$",
+    re.IGNORECASE,
+)
+_CASUAL_STYLE_DANGER_PATTERN = re.compile(
+    r"닥쳐|꺼져|뒤져|죽어|입\s*닥|바보|멍청|한심|쓰레기|모욕|협박",
+    re.IGNORECASE,
+)
+
+
+def apply_casual_speech_guard(
+        result: "ModerationResult", content: str) -> "ModerationResult":
+    """용용체·음슴체·경미한 경어를 말투만으로 규정 3 위반 처리한 오탐을 해제한다."""
+    if result.level == "NONE" or not re.search(
+            r"(?<!\d)3(?!\d)", str(result.rule_violated)):
+        return result
+    verdict_text = f"{result.rule_violated} {result.reason}"
+    if not _CASUAL_POLITENESS_VERDICT_PATTERN.search(verdict_text):
+        return result
+    normalized = unicodedata.normalize("NFKC", content or "").casefold().strip()
+    if (not normalized or not _CASUAL_ALLOWED_STYLE_PATTERN.search(normalized)
+            or _CASUAL_STYLE_DANGER_PATTERN.search(normalized)):
+        return result
+    if any(
+        unicodedata.normalize("NFKC", word).casefold() in normalized
+        for word in (*config.BANNED_WORDS_SEVERE, *config.BANNED_WORDS_MODERATE)
+        if word
+    ):
+        return result
+    return ModerationResult(
+        "NONE", "NONE",
+        "관리자 합의로 용용체·음슴체·경미한 경어를 정상적인 채팅 말투로 허용",
+        provider=result.provider,
+    )
 
 
 def _parse_json_response(raw_text: str) -> dict:
@@ -583,10 +888,13 @@ async def classify_message(content: str, channel_note: str | None = None,
             )
             if provider in _cloud_rate_limit_until:
                 _cloud_rate_limit_until[provider] = 0.0
-            return (
+            guarded = (
                 apply_barter_conversation_guard(result, content, conversation_context)
                 if barter_context else result
             )
+            guarded = apply_casual_speech_guard(guarded, content)
+            guarded = apply_barter_verification_link_guard(guarded, content)
+            return apply_tarkov_info_link_guard(guarded, content)
         except Exception as error:
             failures.append((provider, error))
             skip_note = ""
@@ -624,6 +932,10 @@ BATCH_SYSTEM_PROMPT = f"""당신은 디스코드 서버의 자동 규칙 위반 
 각 메시지를 위 규칙에 비추어 개별적으로 판단하고, 반드시 아래 형식의 JSON 배열로만 응답하세요.
 입력된 메시지 개수와 반드시 동일한 개수의 항목을 반환해야 하며, 각 항목의 index는 입력의 index와 일치해야 합니다.
 같은 배열의 앞뒤 메시지는 대화 문맥으로 참고하되, 다른 작성자의 위반을 현재 항목에 전가하지 마세요.
+특히 author_ref가 같은 사용자의 연속 항목은 한국어 분할 발화일 수 있으므로 순서대로 공백 없이 붙인
+형태와 띄어 붙인 형태를 모두 읽으세요. `시발` 다음 `점이 어디예요?`는 `시발점이 어디예요?`라는
+정상 질문이므로 두 항목 모두 욕설이 아닙니다. 반대로 `니` 다음 `애미`처럼 결합한 전체 발화가
+명백한 모욕이면 분할 전송으로 우회한 위반입니다.
 설명, 코드블록, 다른 텍스트를 절대 추가하지 마세요. JSON 배열만 출력하세요.
 
 [
@@ -873,5 +1185,10 @@ async def classify_batch(messages: list[dict], backend: str = "auto",
             result = apply_barter_conversation_guard(
                 result, messages[i].get("content", ""), prior_context
             )
+        result = apply_casual_speech_guard(result, messages[i].get("content", ""))
+        result = apply_barter_verification_link_guard(
+            result, messages[i].get("content", "")
+        )
+        result = apply_tarkov_info_link_guard(result, messages[i].get("content", ""))
         results.append(result)
     return results

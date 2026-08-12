@@ -383,6 +383,66 @@ async def _post_review_cards(audit_results: list, on_flagged):
               f"`!BB 검토대기`에서 확인하세요 (BATCH_REVIEW_CARD_LIMIT 조정 가능).")
 
 
+async def _expand_audit_targets(guild: discord.Guild) -> list:
+    """등록 채널을 실제 메시지 이력을 가진 채널/포럼 게시글 목록으로 확장한다."""
+    targets = []
+    seen_ids = set()
+
+    def add_target(channel) -> None:
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None or channel_id in seen_ids or not hasattr(channel, "history"):
+            return
+        seen_ids.add(channel_id)
+        targets.append(channel)
+
+    for channel_id in config.WATCHED_CHANNEL_IDS:
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            print(f"[batch_audit] 채널 ID {channel_id}를 찾을 수 없습니다 (봇 권한/오타 확인).")
+            continue
+
+        if hasattr(channel, "history"):
+            add_target(channel)
+            continue
+
+        # ForumChannel 자체에는 history가 없고 실제 메시지는 각 Thread에 있다.
+        # 활성 게시글과 최근 보관 게시글을 모두 펼쳐야 물물교환 대화 전체가 감사된다.
+        active_threads = list(getattr(channel, "threads", ()) or ())
+        for thread in active_threads:
+            add_target(thread)
+
+        archived_count = 0
+        archived_threads = getattr(channel, "archived_threads", None)
+        if callable(archived_threads):
+            cutoff = discord.utils.utcnow() - datetime.timedelta(
+                days=config.BATCH_FIRST_RUN_LOOKBACK_DAYS
+            )
+            try:
+                async for thread in archived_threads(limit=None):
+                    archived_at = getattr(thread, "archive_timestamp", None)
+                    if archived_at is not None and archived_at < cutoff:
+                        break
+                    before = len(targets)
+                    add_target(thread)
+                    if len(targets) > before:
+                        archived_count += 1
+            except (discord.Forbidden, discord.HTTPException) as e:
+                print(
+                    f"[batch_audit] #{channel.name} 보관 게시글 조회 실패: "
+                    f"{type(e).__name__}"
+                )
+
+        if not active_threads and not archived_count:
+            print(f"[batch_audit] #{channel.name}: 감사할 활성/최근 보관 게시글이 없습니다.")
+        else:
+            print(
+                f"[batch_audit] #{channel.name}: 활성 게시글 {len(active_threads)}개, "
+                f"최근 보관 게시글 {archived_count}개를 감사합니다."
+            )
+
+    return targets
+
+
 async def run_full_audit(guild: discord.Guild, backend: str = None, on_flagged=None) -> str:
     """
     등록된 모든 감시 채널을 감사하고 리포트를 저장 + (설정 시) 디스코드로 전송한다.
@@ -403,14 +463,7 @@ async def run_full_audit(guild: discord.Guild, backend: str = None, on_flagged=N
             return None
 
         audit_results = []
-        for channel_id in config.WATCHED_CHANNEL_IDS:
-            channel = guild.get_channel(channel_id)
-            if channel is None:
-                print(f"[batch_audit] 채널 ID {channel_id}를 찾을 수 없습니다 (봇 권한/오타 확인).")
-                continue
-            if not hasattr(channel, "history"):
-                print(f"[batch_audit] #{channel.name}은 메시지 이력을 지원하는 채널이 아닙니다.")
-                continue
+        for channel in await _expand_audit_targets(guild):
             result = await audit_channel(channel, backend)
             audit_results.append(result)
             print(f"[batch_audit] #{channel.name}: {result['reviewed_count']}건 검토, "
