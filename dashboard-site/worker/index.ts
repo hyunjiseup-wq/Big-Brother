@@ -185,38 +185,104 @@ async function ingest(request: Request, env: Env) {
   return json({ accepted: statements.length });
 }
 
-function rangeBounds(range: string) {
-  const kstOffsetMs = 9 * 60 * 60 * 1000;
-  const nowInKst = new Date(Date.now() + kstOffsetMs);
+type PeriodView = "month" | "quarter" | "year" | "all";
+
+type PeriodSelection = {
+  view: PeriodView;
+  year: number | null;
+  month: number | null;
+  quarter: number | null;
+};
+
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+function kstBoundary(year: number, month: number) {
+  return Date.UTC(year, month, 1) - KST_OFFSET_MS;
+}
+
+function currentKstPeriod() {
+  const nowInKst = new Date(Date.now() + KST_OFFSET_MS);
   const year = nowInKst.getUTCFullYear();
-  const month = nowInKst.getUTCMonth();
-  const kstBoundary = (boundaryYear: number, boundaryMonth: number) =>
-    new Date(Date.UTC(boundaryYear, boundaryMonth, 1) - kstOffsetMs);
-  let start = kstBoundary(year, month);
-  let end = kstBoundary(year, month + 1);
+  const month = nowInKst.getUTCMonth() + 1;
+  return { year, month, quarter: Math.floor((month - 1) / 3) + 1 };
+}
+
+function validInteger(value: string | null, minimum: number, maximum: number, fallback: number) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= minimum && parsed <= maximum ? parsed : fallback;
+}
+
+function legacySelection(range: string | null, current: ReturnType<typeof currentKstPeriod>): PeriodSelection | null {
+  if (!range) return null;
+  if (range === "all") return { view: "all", year: null, month: null, quarter: null };
+  if (range === "current-year") return { view: "year", year: current.year, month: null, quarter: null };
+  if (range === "current-quarter") {
+    return { view: "quarter", year: current.year, month: null, quarter: current.quarter };
+  }
   if (range === "previous-month") {
+    const previous = new Date(Date.UTC(current.year, current.month - 2, 1));
+    return {
+      view: "month",
+      year: previous.getUTCFullYear(),
+      month: previous.getUTCMonth() + 1,
+      quarter: null,
+    };
+  }
+  if (range === "current-month") {
+    return { view: "month", year: current.year, month: current.month, quarter: null };
+  }
+  return null;
+}
+
+function periodBounds(url: URL) {
+  const current = currentKstPeriod();
+  const requestedView = url.searchParams.get("view");
+  const supportedViews = new Set<PeriodView>(["month", "quarter", "year", "all"]);
+  const legacy = legacySelection(url.searchParams.get("range"), current);
+  const view = supportedViews.has(requestedView as PeriodView)
+    ? requestedView as PeriodView
+    : legacy?.view ?? "month";
+  const maximumYear = current.year + 1;
+  const year = view === "all"
+    ? null
+    : validInteger(url.searchParams.get("year"), 2000, maximumYear, legacy?.year ?? current.year);
+  const month = view === "month"
+    ? validInteger(url.searchParams.get("month"), 1, 12, legacy?.month ?? current.month)
+    : null;
+  const quarter = view === "quarter"
+    ? validInteger(url.searchParams.get("quarter"), 1, 4, legacy?.quarter ?? current.quarter)
+    : null;
+
+  let start = 0;
+  let end = kstBoundary(current.year + 1, 0);
+  let label = "전체 기간";
+  if (view === "month" && year && month) {
     start = kstBoundary(year, month - 1);
     end = kstBoundary(year, month);
-  } else if (range === "current-quarter") {
-    start = kstBoundary(year, Math.floor(month / 3) * 3);
-    end = kstBoundary(year, Math.floor(month / 3) * 3 + 3);
-  } else if (range === "current-year") {
+    label = `${year}년 ${month}월`;
+  } else if (view === "quarter" && year && quarter) {
+    start = kstBoundary(year, (quarter - 1) * 3);
+    end = kstBoundary(year, quarter * 3);
+    label = `${year}년 ${quarter}분기`;
+  } else if (view === "year" && year) {
     start = kstBoundary(year, 0);
     end = kstBoundary(year + 1, 0);
-  } else if (range === "all") {
-    start = new Date(0);
-    end = kstBoundary(year + 1, 0);
+    label = `${year}년`;
   }
-  return { start: start.getTime(), end: end.getTime() };
+
+  return {
+    selection: { view, year, month, quarter } satisfies PeriodSelection,
+    start,
+    end,
+    label,
+  };
 }
 
 async function dashboard(request: Request, env: Env) {
   await ensureSchema(env.DB);
-  const range = new URL(request.url).searchParams.get("range") ?? "current-month";
-  const supported = new Set(["current-month", "previous-month", "current-quarter", "current-year", "all"]);
-  const selected = supported.has(range) ? range : "current-month";
-  const { start, end } = rangeBounds(selected);
+  const { selection, start, end, label } = periodBounds(new URL(request.url));
   const periodArgs = [start, end] as const;
+  const trendStart = Math.max(0, end - 370 * 86400000);
 
   const results = await env.DB.batch([
     env.DB.prepare(`SELECT COUNT(*) detected,
@@ -248,7 +314,8 @@ async function dashboard(request: Request, env: Env) {
       SUM(verdict='false_positive') false_positive,
       SUM(verdict IN ('pending','processing')) pending
       FROM moderation_events
-      WHERE detected_ts>=? AND verdict<>'superseded' GROUP BY label ORDER BY label DESC LIMIT 12`).bind(Date.now() - 370 * 86400000),
+      WHERE detected_ts>=? AND detected_ts<? AND verdict<>'superseded'
+      GROUP BY label ORDER BY label DESC LIMIT 12`).bind(trendStart, end),
     env.DB.prepare(`SELECT COUNT(*) runs, COALESCE(SUM(reviewed_messages),0) reviewed_messages,
       COALESCE(SUM(flagged_messages),0) flagged_messages,
       COALESCE(SUM(failed_channels),0) failed_channels,
@@ -261,6 +328,13 @@ async function dashboard(request: Request, env: Env) {
       SELECT updated_at FROM moderation_events UNION ALL
       SELECT updated_at FROM audit_runs UNION ALL SELECT updated_at FROM operation_snapshots
     )`),
+    env.DB.prepare(`SELECT label FROM (
+      SELECT DISTINCT strftime('%Y-%m', detected_ts/1000, 'unixepoch', '+9 hours') label
+      FROM moderation_events WHERE verdict<>'superseded'
+      UNION
+      SELECT DISTINCT strftime('%Y-%m', created_ts/1000, 'unixepoch', '+9 hours') label
+      FROM audit_runs
+    ) WHERE label IS NOT NULL ORDER BY label DESC`),
   ]);
 
   const rows = results.map((result) => result.results ?? []);
@@ -286,10 +360,23 @@ async function dashboard(request: Request, env: Env) {
       : ageSeconds <= 30 * 60
         ? "delayed"
         : "stored";
+  const availableMonths = rows[10]
+    .map((row) => String((row as JsonRecord).label ?? ""))
+    .filter((value) => /^\d{4}-\d{2}$/.test(value));
+  const availableYears = [...new Set(availableMonths.map((value) => Number(value.slice(0, 4))))];
+  const availableQuarters = [...new Set(availableMonths.map((value) => {
+    const month = Number(value.slice(5, 7));
+    return `${value.slice(0, 4)}-Q${Math.floor((month - 1) / 3) + 1}`;
+  }))];
 
   return json({
-    range: selected,
-    period: { start, end },
+    range: selection.view,
+    period: { ...selection, start, end, label },
+    available_periods: {
+      years: availableYears,
+      months: availableMonths,
+      quarters: availableQuarters,
+    },
     cards: {
       detected,
       confirmed,
