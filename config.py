@@ -549,6 +549,13 @@ VIOLATION_CONTENT_RETENTION_DAYS = 90
 # 양수일 때만 REPORT_OUTPUT_DIR의 audit_report_*.md 파일을 대상으로 한다.
 REPORT_RETENTION_DAYS = 180
 
+# KPI 운영 보고·대시보드 동기화. 외부 사이트가 아직 연결되지 않아도 검수 결과는
+# SQLite와 내구성 대기열에 먼저 저장되며, 나중에 사이트를 연결하면 과거분까지 전송한다.
+KPI_SYNC_INTERVAL_SECONDS = 60
+KPI_SYNC_BATCH_SIZE = 50
+KPI_SYNC_MAX_RETRY_SECONDS = 900
+KPI_REPORT_HOUR_KST = 9
+
 
 def validate_config() -> None:
     """운영 중 무감시·과잉 제재를 만들 수 있는 잘못된 설정을 시작 시 차단한다."""
@@ -635,6 +642,22 @@ def validate_config() -> None:
             or not isinstance(REPORT_RETENTION_DAYS, int)
             or REPORT_RETENTION_DAYS < 0):
         errors.append("REPORT_RETENTION_DAYS는 0 이상의 정수여야 합니다.")
+    if (isinstance(KPI_SYNC_INTERVAL_SECONDS, bool)
+            or not isinstance(KPI_SYNC_INTERVAL_SECONDS, (int, float))
+            or KPI_SYNC_INTERVAL_SECONDS <= 0):
+        errors.append("KPI_SYNC_INTERVAL_SECONDS는 0보다 커야 합니다.")
+    if (isinstance(KPI_SYNC_BATCH_SIZE, bool)
+            or not isinstance(KPI_SYNC_BATCH_SIZE, int)
+            or KPI_SYNC_BATCH_SIZE <= 0):
+        errors.append("KPI_SYNC_BATCH_SIZE는 1 이상의 정수여야 합니다.")
+    if (isinstance(KPI_SYNC_MAX_RETRY_SECONDS, bool)
+            or not isinstance(KPI_SYNC_MAX_RETRY_SECONDS, (int, float))
+            or KPI_SYNC_MAX_RETRY_SECONDS < KPI_SYNC_INTERVAL_SECONDS):
+        errors.append("KPI_SYNC_MAX_RETRY_SECONDS는 동기화 주기 이상이어야 합니다.")
+    if (isinstance(KPI_REPORT_HOUR_KST, bool)
+            or not isinstance(KPI_REPORT_HOUR_KST, int)
+            or not 0 <= KPI_REPORT_HOUR_KST <= 23):
+        errors.append("KPI_REPORT_HOUR_KST는 0~23의 정수여야 합니다.")
     if BATCH_BACKEND not in valid_batch_backends:
         errors.append("BATCH_BACKEND는 auto/gemini/groq/ollama 중 하나여야 합니다.")
     if not isinstance(REPORT_OUTPUT_DIR, str) or not REPORT_OUTPUT_DIR.strip():

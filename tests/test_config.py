@@ -117,6 +117,14 @@ class ConfigValidationTests(unittest.TestCase):
     def test_current_configuration_is_valid(self):
         config.validate_config()
 
+    def test_kpi_schedule_and_sync_settings_are_validated(self):
+        with patch.object(config, "KPI_REPORT_HOUR_KST", 24):
+            with self.assertRaisesRegex(ValueError, "KPI_REPORT_HOUR_KST"):
+                config.validate_config()
+        with patch.object(config, "KPI_SYNC_BATCH_SIZE", 0):
+            with self.assertRaisesRegex(ValueError, "KPI_SYNC_BATCH_SIZE"):
+                config.validate_config()
+
     def test_cloud_concurrency_must_be_positive_integer(self):
         for name in ("GEMINI_MAX_CONCURRENT_CALLS", "GROQ_MAX_CONCURRENT_CALLS"):
             with self.subTest(name=name), patch.object(config, name, 0):

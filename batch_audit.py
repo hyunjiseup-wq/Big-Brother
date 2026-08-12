@@ -17,6 +17,7 @@ import os
 import argparse
 import asyncio
 import datetime
+import re
 from pathlib import Path
 from collections import defaultdict
 
@@ -300,6 +301,37 @@ def prune_expired_reports(retention_days: int) -> int:
     return removed
 
 
+async def backfill_audit_metrics_from_reports(guild_id: int) -> int:
+    """기존 Markdown에서 요약 숫자만 읽어 감사 커버리지 KPI를 한 번 백필한다."""
+    report_dir = Path(config.REPORT_OUTPUT_DIR)
+    if not report_dir.is_dir():
+        return 0
+    inserted = 0
+    for path in sorted(report_dir.glob("audit_report_*.md")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        reviewed_match = re.search(r"^- 검토한 메시지:\s*(\d+)건", text, re.MULTILINE)
+        flagged_match = re.search(r"^- 규정 위반 의심:\s*(\d+)건", text, re.MULTILINE)
+        if not reviewed_match or not flagged_match:
+            continue
+        failed_match = re.search(
+            r"^- .*판단 실패로 재시도가 필요한 채널:\s*(\d+)개", text, re.MULTILINE
+        )
+        scope = text.split("## 유저별 정리", 1)[0]
+        target_channels = len(re.findall(r"^- #", scope, re.MULTILINE))
+        row_id = await database.record_audit_run_metrics(
+            guild_id, "legacy-report", int(reviewed_match.group(1)),
+            int(flagged_match.group(1)), int(failed_match.group(1)) if failed_match else 0,
+            target_channels, str(path.resolve()), path.stat().st_mtime,
+        )
+        inserted += int(row_id > 0)
+    return inserted
+
+
 async def send_report_to_discord(guild: discord.Guild, report_text: str, file_path: str):
     raw = os.environ.get("REPORT_CHANNEL_ID", "").strip()
     channel_id = None
@@ -358,6 +390,13 @@ async def _post_review_cards(audit_results: list, on_flagged):
                 message.content, f["level"], f["reason"],
                 "배치 감사 검토 대기" if will_post else "배치 감사 검토 대기 (카드 상한 초과로 미게시)",
                 f["provider"], card_delivered=will_post,
+                rule_violated=f["rule_violated"], detection_source="batch",
+                channel_name=getattr(message.channel, "name", None),
+                channel_group=(
+                    getattr(getattr(message.channel, "parent", None), "name", None)
+                    if isinstance(message.channel, discord.Thread)
+                    else getattr(message.channel, "name", None)
+                ),
             )
         except Exception as e:
             print(f"[batch_audit] 검수 레코드 저장 실패: {e}")
@@ -475,6 +514,14 @@ async def run_full_audit(guild: discord.Guild, backend: str = None, on_flagged=N
         report_text = build_report_markdown(audit_results)
         file_path = save_report_file(report_text)
         print(f"[batch_audit] 리포트 저장 완료: {file_path}")
+
+        await database.record_audit_run_metrics(
+            int(guild.id), backend,
+            sum(result["reviewed_count"] for result in audit_results),
+            sum(len(result["flagged"]) for result in audit_results),
+            sum(bool(result.get("error")) for result in audit_results),
+            len(audit_results), str(Path(file_path).resolve()),
+        )
 
         await send_report_to_discord(guild, report_text, file_path)
 

@@ -47,6 +47,38 @@ async def _validate_connection_integrity(db) -> None:
         raise RuntimeError(f"SQLite 무결성 검사 실패: {summary}")
 
 
+async def _enqueue_kpi_sync(db, review_id: int, guild_id: int, now: float | None = None):
+    """현재 트랜잭션 안에서 KPI 변경을 outbox에 멱등 등록한다."""
+    updated_at = time.time() if now is None else now
+    await db.execute(
+        """INSERT INTO kpi_sync_outbox
+           (review_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+           VALUES (?, ?, 0, 0, NULL, ?)
+           ON CONFLICT(review_id) DO UPDATE SET
+               guild_id = excluded.guild_id,
+               attempts = 0,
+               next_attempt_at = 0,
+               last_error = NULL,
+               updated_at = excluded.updated_at""",
+        (review_id, guild_id, updated_at),
+    )
+
+
+async def _mark_kpi_snapshots_dirty_for_review(db, review_id: int,
+                                                guild_id: int) -> None:
+    """현재 트랜잭션에서 해당 카드가 속한 기존 기간 스냅샷만 무효화한다."""
+    await db.execute(
+        """UPDATE kpi_period_snapshots SET dirty = 1
+           WHERE guild_id = ? AND EXISTS (
+               SELECT 1 FROM violation_log v
+               WHERE v.id = ? AND v.guild_id = ?
+                 AND v.created_at >= kpi_period_snapshots.period_start
+                 AND v.created_at < kpi_period_snapshots.period_end
+           )""",
+        (guild_id, review_id, guild_id),
+    )
+
+
 async def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     async with _connect() as db:
@@ -99,6 +131,12 @@ async def init_db():
         await _ensure_column(db, "violation_log", "reviewed_at", "REAL")
         await _ensure_column(db, "violation_log", "reviewed_by", "INTEGER")
         await _ensure_column(db, "violation_log", "language_group", "TEXT NOT NULL DEFAULT 'und'")
+        await _ensure_column(db, "violation_log", "rule_violated", "TEXT DEFAULT '-'")
+        await _ensure_column(
+            db, "violation_log", "detection_source", "TEXT NOT NULL DEFAULT 'legacy'"
+        )
+        await _ensure_column(db, "violation_log", "channel_name", "TEXT")
+        await _ensure_column(db, "violation_log", "channel_group", "TEXT")
         # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
         # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
         await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
@@ -126,6 +164,16 @@ async def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_violation_message_review "
             "ON violation_log(guild_id, message_id, review_status) "
             "WHERE message_id IS NOT NULL AND review_status IN ('pending', 'processing')"
+        )
+        # 월간/분기/연간 KPI는 길드·기간을 먼저 제한한 뒤 상태/채널로 묶는다.
+        # 메시지 원문을 읽지 않고 장기 메타데이터만 집계할 수 있도록 실제 조회 순서에 맞춘다.
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_violation_kpi_period "
+            "ON violation_log(guild_id, created_at, review_status)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_violation_kpi_channel_period "
+            "ON violation_log(guild_id, channel_id, created_at)"
         )
 
         # AI 전량 장애 메시지는 원문을 중복 저장하지 않고 Discord 식별자만 보관한다.
@@ -211,6 +259,97 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_moderation_label_recent "
             "ON moderation_labels(guild_id, created_at DESC)"
         )
+
+        # 사이트가 잠시 끊겨도 KPI 갱신을 잃지 않는 영속 outbox. review_id만 보관하며
+        # 전송 시 violation_log에서 비식별 메타데이터를 다시 읽는다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS kpi_sync_outbox (
+                review_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_kpi_sync_due "
+            "ON kpi_sync_outbox(next_attempt_at, review_id)"
+        )
+
+        # 배치 감사의 커버리지 KPI. 감사 리포트 원문을 다시 파싱하지 않고 실행 단위의
+        # 검토량·의심 감지·실패 채널 수를 장기 보존한다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS audit_run_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                backend TEXT NOT NULL,
+                reviewed_messages INTEGER NOT NULL,
+                flagged_messages INTEGER NOT NULL,
+                failed_channels INTEGER NOT NULL,
+                target_channels INTEGER NOT NULL,
+                report_path TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_run_metrics_period "
+            "ON audit_run_metrics(guild_id, created_at)"
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_run_metrics_report "
+            "ON audit_run_metrics(guild_id, report_path) WHERE report_path IS NOT NULL"
+        )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS audit_kpi_sync_outbox (
+                audit_run_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_kpi_sync_due "
+            "ON audit_kpi_sync_outbox(next_attempt_at, audit_run_id)"
+        )
+
+        # 종료된 기간의 집계를 JSON으로 고정해 장기 조회 비용을 일정하게 유지한다.
+        # 검수 결과가 뒤늦게 바뀌면 dirty=1로 표시해 그 기간만 다시 계산한다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS kpi_period_snapshots (
+                guild_id INTEGER NOT NULL,
+                period_type TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                period_start REAL NOT NULL,
+                period_end REAL NOT NULL,
+                summary_json TEXT,
+                source_rows INTEGER NOT NULL DEFAULT 0,
+                dirty INTEGER NOT NULL DEFAULT 1,
+                finalized INTEGER NOT NULL DEFAULT 0,
+                refreshed_at REAL,
+                PRIMARY KEY (guild_id, period_type, period_key)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_kpi_period_snapshot_dirty "
+            "ON kpi_period_snapshots(guild_id, dirty, period_end)"
+        )
+
+        # 봇 재시작·Discord 재연결에도 같은 월/분기/연간 정산을 두 번 보내지 않는다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS kpi_report_deliveries (
+                guild_id INTEGER NOT NULL,
+                period_type TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                channel_id INTEGER,
+                message_id INTEGER,
+                delivered_at REAL NOT NULL,
+                PRIMARY KEY (guild_id, period_type, period_key)
+            )
+        """)
+        await db.execute("PRAGMA optimize")
         await db.commit()
 
 
@@ -475,9 +614,382 @@ async def count_moderation_retries(guild_id: int | None = None) -> int:
         return int(row[0])
 
 
+# ── KPI 집계·대시보드 동기화 ────────────────────────────────────────
+
+_KPI_ROW_COLUMNS = (
+    "review_id", "guild_id", "channel_id", "channel_name", "channel_group",
+    "level", "reason", "rule_violated",
+    "provider", "review_status", "card_delivered", "language_group",
+    "detection_source", "created_at", "reviewed_at", "sync_attempts",
+)
+
+
+def _kpi_row_dict(row) -> dict:
+    return dict(zip(_KPI_ROW_COLUMNS, row))
+
+
+async def backfill_kpi_sync_outbox(guild_id: int) -> int:
+    """기존 검수 기록도 최초 사이트 연결 때 한 번에 안전하게 동기화 대상으로 만든다."""
+    now = time.time()
+    async with _connect() as db:
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO kpi_sync_outbox
+               (review_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+               SELECT id, guild_id, 0, 0, NULL, ? FROM violation_log
+               WHERE guild_id = ? AND review_status <> 'not_required'""",
+            (now, guild_id),
+        )
+        await db.commit()
+        return max(0, cursor.rowcount)
+
+
+async def get_due_kpi_sync_records(limit: int = 50) -> list[dict]:
+    """동기화할 비식별 KPI 메타데이터를 반환한다. 원문·유저·메시지 ID는 포함하지 않는다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT v.id, v.guild_id, v.channel_id, v.channel_name, v.channel_group,
+                      v.level, v.reason,
+                      COALESCE(v.rule_violated, '-'), v.provider, v.review_status,
+                      v.card_delivered, v.language_group,
+                      COALESCE(v.detection_source, 'legacy'), v.created_at, v.reviewed_at,
+                      o.attempts
+               FROM kpi_sync_outbox AS o
+               JOIN violation_log AS v ON v.id = o.review_id AND v.guild_id = o.guild_id
+               WHERE o.next_attempt_at <= ?
+               ORDER BY o.next_attempt_at, o.review_id
+               LIMIT ?""",
+            (time.time(), max(1, limit)),
+        )
+        return [_kpi_row_dict(row) for row in await cursor.fetchall()]
+
+
+async def mark_kpi_sync_complete(review_ids: list[int]) -> int:
+    if not review_ids:
+        return 0
+    placeholders = ",".join("?" for _ in review_ids)
+    async with _connect() as db:
+        cursor = await db.execute(
+            f"DELETE FROM kpi_sync_outbox WHERE review_id IN ({placeholders})",
+            tuple(int(review_id) for review_id in review_ids),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def reschedule_kpi_sync(review_ids: list[int], error_category: str,
+                              delay_seconds: float) -> None:
+    if not review_ids:
+        return
+    next_attempt = time.time() + max(1.0, delay_seconds)
+    async with _connect() as db:
+        await db.executemany(
+            """UPDATE kpi_sync_outbox
+               SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, updated_at = ?
+               WHERE review_id = ?""",
+            [
+                (next_attempt, str(error_category)[:100], time.time(), int(review_id))
+                for review_id in review_ids
+            ],
+        )
+        await db.commit()
+
+
+async def count_kpi_sync_pending(guild_id: int | None = None) -> int:
+    async with _connect() as db:
+        if guild_id is None:
+            cursor = await db.execute(
+                "SELECT (SELECT COUNT(*) FROM kpi_sync_outbox) + "
+                "(SELECT COUNT(*) FROM audit_kpi_sync_outbox)"
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT (SELECT COUNT(*) FROM kpi_sync_outbox WHERE guild_id = ?) + "
+                "(SELECT COUNT(*) FROM audit_kpi_sync_outbox WHERE guild_id = ?)",
+                (guild_id, guild_id),
+            )
+        row = await cursor.fetchone()
+        return int(row[0])
+
+
+async def get_kpi_rows(guild_id: int, start_at: float, end_at: float) -> list[dict]:
+    """기간 KPI 집계에 필요한 메타데이터만 조회한다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT id, guild_id, channel_id, channel_name, channel_group, level, reason,
+                      COALESCE(rule_violated, '-'), provider, review_status,
+                      card_delivered, language_group,
+                      COALESCE(detection_source, 'legacy'), created_at, reviewed_at
+               FROM violation_log
+               WHERE guild_id = ? AND created_at >= ? AND created_at < ?
+                 AND review_status <> 'not_required'
+               ORDER BY created_at""",
+            (guild_id, start_at, end_at),
+        )
+        return [_kpi_row_dict(row) for row in await cursor.fetchall()]
+
+
+async def get_kpi_operational_counts(guild_id: int, now: float | None = None) -> dict:
+    current = time.time() if now is None else now
+    async with _connect() as db:
+        pending_24h = int((await (await db.execute(
+            "SELECT COUNT(*) FROM violation_log WHERE guild_id = ? "
+            "AND review_status IN ('pending', 'processing') AND created_at < ?",
+            (guild_id, current - 86400),
+        )).fetchone())[0])
+        pending_72h = int((await (await db.execute(
+            "SELECT COUNT(*) FROM violation_log WHERE guild_id = ? "
+            "AND review_status IN ('pending', 'processing') AND created_at < ?",
+            (guild_id, current - 3 * 86400),
+        )).fetchone())[0])
+        active_learning = int((await (await db.execute(
+            "SELECT COUNT(*) FROM false_positive_rules WHERE guild_id = ? AND active = 1",
+            (guild_id,),
+        )).fetchone())[0])
+        retry_queue = int((await (await db.execute(
+            "SELECT COUNT(*) FROM moderation_retry_queue WHERE guild_id = ?",
+            (guild_id,),
+        )).fetchone())[0])
+        kpi_outbox = int((await (await db.execute(
+            "SELECT (SELECT COUNT(*) FROM kpi_sync_outbox WHERE guild_id = ?) + "
+            "(SELECT COUNT(*) FROM audit_kpi_sync_outbox WHERE guild_id = ?)",
+            (guild_id, guild_id),
+        )).fetchone())[0])
+    return {
+        "pending_over_24h": pending_24h,
+        "pending_over_72h": pending_72h,
+        "active_learning_rules": active_learning,
+        "ai_retry_queue": retry_queue,
+        "kpi_sync_pending": kpi_outbox,
+    }
+
+
+async def record_audit_run_metrics(guild_id: int, backend: str,
+                                   reviewed_messages: int, flagged_messages: int,
+                                   failed_channels: int, target_channels: int,
+                                   report_path: str | None = None,
+                                   created_at: float | None = None) -> int:
+    """배치 감사 실행 결과를 원문 없이 운영 KPI로 저장한다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO audit_run_metrics
+               (guild_id, backend, reviewed_messages, flagged_messages, failed_channels,
+                target_channels, report_path, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (guild_id, backend, max(0, reviewed_messages), max(0, flagged_messages),
+             max(0, failed_channels), max(0, target_channels), report_path,
+             time.time() if created_at is None else created_at),
+        )
+        if cursor.rowcount == 1:
+            await db.execute(
+                """INSERT OR IGNORE INTO audit_kpi_sync_outbox
+                   (audit_run_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+                   VALUES (?, ?, 0, 0, NULL, ?)""",
+                (int(cursor.lastrowid), guild_id, time.time()),
+            )
+        await db.commit()
+        return int(cursor.lastrowid or 0) if cursor.rowcount == 1 else 0
+
+
+async def backfill_audit_kpi_sync_outbox(guild_id: int) -> int:
+    async with _connect() as db:
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO audit_kpi_sync_outbox
+               (audit_run_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+               SELECT id, guild_id, 0, 0, NULL, ? FROM audit_run_metrics
+               WHERE guild_id = ?""",
+            (time.time(), guild_id),
+        )
+        await db.commit()
+        return max(0, cursor.rowcount)
+
+
+async def get_due_audit_kpi_sync_records(limit: int = 25) -> list[dict]:
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT a.id, a.guild_id, a.backend, a.reviewed_messages,
+                      a.flagged_messages, a.failed_channels, a.target_channels,
+                      a.created_at, o.attempts
+               FROM audit_kpi_sync_outbox o
+               JOIN audit_run_metrics a
+                 ON a.id = o.audit_run_id AND a.guild_id = o.guild_id
+               WHERE o.next_attempt_at <= ?
+               ORDER BY o.next_attempt_at, o.audit_run_id LIMIT ?""",
+            (time.time(), max(1, limit)),
+        )
+        columns = (
+            "audit_run_id", "guild_id", "backend", "reviewed_messages",
+            "flagged_messages", "failed_channels", "target_channels", "created_at",
+            "sync_attempts",
+        )
+        return [dict(zip(columns, row)) for row in await cursor.fetchall()]
+
+
+async def mark_audit_kpi_sync_complete(audit_run_ids: list[int]) -> int:
+    if not audit_run_ids:
+        return 0
+    placeholders = ",".join("?" for _ in audit_run_ids)
+    async with _connect() as db:
+        cursor = await db.execute(
+            f"DELETE FROM audit_kpi_sync_outbox WHERE audit_run_id IN ({placeholders})",
+            tuple(map(int, audit_run_ids)),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def reschedule_audit_kpi_sync(audit_run_ids: list[int], error_category: str,
+                                    delay_seconds: float) -> None:
+    if not audit_run_ids:
+        return
+    next_attempt = time.time() + max(1.0, delay_seconds)
+    async with _connect() as db:
+        await db.executemany(
+            """UPDATE audit_kpi_sync_outbox
+               SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, updated_at = ?
+               WHERE audit_run_id = ?""",
+            [(next_attempt, str(error_category)[:100], time.time(), int(run_id))
+             for run_id in audit_run_ids],
+        )
+        await db.commit()
+
+
+async def get_audit_metrics(guild_id: int, start_at: float, end_at: float) -> dict:
+    async with _connect() as db:
+        row = await (await db.execute(
+            """SELECT COUNT(*), COALESCE(SUM(reviewed_messages), 0),
+                      COALESCE(SUM(flagged_messages), 0),
+                      COALESCE(SUM(failed_channels), 0),
+                      COALESCE(SUM(target_channels), 0)
+               FROM audit_run_metrics
+               WHERE guild_id = ? AND created_at >= ? AND created_at < ?""",
+            (guild_id, start_at, end_at),
+        )).fetchone()
+    runs, reviewed, flagged, failed, targets = map(int, row)
+    return {
+        "runs": runs,
+        "reviewed_messages": reviewed,
+        "flagged_messages": flagged,
+        "flag_rate_percent": round(flagged / reviewed * 100, 1) if reviewed else None,
+        "failed_channels": failed,
+        "target_channels": targets,
+        "successful_channel_percent": (
+            round((targets - failed) / targets * 100, 1) if targets else None
+        ),
+    }
+
+
+async def upsert_kpi_period_snapshot(guild_id: int, period_type: str, period_key: str,
+                                     period_start: float, period_end: float,
+                                     summary_json: str, source_rows: int,
+                                     finalized: bool) -> None:
+    async with _connect() as db:
+        await db.execute(
+            """INSERT INTO kpi_period_snapshots
+               (guild_id, period_type, period_key, period_start, period_end, summary_json,
+                source_rows, dirty, finalized, refreshed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+               ON CONFLICT(guild_id, period_type, period_key) DO UPDATE SET
+                   period_start = excluded.period_start,
+                   period_end = excluded.period_end,
+                   summary_json = excluded.summary_json,
+                   source_rows = excluded.source_rows,
+                   dirty = 0,
+                   finalized = excluded.finalized,
+                   refreshed_at = excluded.refreshed_at""",
+            (guild_id, period_type, period_key, period_start, period_end, summary_json,
+             max(0, source_rows), int(finalized), time.time()),
+        )
+        await db.commit()
+
+
+async def get_kpi_period_snapshot(guild_id: int, period_type: str,
+                                  period_key: str) -> dict | None:
+    async with _connect() as db:
+        row = await (await db.execute(
+            """SELECT period_start, period_end, summary_json, source_rows, dirty,
+                      finalized, refreshed_at
+               FROM kpi_period_snapshots
+               WHERE guild_id = ? AND period_type = ? AND period_key = ?""",
+            (guild_id, period_type, period_key),
+        )).fetchone()
+    if row is None:
+        return None
+    return {
+        "period_start": row[0], "period_end": row[1], "summary_json": row[2],
+        "source_rows": int(row[3]), "dirty": bool(row[4]),
+        "finalized": bool(row[5]), "refreshed_at": row[6],
+    }
+
+
+async def mark_kpi_snapshots_dirty_for_timestamp(guild_id: int,
+                                                  detected_at: float) -> int:
+    """뒤늦은 관리자 확정이 포함되는 기존 월·분기·연 스냅샷만 무효화한다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """UPDATE kpi_period_snapshots SET dirty = 1
+               WHERE guild_id = ? AND period_start <= ? AND period_end > ?""",
+            (guild_id, detected_at, detected_at),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def prune_kpi_sync_outbox(max_completed_age_days: int = 30) -> int:
+    """이미 삭제된 카드·감사 레코드를 가리키는 고아 outbox만 정리한다."""
+    cutoff = time.time() - max(0, max_completed_age_days) * 86400
+    async with _connect() as db:
+        review_cursor = await db.execute(
+            """DELETE FROM kpi_sync_outbox
+               WHERE updated_at < ? AND NOT EXISTS (
+                   SELECT 1 FROM violation_log v
+                   WHERE v.id = kpi_sync_outbox.review_id
+                     AND v.guild_id = kpi_sync_outbox.guild_id
+               )""",
+            (cutoff,),
+        )
+        audit_cursor = await db.execute(
+            """DELETE FROM audit_kpi_sync_outbox
+               WHERE updated_at < ? AND NOT EXISTS (
+                   SELECT 1 FROM audit_run_metrics a
+                   WHERE a.id = audit_kpi_sync_outbox.audit_run_id
+                     AND a.guild_id = audit_kpi_sync_outbox.guild_id
+               )""",
+            (cutoff,),
+        )
+        await db.execute("PRAGMA optimize")
+        await db.commit()
+        return review_cursor.rowcount + audit_cursor.rowcount
+
+
+async def kpi_report_was_delivered(guild_id: int, period_type: str,
+                                   period_key: str) -> bool:
+    async with _connect() as db:
+        row = await (await db.execute(
+            "SELECT 1 FROM kpi_report_deliveries "
+            "WHERE guild_id = ? AND period_type = ? AND period_key = ?",
+            (guild_id, period_type, period_key),
+        )).fetchone()
+        return row is not None
+
+
+async def mark_kpi_report_delivered(guild_id: int, period_type: str, period_key: str,
+                                    channel_id: int | None, message_id: int | None) -> None:
+    async with _connect() as db:
+        await db.execute(
+            """INSERT INTO kpi_report_deliveries
+               (guild_id, period_type, period_key, channel_id, message_id, delivered_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(guild_id, period_type, period_key) DO NOTHING""",
+            (guild_id, period_type, period_key, channel_id, message_id, time.time()),
+        )
+        await db.commit()
+
+
 async def create_review_record(
     guild_id, user_id, channel_id, message_id, message_content,
     level, reason, action_taken, provider="unknown", card_delivered=True,
+    rule_violated="-", detection_source="realtime",
+    channel_name=None, channel_group=None,
 ) -> int:
     """
     검수 대기(pending) 레코드를 만들고 id를 돌려준다.
@@ -492,7 +1004,14 @@ async def create_review_record(
     """
     async with _connect() as db:
         await db.execute("BEGIN IMMEDIATE")
+        superseded_ids = []
         if message_id is not None:
+            cursor = await db.execute(
+                "SELECT id FROM violation_log WHERE guild_id = ? AND message_id = ? "
+                "AND review_status IN ('pending', 'processing')",
+                (guild_id, message_id),
+            )
+            superseded_ids = [int(row[0]) for row in await cursor.fetchall()]
             await db.execute(
                 "UPDATE violation_log SET review_status = 'superseded' "
                 "WHERE guild_id = ? AND message_id = ? "
@@ -503,24 +1022,33 @@ async def create_review_record(
             """INSERT INTO violation_log
                (guild_id, user_id, channel_id, message_id, message_content, level, reason,
                 action_taken, provider, needs_review, review_status, card_delivered,
-                language_group, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?)""",
+                language_group, rule_violated, detection_source, channel_name, channel_group,
+                created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
             (guild_id, user_id, channel_id, message_id, message_content, level, reason,
              action_taken, provider, int(card_delivered),
-             detect_language_group(message_content), time.time()),
+             detect_language_group(message_content), str(rule_violated)[:100],
+             str(detection_source)[:30], str(channel_name)[:100] if channel_name else None,
+             str(channel_group)[:100] if channel_group else None, time.time()),
         )
+        review_id = int(cursor.lastrowid)
+        for superseded_id in superseded_ids:
+            await _enqueue_kpi_sync(db, superseded_id, guild_id)
+        await _enqueue_kpi_sync(db, review_id, guild_id)
         await db.commit()
-        return cursor.lastrowid
+        return review_id
 
 
 async def mark_review_delivery_failed(review_id: int, guild_id: int):
     """검수 카드 전송이 실패했음을 기록한다 (pending은 유지, 카드만 없음 표시)."""
     async with _connect() as db:
-        await db.execute(
+        updated = await db.execute(
             "UPDATE violation_log SET card_delivered = 0 "
             "WHERE id = ? AND guild_id = ? AND review_status = 'pending'",
             (review_id, guild_id),
         )
+        if updated.rowcount == 1:
+            await _enqueue_kpi_sync(db, review_id, guild_id)
         await db.commit()
 
 
@@ -622,6 +1150,8 @@ async def resolve_review(
                        created_at = excluded.created_at""",
                 (verdict, corrected_level, reviewer_id, time.time(), review_id, guild_id),
             )
+            await _enqueue_kpi_sync(db, review_id, guild_id)
+            await _mark_kpi_snapshots_dirty_for_review(db, review_id, guild_id)
         await db.commit()
         return updated.rowcount == 1
 
@@ -856,6 +1386,8 @@ async def resolve_review_as_false_positive(review_id: int, guild_id: int,
                    created_at = excluded.created_at""",
             (review_id, guild_id, reviewer_id, now),
         )
+        await _enqueue_kpi_sync(db, review_id, guild_id, now)
+        await _mark_kpi_snapshots_dirty_for_review(db, review_id, guild_id)
         await db.commit()
         return {"id": rule_id, "content": content}
 

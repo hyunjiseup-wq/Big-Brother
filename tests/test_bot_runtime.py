@@ -32,6 +32,29 @@ class RuntimeEnvironmentTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "DISCORD_BOT_TOKEN"):
                 bot.validate_runtime_environment()
 
+    def test_kpi_ingest_url_and_token_must_be_configured_together(self):
+        values = {
+            "DISCORD_BOT_TOKEN": "real-looking-test-token",
+            "GEMINI_API_KEY": "gemini-test-key",
+            "LOG_CHANNEL_ID": "123456789",
+            "KPI_DASHBOARD_INGEST_URL": "https://example.test/api/ingest",
+            "KPI_DASHBOARD_INGEST_TOKEN": "",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "함께 설정"):
+                bot.validate_runtime_environment()
+
+    def test_kpi_dashboard_requires_https(self):
+        values = {
+            "DISCORD_BOT_TOKEN": "real-looking-test-token",
+            "GEMINI_API_KEY": "gemini-test-key",
+            "LOG_CHANNEL_ID": "123456789",
+            "KPI_DASHBOARD_PUBLIC_URL": "http://example.test/dashboard",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+                bot.validate_runtime_environment()
+
 
 class PermissionWarningTests(unittest.TestCase):
     def test_administrator_permission_is_flagged(self):

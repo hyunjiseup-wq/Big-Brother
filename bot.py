@@ -31,6 +31,7 @@ import re
 import unicodedata
 from collections import defaultdict, deque
 import discord
+import httpx
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import datetime
@@ -39,12 +40,13 @@ import config
 import database
 import cache
 import learning
+import kpi
 from filters import FilterResult, extract_discord_invite_urls, fast_check
 import moderator
 import ollama_runtime
 import runtime_lock
 from moderator import classify_message, get_channel_note
-from batch_audit import prune_expired_reports, run_full_audit
+from batch_audit import backfill_audit_metrics_from_reports, prune_expired_reports, run_full_audit
 
 # Windows 콘솔(cp949)은 이모지를 출력하지 못해 UnicodeEncodeError로
 # 이벤트 핸들러가 중단될 수 있으므로 표준 출력을 UTF-8로 강제한다.
@@ -71,6 +73,12 @@ def _env_int(name: str):
 TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID")
 PUBLIC_LOG_CHANNEL_ID = _env_int("PUBLIC_LOG_CHANNEL_ID")
+KPI_REPORT_CHANNEL_ID = (
+    _env_int("KPI_REPORT_CHANNEL_ID") or _env_int("REPORT_CHANNEL_ID") or LOG_CHANNEL_ID
+)
+KPI_DASHBOARD_PUBLIC_URL = os.environ.get("KPI_DASHBOARD_PUBLIC_URL", "").strip()
+KPI_DASHBOARD_INGEST_URL = os.environ.get("KPI_DASHBOARD_INGEST_URL", "").strip()
+KPI_DASHBOARD_INGEST_TOKEN = os.environ.get("KPI_DASHBOARD_INGEST_TOKEN", "").strip()
 
 
 def validate_runtime_environment() -> None:
@@ -95,7 +103,7 @@ def validate_runtime_environment() -> None:
         except ValueError:
             errors.append("LOG_CHANNEL_ID는 양의 정수 Discord 채널 ID여야 합니다.")
 
-    for name in ("PUBLIC_LOG_CHANNEL_ID", "REPORT_CHANNEL_ID"):
+    for name in ("PUBLIC_LOG_CHANNEL_ID", "REPORT_CHANNEL_ID", "KPI_REPORT_CHANNEL_ID"):
         raw = os.environ.get(name, "").strip()
         if raw:
             try:
@@ -103,6 +111,16 @@ def validate_runtime_environment() -> None:
                     raise ValueError
             except ValueError:
                 errors.append(f"{name}는 비워두거나 양의 정수 Discord 채널 ID를 사용해야 합니다.")
+
+    ingest_url = os.environ.get("KPI_DASHBOARD_INGEST_URL", "").strip()
+    ingest_token = os.environ.get("KPI_DASHBOARD_INGEST_TOKEN", "").strip()
+    public_url = os.environ.get("KPI_DASHBOARD_PUBLIC_URL", "").strip()
+    if bool(ingest_url) != bool(ingest_token):
+        errors.append("KPI_DASHBOARD_INGEST_URL과 KPI_DASHBOARD_INGEST_TOKEN은 함께 설정해야 합니다.")
+    if ingest_url and not ingest_url.startswith("https://"):
+        errors.append("KPI_DASHBOARD_INGEST_URL은 HTTPS 주소여야 합니다.")
+    if public_url and not public_url.startswith("https://"):
+        errors.append("KPI_DASHBOARD_PUBLIC_URL은 HTTPS 주소여야 합니다.")
 
     if errors:
         raise RuntimeError("환경 설정 오류:\n- " + "\n- ".join(errors))
@@ -177,6 +195,8 @@ _last_drop_alert_at: datetime.datetime | None = None
 _workers_started = False  # on_ready는 재연결 시마다 다시 호출되므로 워커 중복 생성 방지용
 _processing_keys: set[tuple[int, int, str]] = set()
 _background_tasks: set[asyncio.Task] = set()
+_kpi_http_client: httpx.AsyncClient | None = None
+_kpi_backfill_done = False
 
 # 채널별 최근 메시지를 Discord API 재조회 없이 잠깐 보관한다. 분할 발화 판단에만 쓰며
 # 작성자 ID는 AI에 전달하지 않고 current_user/other_user 표기로 바꾼다.
@@ -522,6 +542,13 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
         message.guild.id, message.author.id, message.channel.id, message.id,
         message.content, level, reason_text,
         f"검수모드(조치 없음, 모의: {action_label})", provider,
+        rule_violated=rule_violated, detection_source="realtime",
+        channel_name=getattr(message.channel, "name", None),
+        channel_group=(
+            getattr(getattr(message.channel, "parent", None), "name", None)
+            if isinstance(message.channel, discord.Thread)
+            else getattr(message.channel, "name", None)
+        ),
     )
 
     embed = discord.Embed(
@@ -1466,6 +1493,203 @@ async def ai_retry_worker():
                 _processing_keys.discard(processing_key)
 
 
+# ── KPI 집계 보고·외부 대시보드 동기화 ─────────────────────────────
+
+def _kpi_channel_labels(guild: discord.Guild) -> dict[int, str]:
+    """집계 화면에 쓸 현재 채널 이름을 만든다. 삭제된 채널은 DB의 마지막 이름을 쓴다."""
+    labels = {int(channel.id): f"#{channel.name}" for channel in guild.channels}
+    for thread in guild.threads:
+        parent_name = getattr(getattr(thread, "parent", None), "name", None)
+        labels[int(thread.id)] = f"#{parent_name or thread.name}"
+    return labels
+
+
+def _kpi_row_channel_names(guild: discord.Guild, row: dict) -> tuple[str, str]:
+    channel = guild.get_channel_or_thread(int(row["channel_id"]))
+    if channel is None:
+        name = row.get("channel_name") or "삭제·이전된 채널"
+        group = row.get("channel_group") or name
+        return str(name), str(group)
+    name = getattr(channel, "name", None) or row.get("channel_name") or "이름 미확인 채널"
+    parent = getattr(channel, "parent", None)
+    group = getattr(parent, "name", None) or row.get("channel_group") or name
+    return str(name), str(group)
+
+
+async def kpi_sync_worker():
+    """비식별 KPI 이벤트를 내구성 대기열에서 사이트로 전송하고 실패 시 재시도한다."""
+    global _kpi_http_client, _kpi_backfill_done
+    if not (KPI_DASHBOARD_INGEST_URL and KPI_DASHBOARD_INGEST_TOKEN):
+        return
+
+    if not _kpi_backfill_done:
+        review_total = 0
+        audit_total = 0
+        for guild in bot.guilds:
+            review_total += await database.backfill_kpi_sync_outbox(int(guild.id))
+            audit_total += await database.backfill_audit_kpi_sync_outbox(int(guild.id))
+        _kpi_backfill_done = True
+        if review_total or audit_total:
+            print(
+                f"[kpi-sync] 기존 검수 {review_total}건·감사 {audit_total}건을 "
+                "동기화 대기열에 추가했습니다."
+            )
+
+    _kpi_http_client = httpx.AsyncClient(timeout=15.0)
+    last_operations_sync = 0.0
+    while True:
+        rows = await database.get_due_kpi_sync_records(config.KPI_SYNC_BATCH_SIZE)
+        audit_rows = await database.get_due_audit_kpi_sync_records(
+            max(1, config.KPI_SYNC_BATCH_SIZE // 2)
+        )
+        operations_due = time.monotonic() - last_operations_sync >= 300
+        if not rows and not audit_rows and not operations_due:
+            await asyncio.sleep(config.KPI_SYNC_INTERVAL_SECONDS)
+            continue
+
+        review_ids = [int(row["review_id"]) for row in rows]
+        audit_run_ids = [int(row["audit_run_id"]) for row in audit_rows]
+        try:
+            events = []
+            for row in rows:
+                guild = bot.get_guild(int(row["guild_id"]))
+                if guild is None:
+                    channel_name = row.get("channel_name") or "삭제·이전된 채널"
+                    channel_group = row.get("channel_group") or channel_name
+                else:
+                    channel_name, channel_group = _kpi_row_channel_names(guild, row)
+                events.append(kpi.build_sync_event(row, channel_name, channel_group))
+            audit_events = [kpi.build_sync_audit_event(row) for row in audit_rows]
+            operations = []
+            if operations_due:
+                for guild in bot.guilds:
+                    counts = await database.get_kpi_operational_counts(int(guild.id))
+                    operations.append(kpi.build_sync_operations(int(guild.id), counts))
+
+            response = await _kpi_http_client.post(
+                KPI_DASHBOARD_INGEST_URL,
+                headers={"Authorization": f"Bearer {KPI_DASHBOARD_INGEST_TOKEN}"},
+                json={
+                    "schema_version": 1,
+                    "events": events,
+                    "audit_runs": audit_events,
+                    "operations": operations,
+                },
+            )
+            response.raise_for_status()
+            await database.mark_kpi_sync_complete(review_ids)
+            await database.mark_audit_kpi_sync_complete(audit_run_ids)
+            if operations_due:
+                last_operations_sync = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            attempt_values = [int(row.get("sync_attempts", 0)) for row in rows]
+            attempt_values.extend(
+                int(row.get("sync_attempts", 0)) for row in audit_rows
+            )
+            attempts = max(attempt_values, default=0) + 1
+            delay = min(
+                config.KPI_SYNC_MAX_RETRY_SECONDS,
+                config.KPI_SYNC_INTERVAL_SECONDS * (2 ** min(attempts, 4)),
+            )
+            await database.reschedule_kpi_sync(review_ids, type(error).__name__, delay)
+            await database.reschedule_audit_kpi_sync(
+                audit_run_ids, type(error).__name__, delay
+            )
+            print(
+                f"[kpi-sync] 카드 {len(rows)}건·감사 {len(audit_rows)}건 전송 실패"
+                f"({type(error).__name__}), {delay:g}초 후 재시도"
+            )
+        await asyncio.sleep(0)
+
+
+def _kpi_report_embed(summary: dict) -> discord.Embed:
+    cards = summary["cards"]
+    embed = discord.Embed(
+        title=f"📊 BB봇 KPI — {summary['period']['label']}",
+        description="\n".join(kpi.concise_report_lines(summary)),
+        color=discord.Color.blurple(),
+        timestamp=datetime.datetime.now(_KST),
+    )
+    review_time = summary["review_time_hours"]
+    median = "-" if review_time["median"] is None else f"{review_time['median']:.1f}시간"
+    p90 = "-" if review_time["p90"] is None else f"{review_time['p90']:.1f}시간"
+    embed.add_field(
+        name="검수 운영",
+        value=(f"해결률 {cards['resolution_percent'] if cards['resolution_percent'] is not None else '-'}%\n"
+               f"검수 중앙값 {median} · P90 {p90}"),
+        inline=True,
+    )
+    operations = summary["operations"]
+    embed.add_field(
+        name="현재 미처리·복구 상태",
+        value=(f"24시간 초과 {operations['pending_over_24h']}건\n"
+               f"72시간 초과 {operations['pending_over_72h']}건\n"
+               f"AI 재판단 대기 {operations['ai_retry_queue']}건"),
+        inline=True,
+    )
+    audit = summary["audit"]
+    audit_rate = "-" if audit["flag_rate_percent"] is None else f"{audit['flag_rate_percent']:.1f}%"
+    audit_success = (
+        "-" if audit["successful_channel_percent"] is None
+        else f"{audit['successful_channel_percent']:.1f}%"
+    )
+    embed.add_field(
+        name="배치 감사 커버리지",
+        value=(f"{audit['runs']}회 · 메시지 {audit['reviewed_messages']}건\n"
+               f"의심 감지율 {audit_rate} · 채널 성공률 {audit_success}"),
+        inline=False,
+    )
+    if KPI_DASHBOARD_PUBLIC_URL:
+        embed.add_field(
+            name="상시 대시보드",
+            value=f"[관리자 KPI 대시보드 열기]({KPI_DASHBOARD_PUBLIC_URL})",
+            inline=False,
+        )
+    embed.set_footer(text="정탐·오탐은 관리자 카드 검수 결과 기준 · 사용자/메시지 원문 비공개")
+    return embed
+
+
+async def _send_kpi_report(guild: discord.Guild, period: kpi.KpiPeriod,
+                           *, record_delivery: bool) -> discord.Message | None:
+    summary = await kpi.get_period_summary(
+        int(guild.id), period, _kpi_channel_labels(guild)
+    )
+    channel = guild.get_channel_or_thread(KPI_REPORT_CHANNEL_ID) if KPI_REPORT_CHANNEL_ID else None
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        print(f"[kpi-report] 서버 {guild.id}의 KPI 보고 채널을 찾을 수 없습니다.")
+        return None
+    message = await channel.send(embed=_kpi_report_embed(summary))
+    if record_delivery:
+        await database.mark_kpi_report_delivered(
+            int(guild.id), period.kind, period.key, int(channel.id), int(message.id)
+        )
+    return message
+
+
+@tasks.loop(minutes=30)
+async def kpi_report_task():
+    """매월 1일 이후 월간 보고를 보충하고 분기·연간 경계에는 함께 정산한다."""
+    now = datetime.datetime.now(_KST)
+    if now.hour < config.KPI_REPORT_HOUR_KST:
+        return
+    kinds = ["month"]
+    if now.month in {1, 4, 7, 10}:
+        kinds.append("quarter")
+    if now.month == 1:
+        kinds.append("year")
+    for guild in bot.guilds:
+        for kind in kinds:
+            period = kpi.completed_period(kind, now)
+            if await database.kpi_report_was_delivered(int(guild.id), kind, period.key):
+                continue
+            try:
+                await _send_kpi_report(guild, period, record_delivery=True)
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"[kpi-report] {period.key} 게시 실패: {type(error).__name__}")
+
+
 # 매일 정해진 시각(한국 시간)에만 실행 — 시작 즉시 실행되는 hours= 방식과 달리
 # 봇을 재시작해도 감사가 곧바로 돌지 않아 무료 API 한도를 아낀다.
 _KST = datetime.timezone(datetime.timedelta(hours=9))
@@ -1492,6 +1716,8 @@ async def close():
     # 닫으면 종료 도중 감사가 시작될 수 있으므로 가장 먼저 중단한다.
     if batch_audit_task.is_running():
         batch_audit_task.cancel()
+    if kpi_report_task.is_running():
+        kpi_report_task.cancel()
 
     # ai_worker는 Queue.get()에서 계속 대기하므로 명시적으로 취소해야 정상 종료 시
     # "Task was destroyed but it is pending" 경고와 미완료 작업 잔존을 막을 수 있다.
@@ -1502,6 +1728,8 @@ async def close():
         await asyncio.gather(*pending, return_exceptions=True)
     _workers_started = False
 
+    if _kpi_http_client is not None:
+        await _kpi_http_client.aclose()
     await moderator.aclose_http_client()
     await commands.Bot.close(bot)
 
@@ -1518,6 +1746,13 @@ async def on_ready():
     removed_reports = prune_expired_reports(config.REPORT_RETENTION_DAYS)
     if removed_reports:
         print(f"[privacy] 보존 기간이 지난 감사 리포트 {removed_reports}개를 정리했습니다.")
+    for guild in bot.guilds:
+        backfilled_audits = await backfill_audit_metrics_from_reports(int(guild.id))
+        if backfilled_audits:
+            print(f"[kpi] 기존 감사 리포트 {backfilled_audits}건의 요약 지표를 백필했습니다.")
+    orphaned_kpi = await database.prune_kpi_sync_outbox()
+    if orphaned_kpi:
+        print(f"[kpi] 고아 동기화 대기 항목 {orphaned_kpi}건을 정리했습니다.")
     migrated = await learning.initialize()
     if migrated:
         print(f"[learning] 기존 오탐 이력 {migrated}건을 범위 지정 규칙으로 이전했습니다.")
@@ -1529,10 +1764,14 @@ async def on_ready():
             _spawn(ai_worker(i))
         if config.AI_RETRY_ENABLED:
             _spawn(ai_retry_worker())
+        if KPI_DASHBOARD_INGEST_URL and KPI_DASHBOARD_INGEST_TOKEN:
+            _spawn(kpi_sync_worker())
         _workers_started = True
 
     if config.WATCHED_CHANNEL_IDS and not batch_audit_task.is_running():
         batch_audit_task.start()
+    if KPI_REPORT_CHANNEL_ID and not kpi_report_task.is_running():
+        kpi_report_task.start()
     for guild in bot.guilds:
         for warning in permission_warnings(guild.me):
             print(f"[permissions] 서버 {guild.id}: {warning}")
@@ -1878,6 +2117,7 @@ async def show_commands(ctx):
             "`!BB 점수 @유저` — 누적 위반 점수와 최근 이력 확인\n"
             "`!BB 검토대기 [시간]` — 킥/밴 대신 하향 조정된 건 목록 (기본 72시간)\n"
             "`!BB 오탐학습 [개수]` — 활성 오탐 학습 규칙과 적용 범위 조회\n"
+            "`!BB KPI [월|분기|연]` — 현재 카드 정탐·오탐 운영 지표 조회\n"
             "`!BB 상태` — 처리 대기열/워커/드롭 건수 확인"
         ),
         inline=False,
@@ -2038,6 +2278,26 @@ def _fallback_chain_status() -> str:
             "받아져 있는지 확인하세요.")
 
 
+@bot.command(name="KPI", aliases=["kpi", "통계"])
+@commands.has_permissions(administrator=True)
+async def show_kpi(ctx, period_name: str = "월"):
+    """현재 월·분기·연도의 관리자 확정 카드 KPI를 즉시 보여준다."""
+    kind_by_name = {
+        "월": "month", "월간": "month", "month": "month",
+        "분기": "quarter", "분기간": "quarter", "quarter": "quarter",
+        "연": "year", "연간": "year", "년": "year", "year": "year",
+    }
+    kind = kind_by_name.get(period_name.casefold())
+    if kind is None:
+        await ctx.send("사용법: `!BB KPI [월|분기|연]`")
+        return
+    period = kpi.current_period(kind)
+    summary = await kpi.get_period_summary(
+        int(ctx.guild.id), period, _kpi_channel_labels(ctx.guild)
+    )
+    await ctx.send(embed=_kpi_report_embed(summary))
+
+
 @bot.command(name="상태")
 @commands.has_permissions(administrator=True)
 async def show_status(ctx):
@@ -2068,6 +2328,13 @@ async def show_status(ctx):
         value=(f"{retry_count}건" if retry_count else "없음"),
         inline=True,
     )
+    kpi_pending = await database.count_kpi_sync_pending(int(ctx.guild.id))
+    dashboard_state = (
+        f"연결됨 · 전송 대기 {kpi_pending}건"
+        if KPI_DASHBOARD_INGEST_URL and KPI_DASHBOARD_INGEST_TOKEN
+        else f"사이트 미연결 · 로컬 보관 {kpi_pending}건"
+    )
+    embed.add_field(name="KPI 대시보드", value=dashboard_state, inline=True)
 
     total_dropped = _dropped_count + _expired_count
     drop_text = (f"큐 포화 {_dropped_count}건 · 대기 초과 {_expired_count}건"
