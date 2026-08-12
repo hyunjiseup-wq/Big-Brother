@@ -91,10 +91,14 @@ main { width: min(1440px, 100%); margin: 0 auto; padding: 0 36px 48px; }
 .hero h2 em::after { content: ""; position: absolute; left: 0; right: 0; bottom: .02em; height: .11em; background: var(--acid); z-index: -1; transform: rotate(-1deg); }
 .hero-copy { max-width: 570px; margin: 0; color: var(--muted); font-size: 15px; line-height: 1.65; }
 
-.period-control { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; padding-bottom: 4px; }
-.period-control button { border: 1px solid var(--line); background: rgba(249,248,241,.65); color: var(--muted); padding: 10px 14px; border-radius: 99px; cursor: pointer; transition: .16s ease; }
-.period-control button:hover, .period-control button:focus-visible { border-color: var(--ink); color: var(--ink); outline: none; }
-.period-control button.active { border-color: var(--ink); background: var(--ink); color: var(--paper); }
+.period-control { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; align-items: flex-end; padding-bottom: 4px; }
+.period-field { display: grid; gap: 6px; }
+.period-field span, .period-summary span { color: var(--muted); font: 650 9px/1.2 var(--font-geist-mono), monospace; letter-spacing: .08em; text-transform: uppercase; }
+.period-field select { min-width: 104px; border: 1px solid var(--line); background: rgba(249,248,241,.88); color: var(--ink); padding: 10px 34px 10px 12px; border-radius: 4px; cursor: pointer; font: 650 12px/1.2 var(--font-geist-sans), sans-serif; }
+.period-field select:hover, .period-field select:focus-visible { border-color: var(--ink); outline: 2px solid rgba(38,117,83,.18); outline-offset: 1px; }
+.period-summary { min-width: 132px; display: grid; align-content: center; gap: 4px; padding: 9px 12px; border-left: 3px solid var(--green); background: rgba(249,248,241,.72); }
+.period-summary strong { font-size: 13px; }
+.period-summary small { color: var(--coral); font-size: 10px; }
 
 .sync-banner {
   display: flex;
@@ -190,6 +194,8 @@ td:first-child { font-weight: 600; }
 .empty-copy { margin: 24px 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .notice { margin: 0 0 16px; padding: 14px 18px; border: 1px solid var(--coral); background: #fff2ed; }
 .notice button { float: right; border: 0; background: none; color: var(--coral); cursor: pointer; font-weight: 700; }
+.empty-period-notice { border-color: var(--line); background: rgba(249,248,241,.82); color: var(--muted); }
+.empty-period-notice strong { margin-right: 7px; color: var(--ink); }
 .loading-state { min-height: 360px; display: grid; place-content: center; justify-items: center; color: var(--muted); }
 .loading-state span { width: 32px; height: 32px; border: 2px solid var(--line); border-top-color: var(--green); border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -220,7 +226,9 @@ footer p { margin: 0; text-align: right; }
   .hero h2 { font-size: clamp(42px, 14vw, 64px); }
   .hero-copy { font-size: 13px; }
   .period-control { justify-content: flex-start; margin-top: 28px; }
-  .period-control button { padding: 8px 11px; font-size: 12px; }
+  .period-field { flex: 1 1 96px; }
+  .period-field select { width: 100%; min-width: 0; }
+  .period-summary { flex: 1 1 100%; }
   .sync-banner, .sync-banner div:first-child, .sync-details { align-items: flex-start; flex-direction: column; gap: 6px; }
   .sync-details { text-align: left; }
   .metrics-grid, .insight-strip { grid-template-columns: 1fr 1fr; }

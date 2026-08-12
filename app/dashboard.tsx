@@ -12,6 +12,16 @@ type CountRow = {
 
 type DashboardData = {
   range: string;
+  period: PeriodSelection & {
+    start: number;
+    end: number;
+    label: string;
+  };
+  available_periods: {
+    years: number[];
+    months: string[];
+    quarters: string[];
+  };
   cards: {
     detected: number;
     confirmed: number;
@@ -58,13 +68,63 @@ type DashboardData = {
   updated_at: number | null;
 };
 
-const RANGE_OPTIONS = [
-  ["current-month", "이번 달"],
-  ["previous-month", "지난 달"],
-  ["current-quarter", "이번 분기"],
-  ["current-year", "올해"],
+type PeriodView = "month" | "quarter" | "year" | "all";
+
+type PeriodSelection = {
+  view: PeriodView;
+  year: number | null;
+  month: number | null;
+  quarter: number | null;
+};
+
+const VIEW_OPTIONS: ReadonlyArray<readonly [PeriodView, string]> = [
+  ["month", "월별"],
+  ["quarter", "분기별"],
+  ["year", "연간"],
   ["all", "전체"],
 ] as const;
+
+const MONTH_OPTIONS = Array.from({ length: 12 }, (_, index) => index + 1);
+const QUARTER_OPTIONS = [1, 2, 3, 4] as const;
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
+function currentKstSelection(): PeriodSelection & { year: number; month: number; quarter: number } {
+  const nowInKst = new Date(Date.now() + KST_OFFSET_MS);
+  const month = nowInKst.getUTCMonth() + 1;
+  return {
+    view: "month",
+    year: nowInKst.getUTCFullYear(),
+    month,
+    quarter: Math.floor((month - 1) / 3) + 1,
+  };
+}
+
+function selectionFromSearch(search: string, fallback: PeriodSelection): PeriodSelection {
+  const params = new URLSearchParams(search);
+  const requestedView = params.get("view") as PeriodView | null;
+  const view = VIEW_OPTIONS.some(([value]) => value === requestedView) ? requestedView! : fallback.view;
+  const requestedYear = Number(params.get("year"));
+  const requestedMonth = Number(params.get("month"));
+  const requestedQuarter = Number(params.get("quarter"));
+  return {
+    view,
+    year: view === "all" ? null : Number.isInteger(requestedYear) && requestedYear >= 2000 ? requestedYear : fallback.year,
+    month: view === "month" && Number.isInteger(requestedMonth) && requestedMonth >= 1 && requestedMonth <= 12
+      ? requestedMonth
+      : fallback.month,
+    quarter: view === "quarter" && Number.isInteger(requestedQuarter) && requestedQuarter >= 1 && requestedQuarter <= 4
+      ? requestedQuarter
+      : fallback.quarter,
+  };
+}
+
+function selectionQuery(selection: PeriodSelection) {
+  const params = new URLSearchParams({ view: selection.view });
+  if (selection.year != null) params.set("year", String(selection.year));
+  if (selection.view === "month" && selection.month != null) params.set("month", String(selection.month));
+  if (selection.view === "quarter" && selection.quarter != null) params.set("quarter", String(selection.quarter));
+  return params.toString();
+}
 
 const CATEGORY_LABELS: Record<string, string> = {
   language_etiquette: "말투·욕설·예절",
@@ -183,8 +243,11 @@ function Distribution({ rows, labels }: { rows: CountRow[]; labels: Record<strin
   );
 }
 
-export function Dashboard() {
-  const [range, setRange] = useState("current-month");
+export function Dashboard({ initialSearch = "" }: { initialSearch?: string }) {
+  const [selection, setSelection] = useState<PeriodSelection>(() => {
+    const current = currentKstSelection();
+    return selectionFromSearch(initialSearch, current);
+  });
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
@@ -192,7 +255,7 @@ export function Dashboard() {
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
     try {
-      const response = await fetch(`/api/dashboard?range=${encodeURIComponent(range)}`, {
+      const response = await fetch(`/api/dashboard?${selectionQuery(selection)}`, {
         cache: "no-store",
       });
       if (!response.ok) throw new Error("dashboard unavailable");
@@ -203,13 +266,17 @@ export function Dashboard() {
     } finally {
       setLoading(false);
     }
-  }, [range]);
+  }, [selection]);
 
   useEffect(() => {
-    load();
+    window.history.replaceState(null, "", `${window.location.pathname}?${selectionQuery(selection)}`);
+    const initialTimer = window.setTimeout(() => void load(), 0);
     const timer = window.setInterval(() => load(true), 60_000);
-    return () => window.clearInterval(timer);
-  }, [load]);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(timer);
+    };
+  }, [load, selection]);
 
   const topConfirmedChannel = useMemo(
     () => data ? rankBy(data.channels, "confirmed") : undefined,
@@ -228,6 +295,18 @@ export function Dashboard() {
     expected_interval_seconds: 300,
   };
   const freshnessCopy = FRESHNESS_COPY[freshness.status];
+  const current = currentKstSelection();
+  const yearOptions = [...new Set([
+    selection.year ?? current.year,
+    ...(data?.available_periods.years ?? []),
+    current.year,
+  ])].sort((a, b) => b - a);
+  const selectedMonthKey = selection.year && selection.month
+    ? `${selection.year}-${String(selection.month).padStart(2, "0")}`
+    : null;
+  const selectedQuarterKey = selection.year && selection.quarter
+    ? `${selection.year}-Q${selection.quarter}`
+    : null;
 
   return (
     <main>
@@ -257,16 +336,79 @@ export function Dashboard() {
           </p>
         </div>
         <div className="period-control" aria-label="조회 기간">
-          {RANGE_OPTIONS.map(([value, label]) => (
-            <button
-              type="button"
-              className={range === value ? "active" : ""}
-              onClick={() => setRange(value)}
-              key={value}
+          <label className="period-field">
+            <span>조회 단위</span>
+            <select
+              aria-label="조회 단위"
+              value={selection.view}
+              onChange={(event) => setSelection((currentSelection) => ({
+                ...currentSelection,
+                view: event.target.value as PeriodView,
+                year: event.target.value === "all" ? null : currentSelection.year ?? current.year,
+              }))}
             >
-              {label}
-            </button>
-          ))}
+              {VIEW_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </label>
+          {selection.view !== "all" && (
+            <label className="period-field">
+              <span>연도</span>
+              <select
+                aria-label="조회 연도"
+                value={selection.year ?? current.year}
+                onChange={(event) => setSelection((currentSelection) => ({
+                  ...currentSelection,
+                  year: Number(event.target.value),
+                }))}
+              >
+                {yearOptions.map((year) => <option key={year} value={year}>{year}년</option>)}
+              </select>
+            </label>
+          )}
+          {selection.view === "month" && (
+            <label className="period-field">
+              <span>월</span>
+              <select
+                aria-label="조회 월"
+                value={selection.month ?? current.month}
+                onChange={(event) => setSelection((currentSelection) => ({
+                  ...currentSelection,
+                  month: Number(event.target.value),
+                }))}
+              >
+                {MONTH_OPTIONS.map((month) => (
+                  <option key={month} value={month}>
+                    {month}월{data && selection.year && !data.available_periods.months.includes(`${selection.year}-${String(month).padStart(2, "0")}`) ? " · 자료 없음" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {selection.view === "quarter" && (
+            <label className="period-field">
+              <span>분기</span>
+              <select
+                aria-label="조회 분기"
+                value={selection.quarter ?? current.quarter}
+                onChange={(event) => setSelection((currentSelection) => ({
+                  ...currentSelection,
+                  quarter: Number(event.target.value),
+                }))}
+              >
+                {QUARTER_OPTIONS.map((quarter) => (
+                  <option key={quarter} value={quarter}>
+                    {quarter}분기{data && selection.year && !data.available_periods.quarters.includes(`${selection.year}-Q${quarter}`) ? " · 자료 없음" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div className="period-summary" aria-live="polite">
+            <span>선택 기간</span>
+            <strong>{data?.period.label ?? "불러오는 중"}</strong>
+            {data && selection.view === "month" && selectedMonthKey && !data.available_periods.months.includes(selectedMonthKey) && <small>수집 자료 없음</small>}
+            {data && selection.view === "quarter" && selectedQuarterKey && !data.available_periods.quarters.includes(selectedQuarterKey) && <small>수집 자료 없음</small>}
+          </div>
         </div>
       </section>
 
@@ -289,6 +431,12 @@ export function Dashboard() {
         <div className="notice error-notice">
           저장된 집계를 불러오지 못했습니다. 잠시 뒤 자동으로 다시 시도합니다.
           <button type="button" onClick={() => load()}>지금 다시 시도</button>
+        </div>
+      )}
+
+      {data && data.cards.detected === 0 && data.audit.runs === 0 && (
+        <div className="notice empty-period-notice">
+          <strong>{data.period.label}</strong>에는 수집된 감지 카드나 감사 기록이 없습니다.
         </div>
       )}
 
