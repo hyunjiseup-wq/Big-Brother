@@ -210,6 +210,23 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         rmt = moderator.ModerationResult("MODERATE", "3", "현금 거래 유도", "ollama")
         self.assertIs(moderator.apply_casual_speech_guard(rmt, "계좌 거래 가능함"), rmt)
 
+    def test_bdbd_is_not_a_violation_by_itself_but_contextual_taunting_remains(self):
+        literal = moderator.ModerationResult(
+            "MINOR", "3", "ㅂㄷㅂㄷ 초성 비속어가 포함됨", "ollama"
+        )
+        guarded = moderator.apply_ambiguous_emote_guard(literal, "ㅂㄷㅂㄷ")
+        self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+
+        contextual = moderator.ModerationResult(
+            "MINOR", "3", "상대방에게 ㅂㄷㅂㄷ이라고 조롱하며 도발함", "ollama"
+        )
+        self.assertIs(
+            moderator.apply_ambiguous_emote_guard(contextual, "ㅂㄷㅂㄷ"), contextual
+        )
+        self.assertIs(
+            moderator.apply_ambiguous_emote_guard(literal, "너 지금 ㅂㄷㅂㄷ하냐"), literal
+        )
+
     def test_barter_prompt_requires_whole_conversation_judgment(self):
         prompt = moderator._user_prompt(
             "10만원 맞나요?",

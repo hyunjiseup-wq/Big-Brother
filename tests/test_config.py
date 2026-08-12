@@ -44,6 +44,21 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("뭐함", config.SERVER_RULES)
         self.assertIn("실제 모욕·욕설·시비", config.SERVER_RULES)
 
+    def test_default_policy_treats_bdbd_as_context_dependent(self):
+        self.assertIn('"ㅂㄷㅂㄷ"', config.SERVER_RULES)
+        self.assertIn("부들부들", config.SERVER_RULES)
+        self.assertIn("앞뒤 대화", config.SERVER_RULES)
+
+    def test_sherpa_lobby_allows_same_guild_training_channel_guidance(self):
+        lobby_id = 1442471746660995113
+        note = config.CHANNEL_CONTEXT_NOTES[lobby_id]
+        self.assertIn("신규 이용자를 가르치는 선생님", note)
+        self.assertIn("교육용 음성채널", note)
+        self.assertIn("안내·유도", note)
+        self.assertIn("다른 Discord 서버", note)
+        self.assertIn(lobby_id, config.INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS)
+        self.assertIn(lobby_id, config.WATCHED_CHANNEL_IDS)
+
     def test_barter_policy_distinguishes_game_currency_from_real_payment(self):
         trade_note = config.CHANNEL_CONTEXT_NOTES[1526179570192093314]
         self.assertIn("게임 내 플리마켓", trade_note)

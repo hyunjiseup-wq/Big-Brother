@@ -1736,7 +1736,7 @@ async def _barter_conversation_context(message: discord.Message) -> list[dict]:
 
 
 async def _fast_check_with_invite_context(message: discord.Message) -> FilterResult:
-    """Allow only verified same-guild voice invites from configured team-finder channels."""
+    """Allow only verified same-guild voice invites from configured source channels."""
     invite_urls = extract_discord_invite_urls(message.content)
     if not invite_urls or not config.BLOCK_DISCORD_INVITES:
         result = fast_check(message.guild.id, message.author.id, message.content)
@@ -1764,7 +1764,7 @@ async def _fast_check_with_invite_context(message: discord.Message) -> FilterRes
         if target_guild_id != message.guild.id:
             return FilterResult("DECIDED", "MODERATE", "다른 디스코드 서버 초대 링크 무단 게시")
         if target_type not in (discord.ChannelType.voice, discord.ChannelType.stage_voice):
-            return FilterResult("DECIDED", "MODERATE", "팀원찾기 채널에는 같은 서버 음성채널 초대만 허용")
+            return FilterResult("DECIDED", "MODERATE", "허용 채널에는 같은 서버 음성채널 초대만 허용")
 
     # 링크 자체는 검증됐지만 함께 적힌 욕설·광고 등은 기존 필터와 AI가 계속 검사한다.
     result = fast_check(

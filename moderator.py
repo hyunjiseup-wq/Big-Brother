@@ -661,6 +661,40 @@ def apply_casual_speech_guard(
     )
 
 
+_AMBIGUOUS_EMOTE_ONLY_PATTERN = re.compile(
+    r"^[\s.!?~ㅋㅎㅠㅜ]*(?:ㅂ\s*ㄷ\s*){2}[\s.!?~ㅋㅎㅠㅜ]*$",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_EMOTE_LITERAL_VIOLATION_PATTERN = re.compile(
+    r"욕설|비속어|금칙어|초성\s*(?:욕설|비속어)|부적절한\s*(?:말|언어|표현)",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_EMOTE_CONTEXTUAL_ABUSE_PATTERN = re.compile(
+    r"조롱|비꼼|도발|시비|분란|괴롭|공격|모욕\s*(?:의도|목적)|상대(?:방)?에게",
+    re.IGNORECASE,
+)
+
+
+def apply_ambiguous_emote_guard(
+        result: "ModerationResult", content: str) -> "ModerationResult":
+    """단독 `ㅂㄷㅂㄷ`을 욕설 초성으로만 오인한 결과를 해제하되 문맥상 조롱은 보존한다."""
+    if result.level == "NONE" or not re.search(
+            r"(?<!\d)3(?!\d)", str(result.rule_violated)):
+        return result
+    # NFKC는 `ㅂ` 같은 호환 자모를 초성 전용 코드로 바꾸므로 이 표현은 원문 자모로 검사한다.
+    normalized = (content or "").strip()
+    verdict_text = f"{result.rule_violated} {result.reason}"
+    if (not _AMBIGUOUS_EMOTE_ONLY_PATTERN.fullmatch(normalized)
+            or not _AMBIGUOUS_EMOTE_LITERAL_VIOLATION_PATTERN.search(verdict_text)
+            or _AMBIGUOUS_EMOTE_CONTEXTUAL_ABUSE_PATTERN.search(verdict_text)):
+        return result
+    return ModerationResult(
+        "NONE", "NONE",
+        "단독 ㅂㄷㅂㄷ은 부들부들 감정 표현으로도 쓰여 욕설로 단정할 수 없음",
+        provider=result.provider,
+    )
+
+
 def _parse_json_response(raw_text: str) -> dict:
     cleaned = raw_text.replace("```json", "").replace("```", "").strip()
     return json.loads(cleaned)
@@ -893,6 +927,7 @@ async def classify_message(content: str, channel_note: str | None = None,
                 if barter_context else result
             )
             guarded = apply_casual_speech_guard(guarded, content)
+            guarded = apply_ambiguous_emote_guard(guarded, content)
             guarded = apply_barter_verification_link_guard(guarded, content)
             return apply_tarkov_info_link_guard(guarded, content)
         except Exception as error:
@@ -1186,6 +1221,7 @@ async def classify_batch(messages: list[dict], backend: str = "auto",
                 result, messages[i].get("content", ""), prior_context
             )
         result = apply_casual_speech_guard(result, messages[i].get("content", ""))
+        result = apply_ambiguous_emote_guard(result, messages[i].get("content", ""))
         result = apply_barter_verification_link_guard(
             result, messages[i].get("content", "")
         )
