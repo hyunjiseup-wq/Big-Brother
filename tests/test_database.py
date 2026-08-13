@@ -125,6 +125,41 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         candidates = await database.get_false_positive_thread_scope_candidates()
         self.assertEqual(candidates, [])
 
+    async def test_sanction_lifecycle_is_durable_and_queued_for_staff_dashboard(self):
+        sanction_id = await database.record_sanction(
+            1, 50, "테스트유저", "TIMEOUT", "분쟁 유발", "manual_command",
+            "manual:1", issued_by_id=99, issued_by_display="관리자",
+            issued_at=100, expires_at=200,
+        )
+        due = await database.get_due_sanction_sync_records()
+        self.assertEqual([row["sanction_id"] for row in due], [sanction_id])
+        self.assertEqual(due[0]["reason"], "분쟁 유발")
+        self.assertEqual(await database.count_kpi_sync_pending(), 1)
+
+        await database.mark_sanction_sync_complete([sanction_id])
+        self.assertEqual(await database.count_kpi_sync_pending(), 0)
+        released = await database.release_active_sanctions(
+            1, 50, "TIMEOUT", "상황 종료", released_by_id=99,
+            released_by_display="관리자", released_at=150,
+        )
+        self.assertEqual(released, [sanction_id])
+        history = await database.get_sanction_history(1, 50)
+        self.assertEqual(history[0]["status"], "released")
+        self.assertEqual(history[0]["released_at"], 150)
+        self.assertEqual(history[0]["release_reason"], "상황 종료")
+        self.assertEqual(await database.count_kpi_sync_pending(), 1)
+
+    async def test_elapsed_timeout_is_marked_expired(self):
+        sanction_id = await database.record_sanction(
+            1, 50, "테스트유저", "TIMEOUT", "테스트", "review", "review:1",
+            issued_at=100, expires_at=200,
+        )
+        await database.mark_sanction_sync_complete([sanction_id])
+        self.assertEqual(await database.expire_elapsed_timeouts(now=201), 1)
+        history = await database.get_sanction_history(1, 50)
+        self.assertEqual(history[0]["status"], "expired")
+        self.assertEqual(history[0]["released_at"], 200)
+
     async def test_confirmed_review_creates_violation_training_label(self):
         review_id = await database.log_violation(
             1, 9, 10, "harmful message", "SEVERE", "confirmed reason", "review",

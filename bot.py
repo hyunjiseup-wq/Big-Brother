@@ -193,6 +193,39 @@ _expired_count = 0        # 큐에서 너무 오래 대기해 폐기한 메시�
 _last_drop_at: datetime.datetime | None = None
 _last_drop_alert_at: datetime.datetime | None = None
 _workers_started = False  # on_ready는 재연결 시마다 다시 호출되므로 워커 중복 생성 방지용
+_pending_bot_timeout_changes: dict[tuple[int, int], tuple[float, float]] = {}
+
+
+def _remember_bot_timeout_change(guild_id: int, user_id: int, expires_at: float | None):
+    """봇 자체 타임아웃 변경을 멤버 이벤트에서 수동 조치로 중복 기록하지 않게 표시한다."""
+    _pending_bot_timeout_changes[(int(guild_id), int(user_id))] = (
+        float(expires_at or 0), time.monotonic() + 30,
+    )
+
+
+def _consume_bot_timeout_change(guild_id: int, user_id: int,
+                                expires_at: float | None) -> bool:
+    key = (int(guild_id), int(user_id))
+    expected = _pending_bot_timeout_changes.get(key)
+    if expected is None:
+        return False
+    expected_expires, deadline = expected
+    if time.monotonic() > deadline:
+        _pending_bot_timeout_changes.pop(key, None)
+        return False
+    actual = float(expires_at or 0)
+    if abs(expected_expires - actual) <= 5:
+        _pending_bot_timeout_changes.pop(key, None)
+        return True
+    return False
+
+
+def _member_ledger_display(member, user_id: int) -> str:
+    if member is None:
+        return f"Discord 사용자 {user_id}"
+    display_name = getattr(member, "display_name", None)
+    account = str(member)
+    return f"{display_name} ({account})" if display_name and display_name != account else account
 _processing_keys: set[tuple[int, int, str]] = set()
 _background_tasks: set[asyncio.Task] = set()
 _kpi_http_client: httpx.AsyncClient | None = None
@@ -385,10 +418,12 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
     if action == "TIMEOUT":
         try:
             until = discord.utils.utcnow() + datetime.timedelta(minutes=duration_minutes)
+            _remember_bot_timeout_change(guild.id, member.id, until.timestamp())
             await member.timeout(until, reason=reason)
             primary_ok = True
             details.append("타임아웃 성공")
         except (discord.Forbidden, discord.HTTPException) as e:
+            _pending_bot_timeout_changes.pop((int(guild.id), int(member.id)), None)
             details.append(f"타임아웃 실패: {type(e).__name__}")
 
     elif action == "KICK":
@@ -888,16 +923,21 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
                 if action == "del":
                     return await fail("봇 권한이 부족해 메시지를 삭제하지 못했습니다.")
 
+    timeout_expires_at = None
     try:
         if action in ("to1", "to24"):
             minutes = 60 if action == "to1" else 1440
             until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+            timeout_expires_at = until.timestamp()
+            _remember_bot_timeout_change(guild.id, member.id, timeout_expires_at)
             await member.timeout(until, reason=reason)
         elif action == "kick":
             await member.kick(reason=reason)
         elif action == "ban":
             await guild.ban(member or discord.Object(id=user_id), reason=reason)
     except (discord.Forbidden, discord.HTTPException):
+        if member is not None:
+            _pending_bot_timeout_changes.pop((int(guild.id), int(member.id)), None)
         return await fail(
             "봇 권한 또는 Discord API 오류로 조치를 실행하지 못했습니다 "
             "(봇 역할이 대상 유저의 역할보다 위에 있는지 확인)."
@@ -926,7 +966,34 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
         # 같은 카드 재시도로 제재가 중복 실행되지 않게 한다.
         if review_id:
             await database.resolve_review(
-                review_id, guild.id, "confirmed", admin.id, action_label
+                review_id, guild.id, "confirmed", admin.id, action_label,
+                sanction={
+                    "user_id": user_id,
+                    "user_display": _member_ledger_display(member, user_id),
+                    "action_type": {
+                        "del": "DELETE", "warn": "WARNING",
+                        "to1": "TIMEOUT", "to24": "TIMEOUT",
+                        "kick": "KICK", "ban": "BAN",
+                    }[action],
+                    "reason": reason_text or "관리자 검수 확정",
+                    "source": "review",
+                    "expires_at": timeout_expires_at,
+                    "issued_by_display": str(admin),
+                    "dedupe_key": f"review:{review_id}:{action}",
+                },
+            )
+        else:
+            await database.record_sanction(
+                guild.id, user_id, _member_ledger_display(member, user_id),
+                {
+                    "del": "DELETE", "warn": "WARNING",
+                    "to1": "TIMEOUT", "to24": "TIMEOUT",
+                    "kick": "KICK", "ban": "BAN",
+                }[action],
+                reason_text or "관리자 검수 확정", "review",
+                f"review-message:{message_id}:{action}",
+                issued_by_id=admin.id, issued_by_display=str(admin),
+                expires_at=timeout_expires_at,
             )
         points = config.VIOLATION_LEVEL_POINTS.get(level, 0)
         total = await database.add_points(guild.id, user_id, points)
@@ -1186,6 +1253,20 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
         message.content, level, reason_text, recorded_action, provider,
         needs_review=(downgraded and action_ok), message_id=message.id,
     )
+    if action_ok and action != "NONE":
+        await database.record_sanction(
+            message.guild.id, message.author.id,
+            _member_ledger_display(message.author, message.author.id),
+            action,
+            reason_text or f"규칙 {rule_violated} 위반", "automatic",
+            f"automatic:{message.id}:{action}",
+            issued_by_id=getattr(bot.user, "id", None),
+            issued_by_display=str(bot.user) if bot.user else "BB봇",
+            expires_at=(
+                time.time() + float(duration) * 60
+                if action == "TIMEOUT" and duration else None
+            ),
+        )
 
     embed = discord.Embed(
         title=(
@@ -1576,30 +1657,38 @@ async def kpi_sync_worker():
     if not _kpi_backfill_done:
         review_total = 0
         audit_total = 0
+        sanction_total = 0
         for guild in bot.guilds:
             review_total += await database.backfill_kpi_sync_outbox(int(guild.id))
             audit_total += await database.backfill_audit_kpi_sync_outbox(int(guild.id))
+            sanction_total += await database.backfill_sanction_sync_outbox(int(guild.id))
         _kpi_backfill_done = True
-        if review_total or audit_total:
+        if review_total or audit_total or sanction_total:
             print(
-                f"[kpi-sync] 기존 검수 {review_total}건·감사 {audit_total}건을 "
+                f"[kpi-sync] 기존 검수 {review_total}건·감사 {audit_total}건·"
+                f"제재 {sanction_total}건을 "
                 "동기화 대기열에 추가했습니다."
             )
 
     _kpi_http_client = httpx.AsyncClient(timeout=15.0)
     last_operations_sync = 0.0
     while True:
+        await database.expire_elapsed_timeouts()
         rows = await database.get_due_kpi_sync_records(config.KPI_SYNC_BATCH_SIZE)
         audit_rows = await database.get_due_audit_kpi_sync_records(
             max(1, config.KPI_SYNC_BATCH_SIZE // 2)
         )
+        sanction_rows = await database.get_due_sanction_sync_records(
+            max(1, config.KPI_SYNC_BATCH_SIZE)
+        )
         operations_due = time.monotonic() - last_operations_sync >= 300
-        if not rows and not audit_rows and not operations_due:
+        if not rows and not audit_rows and not sanction_rows and not operations_due:
             await asyncio.sleep(config.KPI_SYNC_INTERVAL_SECONDS)
             continue
 
         review_ids = [int(row["review_id"]) for row in rows]
         audit_run_ids = [int(row["audit_run_id"]) for row in audit_rows]
+        sanction_ids = [int(row["sanction_id"]) for row in sanction_rows]
         try:
             events = []
             for row in rows:
@@ -1611,6 +1700,7 @@ async def kpi_sync_worker():
                     channel_name, channel_group = _kpi_row_channel_names(guild, row)
                 events.append(kpi.build_sync_event(row, channel_name, channel_group))
             audit_events = [kpi.build_sync_audit_event(row) for row in audit_rows]
+            sanction_events = [kpi.build_sync_sanction(row) for row in sanction_rows]
             operations = []
             if operations_due:
                 for guild in bot.guilds:
@@ -1621,15 +1711,17 @@ async def kpi_sync_worker():
                 KPI_DASHBOARD_INGEST_URL,
                 headers={"Authorization": f"Bearer {KPI_DASHBOARD_INGEST_TOKEN}"},
                 json={
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "events": events,
                     "audit_runs": audit_events,
                     "operations": operations,
+                    "sanctions": sanction_events,
                 },
             )
             response.raise_for_status()
             await database.mark_kpi_sync_complete(review_ids)
             await database.mark_audit_kpi_sync_complete(audit_run_ids)
+            await database.mark_sanction_sync_complete(sanction_ids)
             if operations_due:
                 last_operations_sync = time.monotonic()
         except asyncio.CancelledError:
@@ -1638,6 +1730,9 @@ async def kpi_sync_worker():
             attempt_values = [int(row.get("sync_attempts", 0)) for row in rows]
             attempt_values.extend(
                 int(row.get("sync_attempts", 0)) for row in audit_rows
+            )
+            attempt_values.extend(
+                int(row.get("sync_attempts", 0)) for row in sanction_rows
             )
             attempts = max(attempt_values, default=0) + 1
             delay = min(
@@ -1648,8 +1743,12 @@ async def kpi_sync_worker():
             await database.reschedule_audit_kpi_sync(
                 audit_run_ids, type(error).__name__, delay
             )
+            await database.reschedule_sanction_sync(
+                sanction_ids, type(error).__name__, delay
+            )
             print(
-                f"[kpi-sync] 카드 {len(rows)}건·감사 {len(audit_rows)}건 전송 실패"
+                f"[kpi-sync] 카드 {len(rows)}건·감사 {len(audit_rows)}건·"
+                f"제재 {len(sanction_rows)}건 전송 실패"
                 f"({type(error).__name__}), {delay:g}초 후 재시도"
             )
         await asyncio.sleep(0)
@@ -2120,6 +2219,60 @@ async def on_message(message: discord.Message):
     # 명령어는 위에서 조기 처리되므로 여기서는 process_commands를 다시 호출하지 않는다
 
 
+async def _recent_timeout_audit_context(guild: discord.Guild, user_id: int):
+    """Discord에서 직접 변경한 타임아웃의 처리자와 감사 사유를 가능한 범위에서 찾는다."""
+    try:
+        async for entry in guild.audit_logs(
+                limit=10, action=discord.AuditLogAction.member_update):
+            target_id = getattr(getattr(entry, "target", None), "id", None)
+            age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+            if target_id == user_id and 0 <= age <= 30:
+                actor = getattr(entry, "user", None)
+                return actor, (entry.reason or "Discord에서 관리자가 직접 변경")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return None, "Discord에서 관리자가 직접 변경 (감사 로그 처리자 확인 불가)"
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    """Discord UI에서 직접 적용·해제한 타임아웃도 인수인계 원장에 남긴다."""
+    before_until = getattr(before, "timed_out_until", None)
+    after_until = getattr(after, "timed_out_until", None)
+    before_ts = before_until.timestamp() if before_until else 0.0
+    after_ts = after_until.timestamp() if after_until else 0.0
+    if abs(before_ts - after_ts) <= 1:
+        return
+    if _consume_bot_timeout_change(after.guild.id, after.id, after_ts or None):
+        return
+
+    actor, audit_reason = await _recent_timeout_audit_context(after.guild, after.id)
+    actor_id = getattr(actor, "id", None)
+    actor_display = str(actor) if actor else None
+    now = time.time()
+    if after_ts > now:
+        if before_ts > now:
+            await database.release_active_sanctions(
+                after.guild.id, after.id, "TIMEOUT", "타임아웃 기간 변경",
+                released_by_id=actor_id, released_by_display=actor_display,
+            )
+        await database.record_sanction(
+            after.guild.id, after.id, _member_ledger_display(after, after.id),
+            "TIMEOUT", audit_reason, "discord_manual",
+            f"discord-timeout:{after.id}:{int(after_ts)}",
+            issued_by_id=actor_id, issued_by_display=actor_display,
+            expires_at=after_ts,
+        )
+    elif before_ts > 0:
+        naturally_expired = before_ts <= now + 5 and actor is None
+        await database.release_active_sanctions(
+            after.guild.id, after.id, "TIMEOUT",
+            "설정된 타임아웃 기간 만료" if naturally_expired else audit_reason,
+            released_by_id=actor_id, released_by_display=actor_display,
+            status="expired" if naturally_expired else "released",
+        )
+
+
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     """
@@ -2169,6 +2322,8 @@ async def show_commands(ctx):
             "`!BB 명령어` — 이 목록 (별칭: 도움말, help)\n"
             "`!BB 규칙확인` — 현재 설정된 서버 규칙 확인\n"
             "`!BB 점수 @유저` — 누적 위반 점수와 최근 이력 확인\n"
+            "`!BB 제재내역 [@유저]` — 경고·타임아웃 적용/해제 인수인계 기록\n"
+            "`!BB 인수인계` — 비밀번호 보호 운영 대시보드 주소를 DM으로 받기\n"
             "`!BB 검토대기 [시간]` — 킥/밴 대신 하향 조정된 건 목록 (기본 72시간)\n"
             "`!BB 오탐학습 [개수]` — 활성 오탐 학습 규칙과 적용 범위 조회\n"
             "`!BB KPI [월|분기|연]` — 현재 카드 정탐·오탐 운영 지표 조회\n"
@@ -2180,6 +2335,10 @@ async def show_commands(ctx):
         name="⚙️ 실행",
         value=(
             "`!BB 점수초기화 @유저` — 유저의 누적 점수 초기화\n"
+            "`!BB 경고등록 @유저 <사유>` — 수동 경고를 원장에 기록\n"
+            "`!BB 경고해제 @유저 <사유>` — 최근 활성 경고 해제 기록\n"
+            "`!BB 타임아웃등록 @유저 <분> <사유>` — 타임아웃 적용과 원장 기록\n"
+            "`!BB 타임아웃해제 @유저 <사유>` — 타임아웃 해제와 원장 기록\n"
             "`!BB 오탐취소 <규칙번호>` — 잘못 등록한 오탐 학습 규칙 취소\n"
             "`!BB 검토복구 <번호>` — 중단된 검수를 확인 후 다시 대기 상태로 전환\n"
             "`!BB 감사실행 [backend]` — 배치 감사를 지금 바로 실행 (gemini/groq/ollama/auto)"
@@ -2211,6 +2370,126 @@ async def check_points(ctx, member: discord.Member):
 async def reset_points_cmd(ctx, member: discord.Member):
     await database.reset_points(ctx.guild.id, member.id)
     await ctx.send(f"✅ {member.mention}의 위반 점수를 초기화했습니다.")
+
+
+@bot.command(name="경고등록")
+@commands.has_permissions(administrator=True)
+async def register_warning_cmd(ctx, member: discord.Member, *, reason: str):
+    sanction_id = await database.record_sanction(
+        ctx.guild.id, member.id, _member_ledger_display(member, member.id),
+        "WARNING", reason, "manual_command", f"manual-warning:{ctx.message.id}",
+        issued_by_id=ctx.author.id, issued_by_display=str(ctx.author),
+    )
+    await ctx.send(
+        f"✅ 경고 기록 `#{sanction_id}`을 인수인계 원장에 등록했습니다. "
+        "사용자에게 별도 메시지는 전송하지 않았습니다."
+    )
+
+
+@bot.command(name="경고해제")
+@commands.has_permissions(administrator=True)
+async def release_warning_cmd(ctx, member: discord.Member, *, reason: str):
+    ids = await database.release_active_sanctions(
+        ctx.guild.id, member.id, "WARNING", reason,
+        released_by_id=ctx.author.id, released_by_display=str(ctx.author), limit=1,
+    )
+    if not ids:
+        await ctx.send("⚠️ 해당 사용자의 활성 경고 기록을 찾지 못했습니다.")
+        return
+    await ctx.send(f"✅ 경고 기록 `#{ids[0]}`을 해제 처리했습니다.")
+
+
+@bot.command(name="타임아웃등록")
+@commands.has_permissions(administrator=True)
+async def register_timeout_cmd(ctx, member: discord.Member, minutes: int, *, reason: str):
+    if minutes < 1 or minutes > 40320:
+        await ctx.send("타임아웃 시간은 1분 이상 40,320분(28일) 이하여야 합니다.")
+        return
+    until = discord.utils.utcnow() + datetime.timedelta(minutes=minutes)
+    _remember_bot_timeout_change(ctx.guild.id, member.id, until.timestamp())
+    try:
+        await member.timeout(until, reason=f"{ctx.author}: {reason}"[:480])
+    except (discord.Forbidden, discord.HTTPException):
+        _pending_bot_timeout_changes.pop((int(ctx.guild.id), int(member.id)), None)
+        await ctx.send("⛔ 타임아웃 적용에 실패했습니다. 봇과 대상 사용자의 역할 순서를 확인하세요.")
+        return
+    sanction_id = await database.record_sanction(
+        ctx.guild.id, member.id, _member_ledger_display(member, member.id),
+        "TIMEOUT", reason, "manual_command", f"manual-timeout:{ctx.message.id}",
+        issued_by_id=ctx.author.id, issued_by_display=str(ctx.author),
+        expires_at=until.timestamp(),
+    )
+    await ctx.send(
+        f"✅ {minutes:,}분 타임아웃을 적용하고 기록 `#{sanction_id}`을 원장에 등록했습니다."
+    )
+
+
+@bot.command(name="타임아웃해제")
+@commands.has_permissions(administrator=True)
+async def release_timeout_cmd(ctx, member: discord.Member, *, reason: str):
+    _remember_bot_timeout_change(ctx.guild.id, member.id, None)
+    try:
+        await member.timeout(None, reason=f"{ctx.author}: {reason}"[:480])
+    except (discord.Forbidden, discord.HTTPException):
+        _pending_bot_timeout_changes.pop((int(ctx.guild.id), int(member.id)), None)
+        await ctx.send("⛔ 타임아웃 해제에 실패했습니다. 봇과 대상 사용자의 역할 순서를 확인하세요.")
+        return
+    ids = await database.release_active_sanctions(
+        ctx.guild.id, member.id, "TIMEOUT", reason,
+        released_by_id=ctx.author.id, released_by_display=str(ctx.author),
+    )
+    await ctx.send(
+        f"✅ 타임아웃을 해제했습니다. 원장 기록 {len(ids)}건을 해제 상태로 변경했습니다."
+    )
+
+
+@bot.command(name="제재내역")
+@commands.has_permissions(administrator=True)
+async def sanction_history_cmd(ctx, member: discord.Member | None = None):
+    rows = await database.get_sanction_history(
+        ctx.guild.id, member.id if member else None, limit=15,
+    )
+    if not rows:
+        await ctx.send("등록된 경고·타임아웃 인수인계 기록이 없습니다.")
+        return
+    lines = []
+    for row in rows:
+        issued = f"<t:{int(row['issued_at'])}:f>"
+        released = (
+            f"<t:{int(row['released_at'])}:f>"
+            if row["released_at"] else "현재 활성"
+        )
+        lines.append(
+            f"`#{row['sanction_id']}` **{row['user_display']}** · {row['action_type']} · "
+            f"{row['status']}\n{issued} → {released}\n사유: {row['reason'][:180]}"
+        )
+    embed = discord.Embed(
+        title="🔒 스태프 제재 인수인계 기록",
+        description="\n\n".join(lines)[:4000],
+        color=discord.Color.dark_blue(),
+    )
+    try:
+        await ctx.author.send(embed=embed)
+        await ctx.send("✅ 제재 인수인계 기록을 관리자 DM으로 보냈습니다.")
+    except (discord.Forbidden, discord.HTTPException):
+        await ctx.send("⚠️ 관리자 DM을 열 수 없어 기록을 전달하지 못했습니다.")
+
+
+@bot.command(name="인수인계")
+@commands.has_permissions(administrator=True)
+async def handoff_dashboard_cmd(ctx):
+    if not KPI_DASHBOARD_PUBLIC_URL:
+        await ctx.send("⚠️ 운영 대시보드 주소가 설정되어 있지 않습니다.")
+        return
+    staff_url = KPI_DASHBOARD_PUBLIC_URL.rstrip("/") + "/staff"
+    try:
+        await ctx.author.send(
+            "🔒 BB봇 스태프 인수인계 대시보드\n"
+            f"{staff_url}\n\n사이트 비밀번호는 서버 책임자에게 별도로 확인해주세요."
+        )
+        await ctx.send("✅ 비밀번호 보호 인수인계 대시보드 주소를 관리자 DM으로 보냈습니다.")
+    except (discord.Forbidden, discord.HTTPException):
+        await ctx.send("⚠️ 관리자 DM을 열 수 없어 대시보드 주소를 전달하지 못했습니다.")
 
 
 @bot.command(name="규칙확인")

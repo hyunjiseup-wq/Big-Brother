@@ -55,3 +55,40 @@ export const operationSnapshots = sqliteTable("operation_snapshots", {
   kpiSyncPending: integer("kpi_sync_pending").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
+
+export const sanctionRecords = sqliteTable(
+  "sanction_records",
+  {
+    eventId: text("event_id").primaryKey(),
+    userId: text("user_id").notNull(),
+    userDisplay: text("user_display").notNull(),
+    actionType: text("action_type").notNull(),
+    reason: text("reason").notNull(),
+    source: text("source").notNull(),
+    status: text("status").notNull(),
+    issuedAt: text("issued_at").notNull(),
+    issuedTs: integer("issued_ts").notNull(),
+    expiresAt: text("expires_at"),
+    expiresTs: integer("expires_ts"),
+    releasedAt: text("released_at"),
+    releasedTs: integer("released_ts"),
+    issuedById: text("issued_by_id"),
+    issuedByDisplay: text("issued_by_display"),
+    releasedById: text("released_by_id"),
+    releasedByDisplay: text("released_by_display"),
+    releaseReason: text("release_reason"),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_sanctions_issued_ts").on(table.issuedTs),
+    index("idx_sanctions_status_issued").on(table.status, table.issuedTs),
+    index("idx_sanctions_user_issued").on(table.userId, table.issuedTs),
+  ],
+);
+
+export const staffLoginAttempts = sqliteTable("staff_login_attempts", {
+  fingerprint: text("fingerprint").primaryKey(),
+  failures: integer("failures").notNull(),
+  lockedUntil: integer("locked_until").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});

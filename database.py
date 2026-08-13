@@ -280,6 +280,56 @@ async def init_db():
             "ON kpi_sync_outbox(next_attempt_at, review_id)"
         )
 
+        # 관리자 인수인계용 제재 원장. 공개 KPI와 달리 사용자·처리자·사유를 보존하며,
+        # 외부 사이트에서는 비밀번호로 보호된 스태프 화면에서만 조회한다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sanction_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_display TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                issued_at REAL NOT NULL,
+                expires_at REAL,
+                released_at REAL,
+                issued_by_id INTEGER,
+                issued_by_display TEXT,
+                released_by_id INTEGER,
+                released_by_display TEXT,
+                release_reason TEXT,
+                review_id INTEGER,
+                dedupe_key TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE (guild_id, dedupe_key)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sanction_user_history "
+            "ON sanction_records(guild_id, user_id, issued_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sanction_status_history "
+            "ON sanction_records(guild_id, status, issued_at DESC)"
+        )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sanction_sync_outbox (
+                sanction_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at REAL NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sanction_sync_due "
+            "ON sanction_sync_outbox(next_attempt_at, sanction_id)"
+        )
+
         # 배치 감사의 커버리지 KPI. 감사 리포트 원문을 다시 파싱하지 않고 실행 단위의
         # 검토량·의심 감지·실패 채널 수를 장기 보존한다.
         await db.execute("""
@@ -619,6 +669,233 @@ async def count_moderation_retries(guild_id: int | None = None) -> int:
 
 # ── KPI 집계·대시보드 동기화 ────────────────────────────────────────
 
+async def record_sanction(
+    guild_id: int,
+    user_id: int,
+    user_display: str,
+    action_type: str,
+    reason: str,
+    source: str,
+    dedupe_key: str,
+    *,
+    issued_by_id: int | None = None,
+    issued_by_display: str | None = None,
+    issued_at: float | None = None,
+    expires_at: float | None = None,
+    review_id: int | None = None,
+) -> int:
+    """제재 적용 사실과 사이트 동기화 항목을 같은 트랜잭션에 기록한다."""
+    now = time.time()
+    issued = now if issued_at is None else float(issued_at)
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO sanction_records
+               (guild_id, user_id, user_display, action_type, reason, source, status,
+                issued_at, expires_at, issued_by_id, issued_by_display, review_id,
+                dedupe_key, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                int(guild_id), int(user_id), str(user_display)[:120],
+                str(action_type)[:32], str(reason)[:1000], str(source)[:32],
+                issued, expires_at, issued_by_id,
+                str(issued_by_display)[:120] if issued_by_display else None,
+                review_id, str(dedupe_key)[:160], now, now,
+            ),
+        )
+        row = await (await db.execute(
+            "SELECT id FROM sanction_records WHERE guild_id = ? AND dedupe_key = ?",
+            (int(guild_id), str(dedupe_key)[:160]),
+        )).fetchone()
+        sanction_id = int(row[0])
+        if cursor.rowcount == 1:
+            await db.execute(
+                """INSERT OR REPLACE INTO sanction_sync_outbox
+                   (sanction_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+                   VALUES (?, ?, 0, 0, NULL, ?)""",
+                (sanction_id, int(guild_id), now),
+            )
+        await db.commit()
+        return sanction_id
+
+
+async def release_active_sanctions(
+    guild_id: int,
+    user_id: int,
+    action_type: str,
+    release_reason: str,
+    *,
+    released_by_id: int | None = None,
+    released_by_display: str | None = None,
+    released_at: float | None = None,
+    status: str = "released",
+    limit: int | None = None,
+) -> list[int]:
+    """활성 제재를 해제/만료 처리하고 변경분을 사이트 동기화 대기열에 넣는다."""
+    if status not in {"released", "expired"}:
+        raise ValueError(f"지원하지 않는 제재 종료 상태: {status}")
+    now = time.time() if released_at is None else float(released_at)
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        sql = (
+            "SELECT id FROM sanction_records WHERE guild_id = ? AND user_id = ? "
+            "AND action_type = ? AND status = 'active' ORDER BY issued_at DESC"
+        )
+        params: list[object] = [int(guild_id), int(user_id), str(action_type)[:32]]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        ids = [int(row[0]) for row in await (await db.execute(sql, params)).fetchall()]
+        if not ids:
+            await db.rollback()
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        await db.execute(
+            f"""UPDATE sanction_records SET status = ?, released_at = ?,
+                   released_by_id = ?, released_by_display = ?, release_reason = ?,
+                   updated_at = ? WHERE id IN ({placeholders})""",
+            (
+                status, now, released_by_id,
+                str(released_by_display)[:120] if released_by_display else None,
+                str(release_reason)[:1000], time.time(), *ids,
+            ),
+        )
+        await db.executemany(
+            """INSERT OR REPLACE INTO sanction_sync_outbox
+               (sanction_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+               VALUES (?, ?, 0, 0, NULL, ?)""",
+            [(sanction_id, int(guild_id), time.time()) for sanction_id in ids],
+        )
+        await db.commit()
+        return ids
+
+
+async def expire_elapsed_timeouts(now: float | None = None) -> int:
+    """Discord 만료 이벤트가 오지 않아도 종료 시각이 지난 타임아웃을 확정한다."""
+    current = time.time() if now is None else float(now)
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        ids = [int(row[0]) for row in await (await db.execute(
+            """SELECT id FROM sanction_records
+               WHERE action_type = 'TIMEOUT' AND status = 'active'
+                 AND expires_at IS NOT NULL AND expires_at <= ?""",
+            (current,),
+        )).fetchall()]
+        if not ids:
+            await db.rollback()
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        await db.execute(
+            f"""UPDATE sanction_records SET status = 'expired', released_at = expires_at,
+                   release_reason = '설정된 타임아웃 기간 만료', updated_at = ?
+               WHERE id IN ({placeholders})""",
+            (time.time(), *ids),
+        )
+        await db.executemany(
+            """INSERT OR REPLACE INTO sanction_sync_outbox
+               (sanction_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+               SELECT id, guild_id, 0, 0, NULL, ? FROM sanction_records WHERE id = ?""",
+            [(time.time(), sanction_id) for sanction_id in ids],
+        )
+        await db.commit()
+        return len(ids)
+
+
+async def get_sanction_history(guild_id: int, user_id: int | None = None,
+                               limit: int = 20) -> list[dict]:
+    where = "WHERE guild_id = ?"
+    params: list[object] = [int(guild_id)]
+    if user_id is not None:
+        where += " AND user_id = ?"
+        params.append(int(user_id))
+    params.append(max(1, min(int(limit), 100)))
+    async with _connect() as db:
+        cursor = await db.execute(
+            f"""SELECT id, user_id, user_display, action_type, reason, source, status,
+                       issued_at, expires_at, released_at, issued_by_display,
+                       released_by_display, release_reason
+                FROM sanction_records {where}
+                ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+                         issued_at DESC LIMIT ?""",
+            params,
+        )
+        columns = (
+            "sanction_id", "user_id", "user_display", "action_type", "reason",
+            "source", "status", "issued_at", "expires_at", "released_at",
+            "issued_by_display", "released_by_display", "release_reason",
+        )
+        return [dict(zip(columns, row)) for row in await cursor.fetchall()]
+
+
+_SANCTION_SYNC_COLUMNS = (
+    "sanction_id", "guild_id", "user_id", "user_display", "action_type",
+    "reason", "source", "status", "issued_at", "expires_at", "released_at",
+    "issued_by_id", "issued_by_display", "released_by_id", "released_by_display",
+    "release_reason", "review_id", "sync_attempts",
+)
+
+
+async def backfill_sanction_sync_outbox(guild_id: int) -> int:
+    async with _connect() as db:
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO sanction_sync_outbox
+               (sanction_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+               SELECT id, guild_id, 0, 0, NULL, ? FROM sanction_records
+               WHERE guild_id = ?""",
+            (time.time(), int(guild_id)),
+        )
+        await db.commit()
+        return max(0, cursor.rowcount)
+
+
+async def get_due_sanction_sync_records(limit: int = 50) -> list[dict]:
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT s.id, s.guild_id, s.user_id, s.user_display, s.action_type,
+                      s.reason, s.source, s.status, s.issued_at, s.expires_at,
+                      s.released_at, s.issued_by_id, s.issued_by_display,
+                      s.released_by_id, s.released_by_display, s.release_reason,
+                      s.review_id, o.attempts
+               FROM sanction_sync_outbox o JOIN sanction_records s
+                 ON s.id = o.sanction_id AND s.guild_id = o.guild_id
+               WHERE o.next_attempt_at <= ?
+               ORDER BY o.next_attempt_at, o.sanction_id LIMIT ?""",
+            (time.time(), max(1, int(limit))),
+        )
+        return [dict(zip(_SANCTION_SYNC_COLUMNS, row)) for row in await cursor.fetchall()]
+
+
+async def mark_sanction_sync_complete(sanction_ids: list[int]) -> int:
+    if not sanction_ids:
+        return 0
+    placeholders = ",".join("?" for _ in sanction_ids)
+    async with _connect() as db:
+        cursor = await db.execute(
+            f"DELETE FROM sanction_sync_outbox WHERE sanction_id IN ({placeholders})",
+            tuple(map(int, sanction_ids)),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def reschedule_sanction_sync(sanction_ids: list[int], error_category: str,
+                                   delay_seconds: float) -> None:
+    if not sanction_ids:
+        return
+    next_attempt = time.time() + max(1.0, float(delay_seconds))
+    async with _connect() as db:
+        await db.executemany(
+            """UPDATE sanction_sync_outbox SET attempts = attempts + 1,
+                   next_attempt_at = ?, last_error = ?, updated_at = ?
+               WHERE sanction_id = ?""",
+            [
+                (next_attempt, str(error_category)[:100], time.time(), int(sanction_id))
+                for sanction_id in sanction_ids
+            ],
+        )
+        await db.commit()
+
+
 _KPI_ROW_COLUMNS = (
     "review_id", "guild_id", "channel_id", "channel_name", "channel_group",
     "level", "reason", "rule_violated",
@@ -702,13 +979,15 @@ async def count_kpi_sync_pending(guild_id: int | None = None) -> int:
         if guild_id is None:
             cursor = await db.execute(
                 "SELECT (SELECT COUNT(*) FROM kpi_sync_outbox) + "
-                "(SELECT COUNT(*) FROM audit_kpi_sync_outbox)"
+                "(SELECT COUNT(*) FROM audit_kpi_sync_outbox) + "
+                "(SELECT COUNT(*) FROM sanction_sync_outbox)"
             )
         else:
             cursor = await db.execute(
                 "SELECT (SELECT COUNT(*) FROM kpi_sync_outbox WHERE guild_id = ?) + "
-                "(SELECT COUNT(*) FROM audit_kpi_sync_outbox WHERE guild_id = ?)",
-                (guild_id, guild_id),
+                "(SELECT COUNT(*) FROM audit_kpi_sync_outbox WHERE guild_id = ?) + "
+                "(SELECT COUNT(*) FROM sanction_sync_outbox WHERE guild_id = ?)",
+                (guild_id, guild_id, guild_id),
             )
         row = await cursor.fetchone()
         return int(row[0])
@@ -754,8 +1033,9 @@ async def get_kpi_operational_counts(guild_id: int, now: float | None = None) ->
         )).fetchone())[0])
         kpi_outbox = int((await (await db.execute(
             "SELECT (SELECT COUNT(*) FROM kpi_sync_outbox WHERE guild_id = ?) + "
-            "(SELECT COUNT(*) FROM audit_kpi_sync_outbox WHERE guild_id = ?)",
-            (guild_id, guild_id),
+            "(SELECT COUNT(*) FROM audit_kpi_sync_outbox WHERE guild_id = ?) + "
+            "(SELECT COUNT(*) FROM sanction_sync_outbox WHERE guild_id = ?)",
+            (guild_id, guild_id, guild_id),
         )).fetchone())[0])
     return {
         "pending_over_24h": pending_24h,
@@ -959,9 +1239,18 @@ async def prune_kpi_sync_outbox(max_completed_age_days: int = 30) -> int:
                )""",
             (cutoff,),
         )
+        sanction_cursor = await db.execute(
+            """DELETE FROM sanction_sync_outbox
+               WHERE updated_at < ? AND NOT EXISTS (
+                   SELECT 1 FROM sanction_records s
+                   WHERE s.id = sanction_sync_outbox.sanction_id
+                     AND s.guild_id = sanction_sync_outbox.guild_id
+               )""",
+            (cutoff,),
+        )
         await db.execute("PRAGMA optimize")
         await db.commit()
-        return review_cursor.rowcount + audit_cursor.rowcount
+        return review_cursor.rowcount + audit_cursor.rowcount + sanction_cursor.rowcount
 
 
 async def kpi_report_was_delivered(guild_id: int, period_type: str,
@@ -1129,6 +1418,7 @@ async def resolve_review(
     status: str,
     reviewer_id: int,
     action_taken: str,
+    sanction: dict | None = None,
 ):
     if status not in {"confirmed", "false_positive"}:
         raise ValueError(f"알 수 없는 검수 상태: {status}")
@@ -1157,6 +1447,37 @@ async def resolve_review(
             )
             await _enqueue_kpi_sync(db, review_id, guild_id)
             await _mark_kpi_snapshots_dirty_for_review(db, review_id, guild_id)
+            if sanction is not None:
+                now = time.time()
+                dedupe_key = str(sanction["dedupe_key"])[:160]
+                inserted = await db.execute(
+                    """INSERT OR IGNORE INTO sanction_records
+                       (guild_id, user_id, user_display, action_type, reason, source,
+                        status, issued_at, expires_at, issued_by_id, issued_by_display,
+                        review_id, dedupe_key, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        int(guild_id), int(sanction["user_id"]),
+                        str(sanction["user_display"])[:120],
+                        str(sanction["action_type"])[:32],
+                        str(sanction["reason"])[:1000], str(sanction["source"])[:32],
+                        float(sanction.get("issued_at", now)), sanction.get("expires_at"),
+                        reviewer_id, str(sanction.get("issued_by_display") or "")[:120],
+                        review_id, dedupe_key, now, now,
+                    ),
+                )
+                row = await (await db.execute(
+                    "SELECT id FROM sanction_records WHERE guild_id = ? AND dedupe_key = ?",
+                    (int(guild_id), dedupe_key),
+                )).fetchone()
+                if inserted.rowcount == 1 and row:
+                    await db.execute(
+                        """INSERT OR REPLACE INTO sanction_sync_outbox
+                           (sanction_id, guild_id, attempts, next_attempt_at,
+                            last_error, updated_at)
+                           VALUES (?, ?, 0, 0, NULL, ?)""",
+                        (int(row[0]), int(guild_id), now),
+                    )
         await db.commit()
         return updated.rowcount == 1
 

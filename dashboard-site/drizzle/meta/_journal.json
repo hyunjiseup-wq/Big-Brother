@@ -8,6 +8,13 @@
       "when": 1786520361848,
       "tag": "0000_sparkling_blonde_phantom",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1786582015097,
+      "tag": "0001_slim_magma",
+      "breakpoints": true
     }
   ]
 }

@@ -385,6 +385,39 @@ def build_sync_operations(guild_id: int, counts: dict,
     }
 
 
+def build_sync_sanction(row: dict) -> dict:
+    """비밀번호 보호 스태프 원장으로 보낼 제재 생명주기 기록."""
+    anonymous_scope = hashlib.sha256(
+        str(row["guild_id"]).encode("ascii")
+    ).hexdigest()[:16]
+
+    def iso(value):
+        return (
+            datetime.datetime.fromtimestamp(float(value), KST).isoformat()
+            if value is not None else None
+        )
+
+    return {
+        "event_id": f"{anonymous_scope}:sanction:{row['sanction_id']}",
+        "user_id": str(row["user_id"]),
+        "user_display": row["user_display"],
+        "action_type": row["action_type"],
+        "reason": row["reason"],
+        "source": row["source"],
+        "status": row["status"],
+        "issued_at": iso(row["issued_at"]),
+        "expires_at": iso(row["expires_at"]),
+        "released_at": iso(row["released_at"]),
+        "issued_by_id": str(row["issued_by_id"]) if row["issued_by_id"] else None,
+        "issued_by_display": row["issued_by_display"],
+        "released_by_id": (
+            str(row["released_by_id"]) if row["released_by_id"] else None
+        ),
+        "released_by_display": row["released_by_display"],
+        "release_reason": row["release_reason"],
+    }
+
+
 def concise_report_lines(summary: dict) -> list[str]:
     """Discord 정산 임베드에 넣을 짧은 한국어 요약."""
     cards = summary["cards"]

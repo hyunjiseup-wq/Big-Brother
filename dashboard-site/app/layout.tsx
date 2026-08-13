@@ -16,6 +16,7 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     title,
     description,
+    robots: { index: false, follow: false },
     openGraph: { title, description, type: "website", images: [{ url: imageUrl, width: 1200, height: 630 }] },
     twitter: { card: "summary_large_image", title, description, images: [imageUrl] },
   };

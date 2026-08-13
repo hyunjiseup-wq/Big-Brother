@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Dashboard } from "./dashboard";
+import { PrivateAccessGate } from "./private-access-gate";
 
 export const metadata: Metadata = {
   title: "BB봇 운영 인사이트",
@@ -14,5 +15,5 @@ export default async function Home({ searchParams }: { searchParams?: Promise<Pa
   for (const [key, value] of Object.entries(values ?? {})) {
     if (typeof value === "string") initialSearch.set(key, value);
   }
-  return <Dashboard initialSearch={initialSearch.toString()} />;
+  return <PrivateAccessGate><Dashboard initialSearch={initialSearch.toString()} /></PrivateAccessGate>;
 }

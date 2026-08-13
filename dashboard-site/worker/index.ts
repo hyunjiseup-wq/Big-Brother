@@ -9,6 +9,7 @@ interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
   KPI_INGEST_TOKEN?: string;
+  STAFF_DASHBOARD_PASSWORD?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -50,6 +51,21 @@ const SCHEMA_STATEMENTS = [
     active_learning_rules INTEGER NOT NULL, ai_retry_queue INTEGER NOT NULL,
     kpi_sync_pending INTEGER NOT NULL, updated_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS sanction_records (
+    event_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, user_display TEXT NOT NULL,
+    action_type TEXT NOT NULL, reason TEXT NOT NULL, source TEXT NOT NULL,
+    status TEXT NOT NULL, issued_at TEXT NOT NULL, issued_ts INTEGER NOT NULL,
+    expires_at TEXT, expires_ts INTEGER, released_at TEXT, released_ts INTEGER,
+    issued_by_id TEXT, issued_by_display TEXT, released_by_id TEXT,
+    released_by_display TEXT, release_reason TEXT, updated_at INTEGER NOT NULL
+  )`,
+  "CREATE INDEX IF NOT EXISTS idx_sanctions_issued_ts ON sanction_records(issued_ts)",
+  "CREATE INDEX IF NOT EXISTS idx_sanctions_status_issued ON sanction_records(status, issued_ts)",
+  "CREATE INDEX IF NOT EXISTS idx_sanctions_user_issued ON sanction_records(user_id, issued_ts)",
+  `CREATE TABLE IF NOT EXISTS staff_login_attempts (
+    fingerprint TEXT PRIMARY KEY, failures INTEGER NOT NULL,
+    locked_until INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  )`,
 ] as const;
 
 let schemaReady = false;
@@ -90,6 +106,175 @@ function list(value: unknown, limit: number): JsonRecord[] {
     : [];
 }
 
+const STAFF_COOKIE = "bb_staff_session";
+const STAFF_SESSION_SECONDS = 8 * 60 * 60;
+const LOGIN_LOCK_SECONDS = 15 * 60;
+const textEncoder = new TextEncoder();
+
+function base64Url(bytes: Uint8Array) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
+async function hmac(secret: string, value: string) {
+  const key = await crypto.subtle.importKey(
+    "raw", textEncoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, textEncoder.encode(value)));
+}
+
+async function safePasswordEqual(left: string, right: string) {
+  const [leftHash, rightHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", textEncoder.encode(left)),
+    crypto.subtle.digest("SHA-256", textEncoder.encode(right)),
+  ]);
+  const a = new Uint8Array(leftHash);
+  const b = new Uint8Array(rightHash);
+  let difference = a.length ^ b.length;
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
+  }
+  return difference === 0;
+}
+
+async function createStaffSession(secret: string) {
+  const payload = base64Url(textEncoder.encode(JSON.stringify({
+    exp: Math.floor(Date.now() / 1000) + STAFF_SESSION_SECONDS,
+  })));
+  return `${payload}.${base64Url(await hmac(secret, `session:${payload}`))}`;
+}
+
+async function validStaffSession(request: Request, secret: string) {
+  const cookie = request.headers.get("cookie") ?? "";
+  const raw = cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${STAFF_COOKIE}=`));
+  const token = raw?.slice(STAFF_COOKIE.length + 1) ?? "";
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) return false;
+  const expected = base64Url(await hmac(secret, `session:${payload}`));
+  if (!(await safePasswordEqual(signature, expected))) return false;
+  try {
+    const normalized = payload.replaceAll("-", "+").replaceAll("_", "/");
+    const parsed = JSON.parse(atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "="))) as JsonRecord;
+    return safeCount(parsed.exp) > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
+}
+
+async function staffFingerprint(request: Request, secret: string) {
+  const address = request.headers.get("cf-connecting-ip") ?? "unknown";
+  return base64Url(await hmac(secret, `login:${address}`));
+}
+
+async function staffLogin(request: Request, env: Env) {
+  if (!env.STAFF_DASHBOARD_PASSWORD || env.STAFF_DASHBOARD_PASSWORD.length < 12) {
+    return json({ error: "staff_login_not_configured" }, 503);
+  }
+  await ensureSchema(env.DB);
+  const fingerprint = await staffFingerprint(request, env.STAFF_DASHBOARD_PASSWORD);
+  const now = Date.now();
+  const attempt = await env.DB.prepare(
+    "SELECT failures, locked_until FROM staff_login_attempts WHERE fingerprint = ?",
+  ).bind(fingerprint).first<JsonRecord>();
+  if (safeCount(attempt?.locked_until) > now) {
+    return json({ error: "temporarily_locked", retry_after_seconds: Math.ceil((safeCount(attempt?.locked_until) - now) / 1000) }, 429);
+  }
+
+  let body: JsonRecord;
+  try {
+    body = (await request.json()) as JsonRecord;
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  const password = safeString(body.password, 256);
+  if (!password || !(await safePasswordEqual(password, env.STAFF_DASHBOARD_PASSWORD))) {
+    const failures = safeCount(attempt?.failures) + 1;
+    const lockedUntil = failures >= 5 ? now + LOGIN_LOCK_SECONDS * 1000 : 0;
+    await env.DB.prepare(
+      `INSERT INTO staff_login_attempts (fingerprint, failures, locked_until, updated_at)
+       VALUES (?, ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET
+       failures=excluded.failures, locked_until=excluded.locked_until, updated_at=excluded.updated_at`,
+    ).bind(fingerprint, failures, lockedUntil, now).run();
+    return json({ error: failures >= 5 ? "temporarily_locked" : "invalid_password", attempts_remaining: Math.max(0, 5 - failures) }, failures >= 5 ? 429 : 401);
+  }
+
+  await env.DB.prepare("DELETE FROM staff_login_attempts WHERE fingerprint = ?").bind(fingerprint).run();
+  const session = await createStaffSession(env.STAFF_DASHBOARD_PASSWORD);
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "set-cookie": `${STAFF_COOKIE}=${session}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${STAFF_SESSION_SECONDS}`,
+    },
+  });
+}
+
+function staffLogout() {
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "set-cookie": `${STAFF_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
+    },
+  });
+}
+
+async function staffSession(request: Request, env: Env) {
+  if (!env.STAFF_DASHBOARD_PASSWORD || env.STAFF_DASHBOARD_PASSWORD.length < 12) {
+    return json({ error: "staff_login_not_configured" }, 503);
+  }
+  if (!(await validStaffSession(request, env.STAFF_DASHBOARD_PASSWORD))) {
+    return json({ error: "authentication_required" }, 401);
+  }
+  return json({ authenticated: true });
+}
+
+async function staffSanctions(request: Request, env: Env) {
+  if (!env.STAFF_DASHBOARD_PASSWORD || env.STAFF_DASHBOARD_PASSWORD.length < 12) {
+    return json({ error: "staff_login_not_configured" }, 503);
+  }
+  if (!(await validStaffSession(request, env.STAFF_DASHBOARD_PASSWORD))) {
+    return json({ error: "authentication_required" }, 401);
+  }
+  await ensureSchema(env.DB);
+  const url = new URL(request.url);
+  const status = safeString(url.searchParams.get("status"), 16);
+  const action = safeString(url.searchParams.get("action"), 16);
+  const query = safeString(url.searchParams.get("q"), 100);
+  const limit = Math.max(1, Math.min(200, safeCount(url.searchParams.get("limit")) || 100));
+  const clauses: string[] = [];
+  const bindings: unknown[] = [];
+  if (["active", "released", "expired"].includes(status)) {
+    clauses.push("status = ?"); bindings.push(status);
+  }
+  if (["WARNING", "DELETE", "TIMEOUT", "KICK", "BAN"].includes(action)) {
+    clauses.push("action_type = ?"); bindings.push(action);
+  }
+  if (query) {
+    clauses.push("(user_display LIKE ? OR user_id LIKE ? OR reason LIKE ?)");
+    const pattern = `%${query}%`;
+    bindings.push(pattern, pattern, pattern);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const results = await env.DB.prepare(
+    `SELECT event_id, user_id, user_display, action_type, reason, source, status,
+            issued_at, expires_at, released_at, issued_by_display,
+            released_by_display, release_reason
+     FROM sanction_records ${where}
+     ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, issued_ts DESC LIMIT ?`,
+  ).bind(...bindings, limit).all();
+  const summary = await env.DB.prepare(
+    `SELECT COUNT(*) total, SUM(status='active') active,
+            SUM(action_type='WARNING') warnings, SUM(action_type='TIMEOUT') timeouts
+     FROM sanction_records`,
+  ).first<JsonRecord>();
+  return json({ records: results.results ?? [], summary: summary ?? {}, limit });
+}
+
 async function ingest(request: Request, env: Env) {
   if (!env.KPI_INGEST_TOKEN) return json({ error: "ingest_not_configured" }, 503);
   const authorization = request.headers.get("authorization") ?? "";
@@ -103,7 +288,9 @@ async function ingest(request: Request, env: Env) {
   } catch {
     return json({ error: "invalid_json" }, 400);
   }
-  if (payload.schema_version !== 1) return json({ error: "unsupported_schema" }, 400);
+  if (![1, 2].includes(Number(payload.schema_version))) {
+    return json({ error: "unsupported_schema" }, 400);
+  }
 
   await ensureSchema(env.DB);
   const now = Date.now();
@@ -178,6 +365,47 @@ async function ingest(request: Request, env: Env) {
       scope, capturedAt, capturedTs, safeCount(state.pending_over_24h),
       safeCount(state.pending_over_72h), safeCount(state.active_learning_rules),
       safeCount(state.ai_retry_queue), safeCount(state.kpi_sync_pending), now,
+    ));
+  }
+
+  for (const sanction of list(payload.sanctions, 250)) {
+    const eventId = safeString(sanction.event_id, 96);
+    const issuedAt = safeString(sanction.issued_at, 64);
+    const issuedTs = timestamp(issuedAt);
+    if (!eventId || !issuedTs) continue;
+    const expiresAt = safeString(sanction.expires_at, 64) || null;
+    const releasedAt = safeString(sanction.released_at, 64) || null;
+    statements.push(env.DB.prepare(
+      `INSERT INTO sanction_records (
+        event_id, user_id, user_display, action_type, reason, source, status,
+        issued_at, issued_ts, expires_at, expires_ts, released_at, released_ts,
+        issued_by_id, issued_by_display, released_by_id, released_by_display,
+        release_reason, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_id) DO UPDATE SET
+        user_id=excluded.user_id, user_display=excluded.user_display,
+        action_type=excluded.action_type, reason=excluded.reason, source=excluded.source,
+        status=excluded.status, issued_at=excluded.issued_at, issued_ts=excluded.issued_ts,
+        expires_at=excluded.expires_at, expires_ts=excluded.expires_ts,
+        released_at=excluded.released_at, released_ts=excluded.released_ts,
+        issued_by_id=excluded.issued_by_id, issued_by_display=excluded.issued_by_display,
+        released_by_id=excluded.released_by_id,
+        released_by_display=excluded.released_by_display,
+        release_reason=excluded.release_reason, updated_at=excluded.updated_at`,
+    ).bind(
+      eventId, safeString(sanction.user_id, 32),
+      safeString(sanction.user_display, 120) || "이름 미확인 사용자",
+      safeString(sanction.action_type, 32) || "UNKNOWN",
+      safeString(sanction.reason, 1000) || "사유 미입력",
+      safeString(sanction.source, 32) || "unknown",
+      safeString(sanction.status, 16) || "active",
+      issuedAt, issuedTs, expiresAt, expiresAt ? timestamp(expiresAt) : null,
+      releasedAt, releasedAt ? timestamp(releasedAt) : null,
+      safeString(sanction.issued_by_id, 32) || null,
+      safeString(sanction.issued_by_display, 120) || null,
+      safeString(sanction.released_by_id, 32) || null,
+      safeString(sanction.released_by_display, 120) || null,
+      safeString(sanction.release_reason, 1000) || null, now,
     ));
   }
 
@@ -424,7 +652,21 @@ const worker = {
     if (url.pathname === "/api/ingest" && request.method === "POST") {
       return ingest(request, env);
     }
+    if (url.pathname === "/api/staff/login" && request.method === "POST") {
+      return staffLogin(request, env);
+    }
+    if (url.pathname === "/api/staff/logout" && request.method === "POST") {
+      return staffLogout();
+    }
+    if (url.pathname === "/api/staff/session" && request.method === "GET") {
+      return staffSession(request, env);
+    }
+    if (url.pathname === "/api/staff/sanctions" && request.method === "GET") {
+      return staffSanctions(request, env);
+    }
     if (url.pathname === "/api/dashboard" && request.method === "GET") {
+      const session = await staffSession(request, env);
+      if (!session.ok) return session;
       return dashboard(request, env);
     }
     if (url.pathname === "/_vinext/image") {

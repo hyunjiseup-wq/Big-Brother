@@ -29,6 +29,21 @@ class KpiPeriodTests(unittest.TestCase):
         self.assertEqual(kpi.categorize_detection("3", "반말과 욕설"), "language_etiquette")
         self.assertEqual(kpi.categorize_detection("4", "상대 조롱과 도발"), "conflict_mockery")
 
+    def test_staff_sanction_event_keeps_identity_but_hides_guild_id(self):
+        row = {
+            "sanction_id": 7, "guild_id": 123456, "user_id": 50,
+            "user_display": "테스트유저", "action_type": "WARNING",
+            "reason": "운영진 수동 경고", "source": "manual_command",
+            "status": "active", "issued_at": 100, "expires_at": None,
+            "released_at": None, "issued_by_id": 99,
+            "issued_by_display": "관리자", "released_by_id": None,
+            "released_by_display": None, "release_reason": None,
+        }
+        event = kpi.build_sync_sanction(row)
+        self.assertEqual(event["user_id"], "50")
+        self.assertEqual(event["reason"], "운영진 수동 경고")
+        self.assertNotIn("123456", event["event_id"])
+
 
 class KpiDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

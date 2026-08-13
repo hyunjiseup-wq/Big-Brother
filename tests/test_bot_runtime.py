@@ -56,6 +56,20 @@ class RuntimeEnvironmentTests(unittest.TestCase):
                 bot.validate_runtime_environment()
 
 
+class TimeoutLedgerSuppressionTests(unittest.TestCase):
+    def tearDown(self):
+        bot._pending_bot_timeout_changes.clear()
+
+    def test_bot_timeout_change_is_consumed_once(self):
+        bot._remember_bot_timeout_change(1, 2, 1000)
+        self.assertTrue(bot._consume_bot_timeout_change(1, 2, 1002))
+        self.assertFalse(bot._consume_bot_timeout_change(1, 2, 1002))
+
+    def test_different_timeout_is_not_suppressed(self):
+        bot._remember_bot_timeout_change(1, 2, 1000)
+        self.assertFalse(bot._consume_bot_timeout_change(1, 2, 1100))
+
+
 class PermissionWarningTests(unittest.TestCase):
     def test_administrator_permission_is_flagged(self):
         permissions = SimpleNamespace(
