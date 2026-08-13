@@ -160,6 +160,35 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history[0]["status"], "expired")
         self.assertEqual(history[0]["released_at"], 200)
 
+    async def test_confirmed_review_and_sanction_are_committed_once_together(self):
+        review_id = await database.log_violation(
+            1, 77, 10, "위반 메시지", "MODERATE", "규정 위반", "검수 대기",
+            review_status="pending", message_id=700,
+        )
+        self.assertTrue(await database.claim_review(review_id, 1))
+        sanction = {
+            "user_id": 77,
+            "user_display": "검수대상",
+            "action_type": "WARNING",
+            "reason": "관리자 확인 규정 위반",
+            "source": "review",
+            "issued_by_display": "관리자",
+            "dedupe_key": f"review:{review_id}:warn",
+        }
+        self.assertTrue(await database.resolve_review(
+            review_id, 1, "confirmed", 99, "경고 기록", sanction=sanction,
+        ))
+        self.assertFalse(await database.resolve_review(
+            review_id, 1, "confirmed", 99, "경고 기록", sanction=sanction,
+        ))
+
+        history = await database.get_sanction_history(1, 77)
+        due = await database.get_due_sanction_sync_records()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["action_type"], "WARNING")
+        self.assertEqual(history[0]["reason"], "관리자 확인 규정 위반")
+        self.assertEqual(due[0]["review_id"], review_id)
+
     async def test_confirmed_review_creates_violation_training_label(self):
         review_id = await database.log_violation(
             1, 9, 10, "harmful message", "SEVERE", "confirmed reason", "review",
