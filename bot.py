@@ -41,6 +41,7 @@ import database
 import cache
 import learning
 import kpi
+import vision
 from filters import FilterResult, extract_discord_invite_urls, fast_check
 import moderator
 import ollama_runtime
@@ -560,7 +561,8 @@ _PROVIDER_LABEL = {"gemini": "Gemini(1차)", "groq": "Groq(2차 폴백)",
 
 
 async def _handle_violation_review_only(message: discord.Message, level: str, reason_text: str,
-                                        rule_violated: str, provider: str, points_to_add: float):
+                                        rule_violated: str, provider: str, points_to_add: float,
+                                        visual_context: dict | None = None):
     """
     수동 검수 모드: 아무 조치도 하지 않고, "자동 모드였다면 어떤 조치가 나갔을지"를
     로그 채널에 올려 관리자가 봇의 판단 정확도를 검증할 수 있게 한다.
@@ -575,7 +577,7 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
 
     review_id = await database.create_review_record(
         message.guild.id, message.author.id, message.channel.id, message.id,
-        message.content, level, reason_text,
+        vision.learning_evidence(message.content, visual_context), level, reason_text,
         f"검수모드(조치 없음, 모의: {action_label})", provider,
         rule_violated=rule_violated, detection_source="realtime",
         channel_name=getattr(message.channel, "name", None),
@@ -605,6 +607,9 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
     embed.add_field(name="자동 모드였다면", value=f"{action_label} (점수 {would_be_points:.1f})", inline=False)
     embed.add_field(name="사유", value=reason_text or "-", inline=False)
     embed.add_field(name="원문", value=(message.content[:500] or "(내용 없음)"), inline=False)
+    visual_summary = vision.display_summary(visual_context)
+    if visual_summary:
+        embed.add_field(name="첨부 이미지 OCR·비전", value=visual_summary, inline=False)
     embed.add_field(name="메시지 바로가기", value=message.jump_url, inline=False)
     view = _build_review_view(message.channel.id, message.id, message.author.id, review_id)
     delivered = await send_log(message.guild, embed, view=view)
@@ -620,7 +625,8 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
 
 
 async def post_batch_review_card(message: discord.Message, level: str, reason_text: str,
-                                 rule_violated: str, provider: str, review_id: int):
+                                 rule_violated: str, provider: str, review_id: int,
+                                 visual_context: dict | None = None):
     """
     배치 감사에서 위반 의심으로 걸린 '과거' 메시지를 제재 로그 채널에 검토 카드로 올린다.
     실시간 검수 카드와 동일한 버튼을 달아, 관리자가 링크로 원문을 확인하고 바로 조치할 수 있게 한다.
@@ -655,6 +661,9 @@ async def post_batch_review_card(message: discord.Message, level: str, reason_te
     embed.add_field(name="자동 모드였다면", value=f"{action_label} (점수 {would_be_points:.1f})", inline=False)
     embed.add_field(name="사유", value=reason_text or "-", inline=False)
     embed.add_field(name="원문", value=(message.content[:500] or "(내용 없음)"), inline=False)
+    visual_summary = vision.display_summary(visual_context)
+    if visual_summary:
+        embed.add_field(name="첨부 이미지 OCR·비전", value=visual_summary, inline=False)
     embed.add_field(name="메시지 바로가기", value=message.jump_url, inline=False)
     view = _build_review_view(message.channel.id, message.id, message.author.id, review_id)
     delivered = await send_log(message.guild, embed, view=view)
@@ -1199,7 +1208,8 @@ async def on_interaction(interaction: discord.Interaction):
 
 
 async def handle_violation(message: discord.Message, level: str, reason_text: str,
-                            rule_violated: str = "-", provider: str = "filter"):
+                            rule_violated: str = "-", provider: str = "filter",
+                            visual_context: dict | None = None):
     """위반으로 판정된 메시지에 대해 점수 부여 + 조치 실행 + 로그를 공통 처리한다."""
     if level == "NONE":
         return
@@ -1212,20 +1222,25 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
     except (discord.Forbidden, discord.HTTPException) as e:
         print(f"[moderation] 제재 전 메시지 재확인 실패로 안전하게 보류: {e}")
         return
-    if latest.content != message.content:
+    if (latest.content != message.content
+            or vision.attachment_fingerprint(latest) != vision.attachment_fingerprint(message)):
         return
     message = latest
 
     # 최신 원문이 현재 채널에 적용되는 오탐 규칙과 일치하면 처리하지 않는다.
-    if await learning.is_known_false_positive(
-            message.guild.id, message.channel, message.content):
+    if (not vision.has_image_attachments(message)
+            and await learning.is_known_false_positive(
+                message.guild.id, message.channel, message.content)):
         return
 
     points_to_add = config.VIOLATION_LEVEL_POINTS.get(level, 0)
 
     # 수동 검수 모드: 감지 결과만 관리자에게 보고하고 여기서 끝낸다 (config.MANUAL_REVIEW_MODE 참고)
     if config.MANUAL_REVIEW_MODE:
-        await _handle_violation_review_only(message, level, reason_text, rule_violated, provider, points_to_add)
+        await _handle_violation_review_only(
+            message, level, reason_text, rule_violated, provider, points_to_add,
+            visual_context=visual_context,
+        )
         return
 
     # [점수 정책] 실제로 집행된 제재만 누적 점수에 반영한다.
@@ -1384,8 +1399,9 @@ async def ai_worker(worker_id: int):
                 continue
             # 관리자가 오탐으로 확정했던 내용과 동일하면 AI 호출 없이 즉시 통과
             # (재오탐 방지 + 무료 API 한도 절약)
-            if await learning.is_known_false_positive(
-                    message.guild.id, message.channel, message.content):
+            if (not vision.has_image_attachments(message)
+                    and await learning.is_known_false_positive(
+                        message.guild.id, message.channel, message.content)):
                 # 큐 대기 중 수정된 메시지가 과거 원문 기준으로 통과하지 않게 재확인한다.
                 try:
                     latest = await message.channel.fetch_message(message.id)
@@ -1416,6 +1432,17 @@ async def ai_worker(worker_id: int):
                 )
             else:
                 conversation_context = burst_context
+            try:
+                visual_context = await vision.analyze_message_attachments(message)
+            except vision.VisionAnalysisUnavailable as error:
+                result = moderator.ModerationResult(
+                    "NONE", "NONE", f"이미지 분석 실패(재검사 보류): {error.category}",
+                    provider="none", failure_category=f"vision:{error.category}",
+                )
+                await _track_ai_outage(message.guild, result)
+                if await _defer_ai_failure(message, result, f"worker-{worker_id}"):
+                    continue
+                continue
             cache_context = channel_note or ""
             if barter_context:
                 # 이전 단일 문장 기준 캐시와 새 대화 증거 기준 캐시를 분리한다.
@@ -1424,6 +1451,10 @@ async def ai_worker(worker_id: int):
                 # 같은 한 줄도 앞뒤 거래 문맥에 따라 정상/위반이 달라질 수 있으므로 캐시를 분리한다.
                 cache_context += "\x00" + json.dumps(
                     conversation_context, ensure_ascii=False, sort_keys=True
+                )
+            if visual_context:
+                cache_context += "\x00vision-v1\x00" + json.dumps(
+                    visual_context, ensure_ascii=False, sort_keys=True
                 )
             cached = cache.get(message.content, context=cache_context)
             if cached is not None:
@@ -1434,6 +1465,7 @@ async def ai_worker(worker_id: int):
                 await handle_violation(
                     message, level, f"(캐시된 판단) {reason_text}",
                     rule_violated=rule_violated, provider=provider,
+                    visual_context=visual_context,
                 )
                 continue
 
@@ -1454,7 +1486,8 @@ async def ai_worker(worker_id: int):
                 result = await classify_message(message.content, channel_note=channel_note,
                                                 fp_examples=fp_examples,
                                                 conversation_context=conversation_context,
-                                                barter_context=barter_context)
+                                                barter_context=barter_context,
+                                                visual_context=visual_context)
             result = moderator.apply_split_utterance_guard(result, split_assessment)
 
             # 판단 실패(provider="none")는 캐시하지 않는다 — 캐시하면 AI가 복구된 뒤에도
@@ -1471,7 +1504,10 @@ async def ai_worker(worker_id: int):
                 await database.delete_moderation_retry_for_message(
                     message.guild.id, message.id
                 )
-            await handle_violation(message, result.level, result.reason, result.rule_violated, provider=result.provider)
+            await handle_violation(
+                message, result.level, result.reason, result.rule_violated,
+                provider=result.provider, visual_context=visual_context,
+            )
         except Exception as e:
             print(f"[worker-{worker_id}] 처리 중 오류: {e}")
         finally:
@@ -1553,8 +1589,9 @@ async def ai_retry_worker():
 
             _processing_keys.add(processing_key)
             try:
-                if await learning.is_known_false_positive(
-                        guild.id, message.channel, message.content):
+                if (not vision.has_image_attachments(message)
+                        and await learning.is_known_false_positive(
+                            guild.id, message.channel, message.content)):
                     await database.delete_moderation_retry(retry_id)
                     continue
 
@@ -1568,12 +1605,25 @@ async def ai_retry_worker():
                     )
                 else:
                     conversation_context = burst_context
+                try:
+                    visual_context = await vision.analyze_message_attachments(message)
+                except vision.VisionAnalysisUnavailable as error:
+                    next_attempt = attempts + 1
+                    await database.reschedule_moderation_retry(
+                        retry_id, next_attempt, f"vision:{error.category}",
+                        _ai_retry_delay(next_attempt),
+                    )
+                    continue
                 cache_context = channel_note or ""
                 if barter_context:
                     cache_context += "\x00barter-conversation-v2"
                 if conversation_context:
                     cache_context += "\x00" + json.dumps(
                         conversation_context, ensure_ascii=False, sort_keys=True
+                    )
+                if visual_context:
+                    cache_context += "\x00vision-v1\x00" + json.dumps(
+                        visual_context, ensure_ascii=False, sort_keys=True
                     )
                 cached = cache.get(message.content, context=cache_context)
                 if cached is not None:
@@ -1582,6 +1632,7 @@ async def ai_retry_worker():
                     await handle_violation(
                         message, level, f"(재검사·캐시된 판단) {reason_text}",
                         rule_violated=rule_violated, provider=provider,
+                        visual_context=visual_context,
                     )
                     continue
 
@@ -1593,6 +1644,7 @@ async def ai_retry_worker():
                         fp_examples=fp_examples,
                         conversation_context=conversation_context,
                         barter_context=barter_context,
+                        visual_context=visual_context,
                     )
                 await _track_ai_outage(guild, result)
                 if result.provider == "none":
@@ -1613,6 +1665,7 @@ async def ai_retry_worker():
                 await handle_violation(
                     message, result.level, f"(장애 복구 후 재판단) {result.reason}",
                     result.rule_violated, provider=result.provider,
+                    visual_context=visual_context,
                 )
             except Exception as error:
                 next_attempt = attempts + 1
@@ -1880,6 +1933,7 @@ async def close():
 
     if _kpi_http_client is not None:
         await _kpi_http_client.aclose()
+    await vision.aclose_http_client()
     await moderator.aclose_http_client()
     await commands.Bot.close(bot)
 
@@ -1951,7 +2005,8 @@ def _is_moderation_target(message: discord.Message) -> bool:
 
 
 def _message_processing_key(message: discord.Message) -> tuple[int, int, str]:
-    return message.guild.id, message.id, message.content
+    attachment_key = json.dumps(vision.attachment_fingerprint(message), ensure_ascii=False)
+    return message.guild.id, message.id, f"{message.content}\x00{attachment_key}"
 
 
 async def _handle_decided(message: discord.Message, result, processing_key):
@@ -2175,6 +2230,7 @@ async def _run_moderation(message: discord.Message):
     _record_split_message(message)
 
     result = await _fast_check_with_invite_context(message)
+    image_needs_ai = vision.has_image_attachments(message)
 
     # 욕설 키워드 한 조각만 보고 즉시 확정하면 "시발" + "점이 어디예요?" 같은 한국어
     # 분할 발화를 오판한다. 초대 링크·도배처럼 문맥과 무관한 확정 규칙은 그대로 유지하고,
@@ -2187,9 +2243,9 @@ async def _run_moderation(message: discord.Message):
         )
     )
 
-    if result.decision == "SKIP" and not keyword_needs_context:
+    if result.decision == "SKIP" and not keyword_needs_context and not image_needs_ai:
         pass  # 정상 메시지, 아무 조치 없음
-    elif result.decision == "DECIDED" and not keyword_needs_context:
+    elif result.decision == "DECIDED" and not keyword_needs_context and not image_needs_ai:
         # 이벤트 핸들러를 막지 않도록 별도 태스크로 처리 (도배 레이드 시 지연 방지)
         _processing_keys.add(processing_key)
         _spawn(_handle_decided(message, result, processing_key))
@@ -2281,14 +2337,9 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     raw 이벤트를 쓰는 이유: 기본 on_message_edit은 봇 캐시에 있는 최근 메시지만 잡는데,
     raw는 오래된 메시지를 수정해도 잡힌다.
     """
-    # 링크 미리보기(임베드) 생성/고정 등 내용이 안 바뀐 수정 이벤트에는 content 키가 없음
-    if "content" not in payload.data:
-        return
-    new_content = payload.data.get("content") or ""
-    if not new_content.strip():
-        return
-    # 캐시에 수정 전 메시지가 있고 내용이 그대로면 검사 불필요
-    if payload.cached_message is not None and payload.cached_message.content == new_content:
+    # 링크 미리보기(임베드) 생성/고정 등 본문·첨부가 안 바뀐 수정 이벤트는 무시한다.
+    # 핵의심 신고는 첨부 교체/삭제도 판단 근거가 달라지는 수정이므로 attachments를 함께 본다.
+    if "content" not in payload.data and "attachments" not in payload.data:
         return
 
     channel = bot.get_channel(payload.channel_id)
@@ -2300,6 +2351,13 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         return
 
     if not _is_moderation_target(message):
+        return
+    if not message.content.strip() and not vision.has_image_attachments(message):
+        return
+    if (payload.cached_message is not None
+            and payload.cached_message.content == message.content
+            and vision.attachment_fingerprint(payload.cached_message)
+            == vision.attachment_fingerprint(message)):
         return
     await _run_moderation(message)
 
@@ -2611,6 +2669,24 @@ def _fallback_chain_status() -> str:
             "받아져 있는지 확인하세요.")
 
 
+def _vision_chain_status() -> str:
+    if not config.VISION_ANALYSIS_ENABLED:
+        return "비활성화"
+    labels = {
+        "ollama": f"Ollama(`{config.OLLAMA_VISION_MODEL}`)",
+        "gemini": f"Gemini(`{config.GEMINI_VISION_MODEL}`)",
+        "groq": f"Groq(`{config.GROQ_VISION_MODEL}`)",
+    }
+    chain = " → ".join(labels[provider] for provider in config.VISION_PROVIDER_ORDER)
+    cooling = [
+        f"{provider} {vision.provider_cooldown_remaining(provider):.0f}초"
+        for provider in config.VISION_PROVIDER_ORDER
+        if vision.provider_cooldown_remaining(provider) > 0
+    ]
+    state = " · 회로 차단: " + ", ".join(cooling) if cooling else " · 최근 장애 없음"
+    return f"{chain}{state}\n대상 채널 {len(config.VISION_CHANNEL_IDS)}개 · 이미지 최대 {config.VISION_MAX_IMAGES}장"
+
+
 @bot.command(name="KPI", aliases=["kpi", "통계"])
 @commands.has_permissions(administrator=True)
 async def show_kpi(ctx, period_name: str = "월"):
@@ -2655,6 +2731,7 @@ async def show_status(ctx):
     embed.add_field(name="대기열", value=f"{gauge} {queued} / {config.MAX_QUEUE_SIZE} ({usage:.0f}%)", inline=True)
     embed.add_field(name="AI 워커 수", value=str(config.MAX_CONCURRENT_AI_CALLS), inline=True)
     embed.add_field(name="판단 폴백 사슬", value=_fallback_chain_status(), inline=False)
+    embed.add_field(name="이미지 OCR·비전 분석", value=_vision_chain_status(), inline=False)
     retry_count = await database.count_moderation_retries(ctx.guild.id)
     embed.add_field(
         name="AI 장애 재검사 대기",

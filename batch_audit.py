@@ -27,6 +27,7 @@ from dotenv import load_dotenv
 import config
 import database
 import learning
+import vision
 from moderator import classify_batch, get_channel_note, is_barter_channel
 
 load_dotenv()
@@ -52,7 +53,7 @@ async def collect_messages(channel: discord.TextChannel, after_message_id):
     messages = []
     truncated = False
     async for msg in channel.history(after=after, limit=None, oldest_first=True):
-        if msg.author.bot or not msg.content.strip():
+        if msg.author.bot or (not msg.content.strip() and not vision.has_image_attachments(msg)):
             continue
         messages.append(msg)
         if len(messages) >= config.BATCH_MAX_MESSAGES_PER_CHANNEL:
@@ -139,7 +140,8 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
     for batch in _chunk(messages, config.BATCH_SIZE):
         # 확정 오탐은 AI에 보내지 않아 재오탐과 API 비용을 함께 줄인다.
         known_false_positives = [
-            await learning.is_known_false_positive(channel.guild.id, channel, m.content)
+            (False if vision.has_image_attachments(m) else
+             await learning.is_known_false_positive(channel.guild.id, channel, m.content))
             for m in batch
         ]
         if all(known_false_positives):
@@ -164,15 +166,23 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
                     author_id, f"user_{len(author_refs) + 1}"
                 )
                 context_turns.append({"speaker": author_ref, "content": content})
-        payload = [
-            {
-                "index": i,
-                "author_ref": author_refs.setdefault(m.author.id, f"user_{len(author_refs) + 1}"),
-                "content": m.content,
-            }
-            for i, m in enumerate(candidates)
-        ]
         try:
+            visual_contexts = [
+                await vision.analyze_message_attachments(message)
+                for message in candidates
+            ]
+            payload = [
+                {
+                    "index": i,
+                    "author_ref": author_refs.setdefault(
+                        m.author.id, f"user_{len(author_refs) + 1}"
+                    ),
+                    "content": m.content,
+                    **({"visual_context": visual_context}
+                       if visual_context is not None else {}),
+                }
+                for i, (m, visual_context) in enumerate(zip(candidates, visual_contexts))
+            ]
             results = await classify_batch(payload, backend=backend,
                                            channel_note=channel_note, fp_examples=fp_examples,
                                            barter_context=barter_mode,
@@ -182,7 +192,8 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
             print(f"[batch_audit] #{channel.name} 배치 판단 실패, 체크포인트 보류: {failure}")
             break
 
-        for r, m, known in zip(results, candidates, candidate_known_flags):
+        for r, m, known, visual_context in zip(
+                results, candidates, candidate_known_flags, visual_contexts):
             if known or r.level == "NONE":
                 continue
             flagged.append({
@@ -191,6 +202,7 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
                 "rule_violated": r.rule_violated,
                 "reason": r.reason,
                 "provider": r.provider,
+                "visual_context": visual_context,
             })
         processed_messages.extend(batch)
 
@@ -387,7 +399,8 @@ async def _post_review_cards(audit_results: list, on_flagged):
         try:
             review_id = await database.create_review_record(
                 message.guild.id, message.author.id, message.channel.id, message.id,
-                message.content, f["level"], f["reason"],
+                vision.learning_evidence(message.content, f.get("visual_context")),
+                f["level"], f["reason"],
                 "배치 감사 검토 대기" if will_post else "배치 감사 검토 대기 (카드 상한 초과로 미게시)",
                 f["provider"], card_delivered=will_post,
                 rule_violated=f["rule_violated"], detection_source="batch",
@@ -408,7 +421,7 @@ async def _post_review_cards(audit_results: list, on_flagged):
             continue
         try:
             await on_flagged(message, f["level"], f["reason"], f["rule_violated"],
-                             f["provider"], review_id)
+                             f["provider"], review_id, f.get("visual_context"))
             posted += 1
         except Exception as e:
             print(f"[batch_audit] 검토 카드 전송 실패: {e}")

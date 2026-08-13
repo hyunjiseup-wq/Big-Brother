@@ -251,6 +251,9 @@ STRIKE_DECAY_RATIO = 0.5
 # 사용할 모델 (1차: Gemini, 2차 폴백: Groq)
 GEMINI_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "openai/gpt-oss-120b"
+# 핵의심 신고 이미지 OCR·비전 분석용 멀티모달 모델.
+GEMINI_VISION_MODEL = "gemini-2.5-flash"
+GROQ_VISION_MODEL = "qwen/qwen3.6-27b"
 
 # ── 킥/밴 자동 실행 제한 (커뮤니티 정책: 경고 2회 이후 제재는 운영진이 최종 결정) ──
 # 실제 서버 정책상 킥/밴처럼 되돌리기 힘든 조치는 운영진 확인 후 결정되어야 하므로,
@@ -502,6 +505,31 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 # 한국어 뉘앙스 판단이 중요하므로 한국어 성능이 검증된 모델 권장.
 # VRAM 여유가 있으면 더 큰 모델로, 부족하면 작은 모델로 바꾸세요.
 OLLAMA_MODEL = "qwen3:14b"
+# 이미지 OCR은 일반 Qwen3 텍스트 모델이 처리할 수 없어 별도 VL 모델을 사용한다.
+# `ollama pull qwen3-vl:4b`로 한 번 내려받으면 클라우드 무료 한도와 무관하게 동작한다.
+OLLAMA_VISION_MODEL = "qwen3-vl:4b"
+
+# ── 핵의심 신고 이미지 OCR·비전 분석 ───────────────────────────────
+# 지정 채널의 PNG/JPEG/WebP 첨부만 읽는다. 이미지의 핵 사용 여부를 자동 확정하지 않고,
+# 보이는 텍스트·닉네임·레이드 서버·맵·관찰사항을 추출해 기존 규칙 판단의 참고자료로 제공한다.
+VISION_ANALYSIS_ENABLED = True
+VISION_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
+    "VISION_CHANNEL_IDS", "1445049743150415923"
+))
+VISION_CHANNEL_NAMES = tuple(
+    name.strip() for name in os.environ.get(
+        "VISION_CHANNEL_NAMES", "핵의심신고,핵의심 신고"
+    ).split(",") if name.strip()
+)
+VISION_PROVIDER_ORDER = _parse_provider_order(
+    os.environ.get("VISION_PROVIDER_ORDER", "ollama,gemini,groq")
+)
+VISION_MAX_IMAGES = 3
+VISION_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# Base64 변환 시 약 4/3로 커지므로 공식 API의 20MB 요청 상한보다 충분히 낮게 둔다.
+VISION_MAX_TOTAL_BYTES = 10 * 1024 * 1024
+VISION_TIMEOUT_SECONDS = 45
+VISION_UNAVAILABLE_COOLDOWN_SECONDS = 300
 
 # ══════════════════════════════════════════════════════════════════
 # 실시간 판단의 호출 한도 없는 로컬 판단망: Ollama
@@ -588,6 +616,37 @@ def validate_config() -> None:
         errors.append(
             "REALTIME_PROVIDER_ORDER는 gemini/groq/ollama를 중복 없이 하나 이상 지정해야 합니다."
         )
+    if not isinstance(VISION_ANALYSIS_ENABLED, bool):
+        errors.append("VISION_ANALYSIS_ENABLED는 True 또는 False여야 합니다.")
+    if (not VISION_PROVIDER_ORDER
+            or len(set(VISION_PROVIDER_ORDER)) != len(VISION_PROVIDER_ORDER)
+            or any(provider not in valid_realtime_providers
+                   for provider in VISION_PROVIDER_ORDER)):
+        errors.append(
+            "VISION_PROVIDER_ORDER는 gemini/groq/ollama를 중복 없이 하나 이상 지정해야 합니다."
+        )
+    if any(isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0
+           for channel_id in VISION_CHANNEL_IDS):
+        errors.append("VISION_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다.")
+    if len(VISION_CHANNEL_IDS) != len(set(VISION_CHANNEL_IDS)):
+        errors.append("VISION_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(not isinstance(name, str) or not name.strip() for name in VISION_CHANNEL_NAMES):
+        errors.append("VISION_CHANNEL_NAMES에는 비어 있지 않은 채널 이름만 사용할 수 있습니다.")
+    for name, value in (
+        ("VISION_MAX_IMAGES", VISION_MAX_IMAGES),
+        ("VISION_MAX_IMAGE_BYTES", VISION_MAX_IMAGE_BYTES),
+        ("VISION_MAX_TOTAL_BYTES", VISION_MAX_TOTAL_BYTES),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{name}는 1 이상의 정수여야 합니다.")
+    if VISION_MAX_TOTAL_BYTES < VISION_MAX_IMAGE_BYTES:
+        errors.append("VISION_MAX_TOTAL_BYTES는 개별 이미지 크기 제한 이상이어야 합니다.")
+    for name, value in (
+        ("VISION_TIMEOUT_SECONDS", VISION_TIMEOUT_SECONDS),
+        ("VISION_UNAVAILABLE_COOLDOWN_SECONDS", VISION_UNAVAILABLE_COOLDOWN_SECONDS),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"{name}는 0보다 큰 숫자여야 합니다.")
     if DROP_ALERT_THRESHOLD <= 0 or DROP_ALERT_COOLDOWN_MINUTES <= 0:
         errors.append("DROP_ALERT_THRESHOLD와 DROP_ALERT_COOLDOWN_MINUTES는 1 이상이어야 합니다.")
     if not isinstance(AI_RETRY_ENABLED, bool):
@@ -684,7 +743,10 @@ def validate_config() -> None:
             or OLLAMA_STARTUP_TIMEOUT_SECONDS <= 0):
         errors.append("OLLAMA_STARTUP_TIMEOUT_SECONDS는 0보다 커야 합니다.")
     if not all(isinstance(model, str) and model.strip()
-               for model in (GEMINI_MODEL, GROQ_MODEL, OLLAMA_MODEL)):
+               for model in (
+                   GEMINI_MODEL, GROQ_MODEL, OLLAMA_MODEL,
+                   GEMINI_VISION_MODEL, GROQ_VISION_MODEL, OLLAMA_VISION_MODEL,
+               )):
         errors.append("AI 모델 이름은 비어 있지 않은 문자열이어야 합니다.")
     if not 0 <= BATCH_RUN_HOUR_KST <= 23:
         errors.append("BATCH_RUN_HOUR_KST는 0~23이어야 합니다.")

@@ -56,6 +56,71 @@ class RuntimeEnvironmentTests(unittest.TestCase):
                 bot.validate_runtime_environment()
 
 
+class VisionQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_image_only_report_is_queued_for_ai(self):
+        queue = asyncio.Queue()
+        channel = SimpleNamespace(
+            id=1445049743150415923, parent_id=None, parent=None, name="핵의심-신고",
+        )
+        message = SimpleNamespace(
+            id=777,
+            content="",
+            attachments=[SimpleNamespace(
+                id=10, filename="overall.png", content_type="image/png", size=123,
+            )],
+            guild=SimpleNamespace(id=1),
+            channel=channel,
+            author=SimpleNamespace(id=20),
+        )
+        bot._processing_keys.clear()
+        with (
+            patch.object(bot, "_message_queue", queue),
+            patch.object(bot, "_record_split_message"),
+            patch.object(
+                bot, "_fast_check_with_invite_context",
+                new=AsyncMock(return_value=bot.FilterResult("SKIP")),
+            ),
+        ):
+            await bot._run_moderation(message)
+
+        queued_message, _queued_at, processing_key, _settle = queue.get_nowait()
+        self.assertIs(queued_message, message)
+        self.assertIn(processing_key, bot._processing_keys)
+        bot._processing_keys.clear()
+
+    async def test_attachment_only_edit_rechecks_image_report(self):
+        channel = SimpleNamespace(id=1445049743150415923)
+        message = SimpleNamespace(
+            id=777,
+            content="",
+            attachments=[SimpleNamespace(
+                id=11, filename="new-overall.png", content_type="image/png", size=123,
+            )],
+            guild=SimpleNamespace(id=1),
+            channel=SimpleNamespace(
+                id=1445049743150415923, parent_id=None, parent=None,
+                name="핵의심-신고", fetch_message=AsyncMock(),
+            ),
+            author=SimpleNamespace(
+                id=20, bot=False,
+                guild_permissions=SimpleNamespace(administrator=False),
+            ),
+        )
+        channel.fetch_message = AsyncMock(return_value=message)
+        payload = SimpleNamespace(
+            data={"attachments": [{"id": "11"}]},
+            cached_message=None,
+            channel_id=channel.id,
+            message_id=message.id,
+        )
+        with (
+            patch.object(bot.bot, "get_channel", return_value=channel),
+            patch.object(bot, "_run_moderation", new=AsyncMock()) as run,
+        ):
+            await bot.on_raw_message_edit(payload)
+        run.assert_awaited_once_with(message)
+
+
 class TimeoutLedgerSuppressionTests(unittest.TestCase):
     def tearDown(self):
         bot._pending_bot_timeout_changes.clear()

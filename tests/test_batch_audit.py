@@ -19,6 +19,69 @@ def _message(message_id: int):
 
 
 class BatchAuditCheckpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_collect_messages_keeps_image_only_report(self):
+        channel = SimpleNamespace(
+            id=1445049743150415923,
+            name="핵의심-신고",
+            parent=None,
+            parent_id=None,
+        )
+        message = SimpleNamespace(
+            id=1,
+            content="",
+            channel=channel,
+            attachments=[SimpleNamespace(
+                id=5, filename="overall.png", content_type="image/png", size=100,
+            )],
+            author=SimpleNamespace(bot=False),
+        )
+
+        async def history(**_kwargs):
+            yield message
+
+        channel.history = history
+        collected = await batch_audit.collect_messages(channel, None)
+        self.assertEqual(collected, [message])
+
+    async def test_image_only_report_is_analyzed_and_included_in_batch(self):
+        channel = SimpleNamespace(
+            id=1445049743150415923, name="핵의심-신고", guild=SimpleNamespace(id=1),
+            parent=None, parent_id=None,
+        )
+        attachment = SimpleNamespace(
+            id=5, filename="overall.png", content_type="image/png", size=100,
+        )
+        message = SimpleNamespace(
+            id=1, content="", channel=channel, attachments=[attachment],
+            author=SimpleNamespace(id=101, bot=False),
+            created_at=datetime.datetime.now(datetime.UTC),
+        )
+        classifier = AsyncMock(return_value=[
+            ModerationResult("NONE", "NONE", "정상 신고", "ollama")
+        ])
+        visual = {"status": "analyzed", "image_kind": "overall"}
+        with (
+            patch.object(batch_audit.database, "get_checkpoint", new=AsyncMock(return_value=None)),
+            patch.object(batch_audit, "collect_messages", new=AsyncMock(return_value=[message])),
+            patch.object(batch_audit, "get_channel_note", return_value="핵 의심 신고 채널"),
+            patch.object(batch_audit.learning, "get_prompt_examples", new=AsyncMock(return_value=None)),
+            patch.object(batch_audit.learning, "is_known_false_positive", new=AsyncMock()) as known,
+            patch.object(
+                batch_audit.vision, "analyze_message_attachments",
+                new=AsyncMock(return_value=visual),
+            ),
+            patch.object(batch_audit, "classify_batch", new=classifier),
+            patch.object(batch_audit.database, "set_checkpoint", new=AsyncMock()) as checkpoint,
+        ):
+            result = await batch_audit.audit_channel(channel, "ollama")
+
+        known.assert_not_awaited()
+        payload = classifier.await_args.args[0]
+        self.assertEqual(payload[0]["content"], "")
+        self.assertEqual(payload[0]["visual_context"], visual)
+        self.assertEqual(result["reviewed_count"], 1)
+        checkpoint.assert_awaited_once_with(1, channel.id, 1)
+
     async def test_total_failure_does_not_advance_checkpoint(self):
         channel = SimpleNamespace(id=10, name="test", guild=SimpleNamespace(id=1))
         messages = [_message(1), _message(2)]

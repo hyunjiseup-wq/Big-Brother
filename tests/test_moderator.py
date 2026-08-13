@@ -98,6 +98,35 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("신고에 필요한 게임 내 정보", prompt)
         self.assertIn("다른 Discord 서버 초대나 현실 위치 공개가 아니며", prompt)
 
+    def test_visual_context_is_evidence_not_cheat_conviction(self):
+        prompt = moderator._user_prompt(
+            "닉네임 suspect 신고합니다",
+            "핵 의심 신고 채널",
+            visual_context={
+                "ocr_text": "K/D 30.0",
+                "game_nicknames": ["suspect"],
+                "image_kind": "overall",
+                "observations": ["높은 K/D가 표시됨"],
+            },
+        )
+        self.assertIn("핵 사용의 확정 증거가 아니며", prompt)
+        self.assertIn("한 장의 화면만으로 핵 사용을 단정하지 마세요", prompt)
+        self.assertIn('"game_nicknames": ["suspect"]', prompt)
+
+    async def test_image_only_message_can_be_classified_with_visual_context(self):
+        expected = moderator.ModerationResult("NONE", "NONE", "정상 신고", "ollama")
+        visual_context = {"status": "analyzed", "image_kind": "overall"}
+        with (
+            patch.object(moderator, "REALTIME_PROVIDER_ORDER", ("ollama",)),
+            patch.object(moderator, "_ollama_available", return_value=True),
+            patch.object(
+                moderator, "_classify_with_ollama", new=AsyncMock(return_value=expected)
+            ) as classify,
+        ):
+            result = await moderator.classify_message("", visual_context=visual_context)
+        self.assertIs(result, expected)
+        self.assertEqual(classify.await_args.args[-1], visual_context)
+
     def test_invalid_level_is_not_silently_cached_as_none(self):
         with self.assertRaisesRegex(ValueError, "알 수 없는 위반 등급"):
             moderator._build_result(

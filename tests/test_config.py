@@ -99,6 +99,31 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("신고 양식 일부가 빠졌더라도", report_note)
         self.assertIn("양식 보완은 관리자 안내 대상", report_note)
 
+    def test_suspicious_player_report_vision_defaults_are_safe(self):
+        self.assertTrue(config.VISION_ANALYSIS_ENABLED)
+        self.assertIn(1445049743150415923, config.VISION_CHANNEL_IDS)
+        self.assertEqual(config.VISION_PROVIDER_ORDER, ("ollama", "gemini", "groq"))
+        self.assertEqual(config.OLLAMA_VISION_MODEL, "qwen3-vl:4b")
+        self.assertLessEqual(config.VISION_MAX_TOTAL_BYTES, 10 * 1024 * 1024)
+        self.assertLessEqual(config.VISION_MAX_IMAGES, 3)
+
+    def test_invalid_vision_settings_are_rejected(self):
+        cases = (
+            ("VISION_ANALYSIS_ENABLED", "true"),
+            ("VISION_PROVIDER_ORDER", ("ollama", "ollama")),
+            ("VISION_CHANNEL_IDS", [123, "bad"]),
+            ("VISION_CHANNEL_NAMES", (123,)),
+            ("VISION_MAX_IMAGES", 0),
+            ("VISION_MAX_IMAGE_BYTES", 0),
+            ("VISION_MAX_TOTAL_BYTES", 0),
+            ("VISION_TIMEOUT_SECONDS", 0),
+            ("VISION_UNAVAILABLE_COOLDOWN_SECONDS", 0),
+        )
+        for name, value in cases:
+            with self.subTest(name=name), patch.object(config, name, value):
+                with self.assertRaisesRegex(ValueError, name):
+                    config.validate_config()
+
     def test_invalid_barter_context_settings_are_rejected(self):
         for name, value in (
             ("BARTER_CHANNEL_IDS", [123, "bad"]),
