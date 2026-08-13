@@ -19,6 +19,82 @@ def _message(message_id: int):
 
 
 class BatchAuditCheckpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_parent_is_attached_to_batch_item_context(self):
+        parent = SimpleNamespace(
+            id=10, content="계좌로 보내라는 뜻인가요?", author=SimpleNamespace(id=500)
+        )
+        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=parent))
+        reply = SimpleNamespace(
+            id=11, channel=channel,
+            reference=SimpleNamespace(message_id=10, resolved=None),
+        )
+        resolved = await batch_audit._batch_reply_parent(reply, {})
+        self.assertEqual(resolved, (parent, parent.content))
+        channel.fetch_message.assert_awaited_once_with(10)
+
+    async def test_collect_messages_keeps_image_only_report(self):
+        channel = SimpleNamespace(
+            id=1445049743150415923,
+            name="핵의심-신고",
+            parent=None,
+            parent_id=None,
+        )
+        message = SimpleNamespace(
+            id=1,
+            content="",
+            channel=channel,
+            attachments=[SimpleNamespace(
+                id=5, filename="overall.png", content_type="image/png", size=100,
+            )],
+            author=SimpleNamespace(bot=False),
+        )
+
+        async def history(**_kwargs):
+            yield message
+
+        channel.history = history
+        collected = await batch_audit.collect_messages(channel, None)
+        self.assertEqual(collected, [message])
+
+    async def test_image_only_report_is_analyzed_and_included_in_batch(self):
+        channel = SimpleNamespace(
+            id=1445049743150415923, name="핵의심-신고", guild=SimpleNamespace(id=1),
+            parent=None, parent_id=None,
+        )
+        attachment = SimpleNamespace(
+            id=5, filename="overall.png", content_type="image/png", size=100,
+        )
+        message = SimpleNamespace(
+            id=1, content="", channel=channel, attachments=[attachment],
+            author=SimpleNamespace(id=101, bot=False),
+            created_at=datetime.datetime.now(datetime.UTC),
+        )
+        classifier = AsyncMock(return_value=[
+            ModerationResult("NONE", "NONE", "정상 신고", "ollama")
+        ])
+        visual = {"status": "analyzed", "image_kind": "overall"}
+        with (
+            patch.object(batch_audit.database, "get_checkpoint", new=AsyncMock(return_value=None)),
+            patch.object(batch_audit, "collect_messages", new=AsyncMock(return_value=[message])),
+            patch.object(batch_audit, "get_channel_note", return_value="핵 의심 신고 채널"),
+            patch.object(batch_audit.learning, "get_prompt_examples", new=AsyncMock(return_value=None)),
+            patch.object(batch_audit.learning, "is_known_false_positive", new=AsyncMock()) as known,
+            patch.object(
+                batch_audit.vision, "analyze_message_attachments",
+                new=AsyncMock(return_value=visual),
+            ),
+            patch.object(batch_audit, "classify_batch", new=classifier),
+            patch.object(batch_audit.database, "set_checkpoint", new=AsyncMock()) as checkpoint,
+        ):
+            result = await batch_audit.audit_channel(channel, "ollama")
+
+        known.assert_not_awaited()
+        payload = classifier.await_args.args[0]
+        self.assertEqual(payload[0]["content"], "")
+        self.assertEqual(payload[0]["visual_context"], visual)
+        self.assertEqual(result["reviewed_count"], 1)
+        checkpoint.assert_awaited_once_with(1, channel.id, 1)
+
     async def test_total_failure_does_not_advance_checkpoint(self):
         channel = SimpleNamespace(id=10, name="test", guild=SimpleNamespace(id=1))
         messages = [_message(1), _message(2)]
@@ -82,6 +158,86 @@ class BatchAuditCheckpointTests(unittest.IsolatedAsyncioTestCase):
         classifier.assert_not_awaited()
         checkpoint.assert_awaited_once_with(1, 10, 2)
         self.assertEqual(result["reviewed_count"], 2)
+
+    async def test_barter_context_crosses_batch_and_checkpoint_boundaries(self):
+        messages = [_message(1), _message(2)]
+
+        async def history(*, before, **kwargs):
+            if before.id == 2:
+                yield messages[0]
+
+        channel = SimpleNamespace(
+            id=10, name="물물교환", guild=SimpleNamespace(id=1),
+            parent=None, history=history,
+        )
+        classifier = AsyncMock(side_effect=[
+            [ModerationResult("NONE", "NONE", "", "ollama")],
+            [ModerationResult("NONE", "NONE", "", "ollama")],
+        ])
+        with (
+            patch.object(batch_audit.config, "BARTER_CHANNEL_IDS", [10]),
+            patch.object(batch_audit.config, "BATCH_SIZE", 1),
+            patch.object(batch_audit.database, "get_checkpoint", new=AsyncMock(return_value=None)),
+            patch.object(batch_audit, "collect_messages", new=AsyncMock(return_value=messages)),
+            patch.object(batch_audit, "get_channel_note", return_value="물물교환 특수 규칙"),
+            patch.object(batch_audit.learning, "get_prompt_examples", new=AsyncMock(return_value=None)),
+            patch.object(batch_audit.learning, "is_known_false_positive", new=AsyncMock(return_value=False)),
+            patch.object(batch_audit, "classify_batch", new=classifier),
+            patch.object(batch_audit.database, "set_checkpoint", new=AsyncMock()),
+        ):
+            result = await batch_audit.audit_channel(channel, "ollama")
+
+        self.assertEqual(result["reviewed_count"], 2)
+        second_kwargs = classifier.await_args_list[1].kwargs
+        self.assertTrue(second_kwargs["barter_context"])
+        self.assertEqual(
+            second_kwargs["conversation_context"][0]["content"], messages[0].content
+        )
+
+
+class BatchAuditTargetExpansionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expands_forum_into_active_and_recent_archived_threads(self):
+        active = SimpleNamespace(id=11, name="active", history=object())
+        recent = SimpleNamespace(
+            id=12,
+            name="recent",
+            history=object(),
+            archive_timestamp=datetime.datetime.now(datetime.UTC),
+        )
+        old = SimpleNamespace(
+            id=13,
+            name="old",
+            history=object(),
+            archive_timestamp=datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=30),
+        )
+
+        async def archived_threads(*, limit):
+            self.assertIsNone(limit)
+            yield recent
+            yield old
+
+        forum = SimpleNamespace(
+            id=10,
+            name="물물교환",
+            threads=[active],
+            archived_threads=archived_threads,
+        )
+        guild = SimpleNamespace(get_channel=lambda channel_id: forum if channel_id == 10 else None)
+        with (
+            patch.object(batch_audit.config, "WATCHED_CHANNEL_IDS", [10]),
+            patch.object(batch_audit.config, "BATCH_FIRST_RUN_LOOKBACK_DAYS", 7),
+        ):
+            targets = await batch_audit._expand_audit_targets(guild)
+
+        self.assertEqual([target.id for target in targets], [11, 12])
+
+    async def test_keeps_normal_text_channel_and_deduplicates_targets(self):
+        channel = SimpleNamespace(id=20, name="자유", history=object())
+        guild = SimpleNamespace(get_channel=lambda channel_id: channel)
+        with patch.object(batch_audit.config, "WATCHED_CHANNEL_IDS", [20, 20]):
+            targets = await batch_audit._expand_audit_targets(guild)
+
+        self.assertEqual(targets, [channel])
 
 
 class ReportRetentionTests(unittest.TestCase):

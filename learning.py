@@ -41,6 +41,18 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(_normalize(content).encode("utf-8")).hexdigest()
 
 
+def _requires_contextual_judgment(content: str) -> bool:
+    """짧은 동의·연락 조각이나 금칙어 포함 문장은 과거 정상 사례만으로 자동 통과시키지 않는다."""
+    normalized = _normalize(content)
+    if len(normalized) < config.MIN_LENGTH_FOR_AI_CHECK:
+        return True
+    for word in (*config.BANNED_WORDS_SEVERE, *config.BANNED_WORDS_MODERATE):
+        normalized_word = _normalize(word)
+        if normalized_word and normalized_word in normalized:
+            return True
+    return False
+
+
 def _safe_prompt_snippet(content: str) -> str:
     """프롬프트 예시는 비신뢰 데이터로 축약하고 멘션/URL/제어문자를 제거한다."""
     text = unicodedata.normalize("NFKC", content)
@@ -49,6 +61,19 @@ def _safe_prompt_snippet(content: str) -> str:
     text = _MENTION_PATTERN.sub("[MENTION]", text)
     text = _URL_PATTERN.sub("[URL]", text)
     return " ".join(text.split())[:config.FALSE_POSITIVE_EXAMPLE_MAX_CHARS]
+
+
+def _safe_learning_explanation(explanation: str | None) -> str | None:
+    """관리자 설명도 프롬프트 명령이 아닌 제한된 비신뢰 데이터로 정제한다."""
+    if not explanation:
+        return None
+    text = unicodedata.normalize("NFKC", explanation)
+    text = _ZERO_WIDTH_PATTERN.sub("", text)
+    text = _CONTROL_PATTERN.sub(" ", text)
+    text = _MENTION_PATTERN.sub("[MENTION]", text)
+    text = _URL_PATTERN.sub("[URL]", text)
+    cleaned = " ".join(text.split())[:config.LEARNING_EXPLANATION_MAX_CHARS]
+    return cleaned or None
 
 
 async def initialize() -> int:
@@ -92,6 +117,10 @@ async def _ensure_loaded():
 async def is_known_false_positive(guild_id: int, channel_or_id, content: str) -> bool:
     if not content or not _normalize(content):
         return False
+    # "시발"+"점"이나 물물교환의 "네"처럼 문맥에 따라 의미가 바뀌는 짧은 조각은
+    # 과거 한 번 정상 처리됐더라도 단독 해시만 보고 영구 통과시키지 않는다.
+    if _requires_contextual_judgment(content):
+        return False
     await _ensure_loaded()
     scope_id = channel_scope_id(channel_or_id)
     h = content_hash(content)
@@ -101,7 +130,8 @@ async def is_known_false_positive(guild_id: int, channel_or_id, content: str) ->
 
 async def record_false_positive(guild_id: int, channel_or_id, content: str,
                                 wrong_level: str, wrong_reason: str,
-                                marked_by: int, *, server_wide: bool = False) -> int | None:
+                                marked_by: int, *, server_wide: bool = False,
+                                learning_explanation: str | None = None) -> int | None:
     if not content or not _normalize(content):
         return None
     await _ensure_loaded()
@@ -110,7 +140,7 @@ async def record_false_positive(guild_id: int, channel_or_id, content: str,
     h = content_hash(content)
     rule_id = await database.upsert_false_positive_rule(
         guild_id, scope_id, h, _safe_prompt_snippet(content), wrong_level, wrong_reason,
-        source_channel_id, marked_by,
+        source_channel_id, marked_by, _safe_learning_explanation(learning_explanation),
     )
     _hashes.add((guild_id, scope_id, h))
     _examples_cache.clear()
@@ -119,7 +149,8 @@ async def record_false_positive(guild_id: int, channel_or_id, content: str,
 
 async def record_review_false_positive(review_id: int, guild_id: int, channel_or_id,
                                        marked_by: int, action_taken: str,
-                                       *, server_wide: bool = False):
+                                       *, server_wide: bool = False,
+                                       learning_explanation: str | None = None):
     """검수 상태 변경과 학습 규칙 저장을 원자적으로 완료한다."""
     await _ensure_loaded()
     scope_id = 0 if server_wide else channel_scope_id(channel_or_id)
@@ -131,7 +162,7 @@ async def record_review_false_positive(review_id: int, guild_id: int, channel_or
     h = content_hash(content)
     result = await database.resolve_review_as_false_positive(
         review_id, guild_id, scope_id, h, _safe_prompt_snippet(content),
-        marked_by, action_taken,
+        marked_by, action_taken, _safe_learning_explanation(learning_explanation),
     )
     if result:
         _hashes.add((guild_id, scope_id, h))
@@ -159,9 +190,12 @@ async def get_prompt_examples(guild_id: int, channel_or_id) -> list[dict] | None
             "scope": "server" if row_scope == 0 else "channel",
             "content": _safe_prompt_snippet(content),
             "previous_level": wrong_level or "UNKNOWN",
+            **({"administrator_explanation": explanation}
+               if explanation else {}),
         }
-        for _, row_scope, content, wrong_level, _ in rows
-        if _safe_prompt_snippet(content)
+        for _, row_scope, content, wrong_level, _, explanation in rows
+        if (_safe_prompt_snippet(content)
+            and (explanation or not _requires_contextual_judgment(content)))
     ] or None
     _examples_cache[key] = (now + config.FALSE_POSITIVE_REFRESH_SECONDS, examples)
     return examples

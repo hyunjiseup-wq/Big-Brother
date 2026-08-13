@@ -62,7 +62,7 @@ async def _check_groq_model(client: httpx.AsyncClient, api_key: str, model: str)
 
 async def _check_ollama(client: httpx.AsyncClient, base_url: str, model: str) -> str:
     """
-    실시간 3차 폴백용 로컬 Ollama가 떠 있고 모델이 받아져 있는지 확인한다.
+    실시간 텍스트/비전 폴백용 로컬 Ollama가 떠 있고 모델이 받아져 있는지 확인한다.
     없어도 봇은 정상 동작(Gemini/Groq만 사용)하므로 실패가 아니라 [WARN]으로 알린다.
     """
     name = f"Ollama model {model}"
@@ -104,24 +104,38 @@ async def run_network_checks() -> int:
             print("[FAIL] Discord bot token: DISCORD_BOT_TOKEN missing")
 
         if gemini_key:
-            checks.append(_check_response(
-                client,
-                f"Gemini model {config.GEMINI_MODEL}",
-                f"https://generativelanguage.googleapis.com/v1beta/models/{quote(config.GEMINI_MODEL, safe='')}",
-                {"x-goog-api-key": gemini_key},
-            ))
+            gemini_models = {config.GEMINI_MODEL}
+            if config.VISION_ANALYSIS_ENABLED:
+                gemini_models.add(config.GEMINI_VISION_MODEL)
+            for model in sorted(gemini_models):
+                checks.append(_check_response(
+                    client,
+                    f"Gemini model {model}",
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}",
+                    {"x-goog-api-key": gemini_key},
+                ))
         else:
             print("[SKIP] Gemini: GEMINI_API_KEY missing")
 
         if groq_key:
-            checks.append(_check_groq_model(client, groq_key, config.GROQ_MODEL))
+            groq_models = {config.GROQ_MODEL}
+            if config.VISION_ANALYSIS_ENABLED:
+                groq_models.add(config.GROQ_VISION_MODEL)
+            for model in sorted(groq_models):
+                checks.append(_check_groq_model(client, groq_key, model))
         else:
             print("[SKIP] Groq: GROQ_API_KEY missing")
 
+        ollama_models = set()
         if config.OLLAMA_REALTIME_FALLBACK:
-            checks.append(_check_ollama(client, config.OLLAMA_BASE_URL, config.OLLAMA_MODEL))
+            ollama_models.add(config.OLLAMA_MODEL)
+        if config.VISION_ANALYSIS_ENABLED and "ollama" in config.VISION_PROVIDER_ORDER:
+            ollama_models.add(config.OLLAMA_VISION_MODEL)
+        if ollama_models:
+            for model in sorted(ollama_models):
+                checks.append(_check_ollama(client, config.OLLAMA_BASE_URL, model))
         else:
-            print("[SKIP] Ollama: OLLAMA_REALTIME_FALLBACK disabled")
+            print("[SKIP] Ollama: text/vision local providers disabled")
 
         results = await asyncio.gather(*checks)
 

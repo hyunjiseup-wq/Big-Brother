@@ -38,6 +38,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_initialized_database_passes_integrity_check(self):
         await database.validate_database_integrity()
 
+    async def test_discord_audit_cursor_only_moves_forward(self):
+        self.assertIsNone(await database.get_discord_audit_cursor(1))
+        await database.advance_discord_audit_cursor(1, 500)
+        await database.advance_discord_audit_cursor(1, 400)
+        self.assertEqual(await database.get_discord_audit_cursor(1), 500)
+        await database.advance_discord_audit_cursor(1, 700)
+        self.assertEqual(await database.get_discord_audit_cursor(1), 700)
+
     async def test_corrupt_existing_database_is_rejected_before_initialization(self):
         corrupt_path = os.path.join(self.temp_dir.name, "corrupt.db")
         with open(corrupt_path, "wb") as file:
@@ -97,12 +105,163 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await database.claim_review(review_id, 1))
         result = await database.resolve_review_as_false_positive(
             review_id, 1, 10, "hash", "safe message", 99, "정상 처리",
+            "게임 내 플리마켓 거래 설명이라 정상",
         )
         self.assertIsNotNone(result)
         rules = await database.list_false_positive_rules(1)
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0][1:3], (10, "safe message"))
+        self.assertEqual(rules[0][6], "게임 내 플리마켓 거래 설명이라 정상")
         self.assertFalse(await database.release_review(review_id, 1))
+        examples = await database.get_moderation_training_examples(1)
+        self.assertEqual(examples[0][:3], ("safe message", "normal", "NONE"))
+        async with database._connect() as db:
+            row = await (await db.execute(
+                "SELECT review_note FROM violation_log WHERE id = ?", (review_id,)
+            )).fetchone()
+        self.assertEqual(row[0], "게임 내 플리마켓 거래 설명이라 정상")
+
+    async def test_review_preserves_learning_scope_and_thread_rules_can_be_migrated(self):
+        review_id = await database.create_review_record(
+            1, 9, 20, 120, "safe trade", "MODERATE", "wrong", "검수 대기",
+            learning_scope_channel_id=20,
+        )
+        self.assertEqual(await database.get_review_learning_scope(review_id, 1), 20)
+        await database.upsert_false_positive_rule(
+            1, 20, "trade-hash", "safe trade", "MODERATE", "wrong", 20, 99,
+        )
+
+        moved = await database.migrate_false_positive_thread_scope(1, 20, 20, 10)
+
+        self.assertEqual(moved, 1)
+        self.assertEqual(await database.get_review_learning_scope(review_id, 1), 10)
+        rules = await database.list_false_positive_rules(1)
+        self.assertEqual([(row[1], row[2]) for row in rules], [(10, "safe trade")])
+        candidates = await database.get_false_positive_thread_scope_candidates()
+        self.assertEqual(candidates, [])
+
+    async def test_sanction_lifecycle_is_durable_and_queued_for_staff_dashboard(self):
+        sanction_id = await database.record_sanction(
+            1, 50, "테스트유저", "TIMEOUT", "분쟁 유발", "manual_command",
+            "manual:1", issued_by_id=99, issued_by_display="관리자",
+            issued_at=100, expires_at=200,
+        )
+        due = await database.get_due_sanction_sync_records()
+        self.assertEqual([row["sanction_id"] for row in due], [sanction_id])
+        self.assertEqual(due[0]["reason"], "분쟁 유발")
+        self.assertEqual(await database.count_kpi_sync_pending(), 1)
+
+        await database.mark_sanction_sync_complete([sanction_id])
+        self.assertEqual(await database.count_kpi_sync_pending(), 0)
+        released = await database.release_active_sanctions(
+            1, 50, "TIMEOUT", "상황 종료", released_by_id=99,
+            released_by_display="관리자", released_at=150,
+        )
+        self.assertEqual(released, [sanction_id])
+        history = await database.get_sanction_history(1, 50)
+        self.assertEqual(history[0]["status"], "released")
+        self.assertEqual(history[0]["issued_by_id"], 99)
+        self.assertEqual(history[0]["issued_by_display"], "관리자")
+        self.assertEqual(history[0]["released_by_id"], 99)
+        self.assertEqual(history[0]["released_by_display"], "관리자")
+        self.assertEqual(history[0]["released_at"], 150)
+        self.assertEqual(history[0]["release_reason"], "상황 종료")
+        self.assertEqual(await database.count_kpi_sync_pending(), 1)
+
+    async def test_legacy_sanction_import_is_idempotent_and_preserves_actor(self):
+        values = dict(
+            guild_id=1, user_id=50, user_display="대상", action_type="BAN",
+            reason="과거 밴", dedupe_key="legacy-moderation:abc", status="released",
+            issued_at=100, released_at=200, issued_by_id=99,
+            issued_by_display="운영진", release_reason="이의제기 승인",
+        )
+        first_id, first_inserted = await database.import_sanction_record(**values)
+        second_id, second_inserted = await database.import_sanction_record(**values)
+        self.assertEqual(first_id, second_id)
+        self.assertTrue(first_inserted)
+        self.assertFalse(second_inserted)
+        self.assertEqual(await database.count_sanction_sync_pending(1), 1)
+        history = await database.get_sanction_history(1, 50)
+        self.assertEqual(history[0]["action_type"], "BAN")
+        self.assertEqual(history[0]["issued_by_id"], 99)
+        self.assertEqual(history[0]["release_reason"], "이의제기 승인")
+
+    async def test_elapsed_timeout_is_marked_expired(self):
+        sanction_id = await database.record_sanction(
+            1, 50, "테스트유저", "TIMEOUT", "테스트", "review", "review:1",
+            issued_at=100, expires_at=200,
+        )
+        await database.mark_sanction_sync_complete([sanction_id])
+        self.assertEqual(await database.expire_elapsed_timeouts(now=201), 1)
+        history = await database.get_sanction_history(1, 50)
+        self.assertEqual(history[0]["status"], "expired")
+        self.assertEqual(history[0]["released_at"], 200)
+
+    async def test_confirmed_review_and_sanction_are_committed_once_together(self):
+        review_id = await database.log_violation(
+            1, 77, 10, "위반 메시지", "MODERATE", "규정 위반", "검수 대기",
+            review_status="pending", message_id=700,
+        )
+        self.assertTrue(await database.claim_review(review_id, 1))
+        sanction = {
+            "user_id": 77,
+            "user_display": "검수대상",
+            "action_type": "WARNING",
+            "reason": "관리자 확인 규정 위반",
+            "source": "review",
+            "issued_by_display": "관리자",
+            "dedupe_key": f"review:{review_id}:warn",
+        }
+        self.assertTrue(await database.resolve_review(
+            review_id, 1, "confirmed", 99, "경고 기록", sanction=sanction,
+        ))
+        self.assertFalse(await database.resolve_review(
+            review_id, 1, "confirmed", 99, "경고 기록", sanction=sanction,
+        ))
+
+        history = await database.get_sanction_history(1, 77)
+        due = await database.get_due_sanction_sync_records()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["action_type"], "WARNING")
+        self.assertEqual(history[0]["reason"], "관리자 확인 규정 위반")
+        self.assertEqual(due[0]["review_id"], review_id)
+
+    async def test_confirmed_review_creates_violation_training_label(self):
+        review_id = await database.log_violation(
+            1, 9, 10, "harmful message", "SEVERE", "confirmed reason", "review",
+            review_status="pending", message_id=13,
+        )
+        self.assertTrue(await database.claim_review(review_id, 1))
+        self.assertTrue(await database.resolve_review(
+            review_id, 1, "confirmed", 99, "confirmed action",
+        ))
+
+        examples = await database.get_moderation_training_examples(1)
+        self.assertEqual(examples[0][:3], ("harmful message", "violation", "SEVERE"))
+
+    async def test_unconfirmed_review_is_not_a_training_example(self):
+        await database.log_violation(
+            1, 9, 10, "pending message", "MINOR", "model guess", "review",
+            review_status="pending", message_id=14,
+        )
+        self.assertEqual(await database.get_moderation_training_examples(1), [])
+
+    async def test_training_stats_are_grouped_by_language_and_verdict(self):
+        for message_id, content, status in (
+            (21, "정상적인 한국어", "false_positive"),
+            (22, "harmful latin text", "confirmed"),
+        ):
+            review_id = await database.log_violation(
+                1, 9, 10, content, "MODERATE", "reason", "review",
+                review_status="pending", message_id=message_id,
+            )
+            self.assertTrue(await database.claim_review(review_id, 1))
+            self.assertTrue(await database.resolve_review(review_id, 1, status, 99, "done"))
+
+        self.assertEqual(
+            set(await database.get_moderation_label_stats(1)),
+            {("ko", "normal", 1), ("latin", "violation", 1)},
+        )
 
     async def test_processing_review_requires_explicit_recovery(self):
         review_id = await database.create_review_record(
@@ -155,6 +314,28 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_zero_retention_disables_redaction(self):
         self.assertEqual(await database.redact_expired_violation_content(0), 0)
+
+    async def test_ai_retry_queue_is_durable_deduplicated_and_reschedulable(self):
+        with patch.object(database.time, "time", return_value=100):
+            await database.enqueue_moderation_retry(1, 10, 99, "rate_limit", 30)
+            await database.enqueue_moderation_retry(1, 10, 99, "rate_limit", 60)
+        self.assertEqual(await database.count_moderation_retries(1), 1)
+
+        await database.init_db()
+        with patch.object(database.time, "time", return_value=131):
+            rows = await database.get_due_moderation_retries()
+        self.assertEqual(len(rows), 1)
+        retry_id = rows[0][0]
+
+        with patch.object(database.time, "time", return_value=131):
+            await database.reschedule_moderation_retry(retry_id, 1, "timeout", 60)
+        with patch.object(database.time, "time", return_value=190):
+            self.assertEqual(await database.get_due_moderation_retries(), [])
+        with patch.object(database.time, "time", return_value=192):
+            self.assertEqual((await database.get_due_moderation_retries())[0][4], 1)
+
+        await database.delete_moderation_retry_for_message(1, 99)
+        self.assertEqual(await database.count_moderation_retries(), 0)
 
 
 if __name__ == "__main__":

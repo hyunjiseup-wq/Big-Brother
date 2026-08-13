@@ -7,6 +7,7 @@
 import os
 
 from dotenv import load_dotenv
+from policy_loader import load_policy_file
 
 
 load_dotenv()
@@ -25,6 +26,10 @@ def _parse_channel_id_list(raw: str) -> list[int | str]:
             values.append(item)
     return values
 
+
+def _parse_provider_order(raw: str) -> tuple[str, ...]:
+    return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+
 # ── 서버 규칙 (Escape from Tarkov 한국 커뮤니티 실제 약관 기반) ────────────
 # 원문 중 "음성 채팅방 이용 규정(B)"과 "인게임 매너(Ⅲ)"는 텍스트 채팅만 읽는 이 봇으로는
 # 판별할 수 없어 제외했습니다. 텍스트로 감지 가능한 커뮤니티 약관(A)만 반영했습니다.
@@ -36,24 +41,61 @@ SERVER_RULES = """
 
 2. 커뮤니티 무단 홍보
    - 허가받지 않은 서버 초대 링크, 외부 사이트/채널 홍보, 광고성 게시
+   - [타르코프 정보 사이트 예외] Escape from Tarkov의 퀘스트·맵·아이템·탄약·시세·플리마켓·
+     패치·이벤트·공략·위키 정보를 확인하거나 공유하는 사이트 링크는 정상적인 게임 정보 공유임.
+     공식 사이트가 아니거나 작성자 본인 사이트라는 이유만으로 무단 홍보로 판단하지 말 것.
+     링크의 실제 내용과 게시 문맥이 타르코프 정보 제공·질문·답변·추천이라면 규정 위반이 아님.
+     단, 타르코프를 내세우더라도 다른 디스코드 서버 입장, 추천인·제휴 보상, 유료 상품 구매·결제,
+     계정·현금 거래, 피싱 또는 실행파일 다운로드를 유도하면 이 예외를 적용하지 말 것.
+   - [타르코프 이벤트 코드 예외] BSG 런처 또는 Escape from Tarkov 공식 사이트의
+     "Activate Code / Activate Promo Code" 메뉴에서 입력하는 게임 이벤트·보상 코드를
+     유저끼리 공유하는 행위는 정상적인 게임 정보 공유이며 광고가 아님.
+     코드가 영문/숫자 조합이거나, 만료됐거나, 실제 작동 여부가 불확실하거나,
+     출처 링크 없이 코드만 공유됐다는 이유만으로 위반 처리하지 말 것.
+   - `escapefromtarkov.com` 등 공식 서비스의 코드 활성화 안내도 정상으로 판단할 것.
+     반대로 타사 사이트 가입·결제·다운로드, 추천인/제휴 보상, 외부 디스코드 입장 등을
+     유도하면서 입력하게 하는 프로모션·쿠폰·추천 코드는 무단 홍보로 판단할 것.
+     링크가 있다는 사실만으로 제재하지 말고, 도메인과 가입·구매·추천 유도 문맥을 함께 볼 것.
 
 3. 채팅 예절 미준수
-   - 반말 (서버는 존댓말 사용을 기본 예절로 함)
-     ※ 반말 판단 시 주의: 존댓말 어미를 장난스럽게/귀엽게 변형한 표현은 존댓말로 취급하며 위반이 아님.
+   - [한국어 분할 발화 판단] 같은 사용자가 짧은 시간에 연속 전송한 메시지 조각은 각각을
+     독립 문장으로 보지 말고, 제공된 before → 판단 대상 → after 순서로 붙여 하나의 발화로 해석할 것.
+     여러 사용자가 끼어든 경우 speaker가 같은 조각끼리만 결합 후보로 보고, 다른 speaker의 말은
+     질문·답변 흐름을 파악하는 문맥으로만 사용할 것. 다른 사용자의 발언이나 위반을 전가하지 말 것.
+     같은 speaker의 조각도 중간 대화상 별개의 답변·새 발화라면 억지로 이어 붙이지 말 것.
+     조각을 공백 없이 붙인 형태와 띄어 붙인 형태를 모두 읽고 실제 문법·의도를 판단할 것.
+     예: `시발` + `점이 어디예요?`는 `시발점이 어디예요?`라는 정상 질문이며 욕설이 아님.
+     정상 합성어·질문·설명의 일부에 금칙어 문자열이 포함됐다는 이유만으로 위반 처리하지 말 것.
+     반대로 `니` + `애미`처럼 결합한 전체 발화가 명백한 모욕이면 분할 전송이어도 위반임.
+   - 무례하거나 공격적인 반말 (서버는 존댓말 사용을 기본 예절로 함)
+     ※ 관리자 합의에 따라 용용체·음슴체·경미한 경어와 짧고 친근한 응답은 암묵적으로 허용하며
+       말투 형식만으로는 규정 위반이 아님. 실제 모욕·욕설·시비·명령조 공격이 있어야 위반으로 판단할 것.
+     ※ 존댓말 어미를 장난스럽게/귀엽게 변형한 표현은 존댓말로 취급하며 위반이 아님.
        예: "~하세용", "~하나용", "알겠어용" 등 어미에 ㅇ을 붙인 용용체,
            "알겠습니당", "감사합니당" 등 "~습니다"를 "~습니당"으로 변형한 것,
            "넵", "넹", "옙" 같은 "네"의 변형.
-       기본 어미가 존댓말(요/니다/네)이면 변형이 있어도 반말이 아님.
+     ※ "확인했음", "지금 가는 중임", "그런 듯", "가능함", "뭐함" 같은 음슴체·메모체와
+       "감사요", "확인요", "괜찮아요" 같은 경미한 경어도 정상적인 채팅 말투로 허용함.
+       기본 어미가 존댓말(요/니다/네)이거나 위 허용 말투이면 변형이 있어도 위반이 아님.
+     ※ "ㅂㄷㅂㄷ"은 "부들부들"(화가 나거나 긴장해 몸을 떠는 모습을 나타내는 인터넷 표현)의
+       초성 축약으로도 쓰이므로, 표현 자체만으로 욕설·모욕으로 단정하지 말 것. 상대를 조롱하거나
+       도발하는 문맥인지, 단순한 자기 감정·게임 상황 표현인지 앞뒤 대화를 보고 판단할 것.
+     ※ [타르코프 은어] "빤스"와 "팬티"는 한국 타르코프 이용자들이 사망해도 아이템을
+       보존하는 개인 공간인 "보안 컨테이너(Secure Container)"를 부르는 일반적인 게임 은어임.
+       "빤스에 넣어", "팬티 몇 칸", "무슨 빤스 써요?"처럼 아이템 보관·칸·종류를 말하는
+       문장은 성적 콘텐츠·욕설·무례함이 아니므로 정상으로 판단할 것. 단, 사람의 실제 속옷이나
+       신체를 대상으로 사진·노출·탈의를 요구하거나 성희롱·모욕하는 문맥이면 이 예외를 적용하지 말 것.
    - 과도한 친목 행위 (특정 유저들끼리만 어울리며 배타적인 분위기 조성)
    - 정치적 발언 (정치인, 정당, 정치 이슈에 대한 논쟁적 발언)
    - 현금 거래 유도 (게임 아이템/계정 등의 현금 거래 시도)
      ※ 현금 거래 판단 시 주의: "현금 거래"란 현실 재화(현금, 계좌이체, 문화상품권, 페이팔 등)로
        게임 아이템/계정을 사고파는 행위(RMT)만을 뜻함. 게임 내 화폐(루블/달러/유로)로 하는
-       아이템 시세·판매·구매 대화는 이 게임의 정상적인 콘텐츠이며 절대 위반이 아님.
+       아이템 시세·판매·구매 대화와 게임 내 플리마켓을 통한 교환은 정상적인 콘텐츠이며 절대 위반이 아님.
        한국 유저들은 게임 내 루블·달러·유로 금액을 관용적으로 모두 "원"이라 부르기도 함
        (예: "테라피스트한테 팔면 18만원 나와요" = 게임 내 상인에게 루블로 판매한다는 뜻, 위반 아님).
-       "원"이라는 단어만으로 현금 거래로 단정하지 말고, 현실 결제 수단 언급이나
-       디스코드 밖 연락 유도(카톡, 오픈채팅 등) 같은 명확한 정황이 있을 때만 위반으로 판단할 것.
+       "원"·"달러"·"루블"·"유로" 표기만으로 현금 거래로 단정하지 말 것. 채널 안의 앞뒤 거래
+       대화를 함께 확인하고, 실제 계좌번호·입금·송금 같은 현실 결제 수단을 공유하거나 개인 DM 및
+       디스코드 밖 연락(카톡, 오픈채팅 등)으로 거래를 옮기려는 명확한 정황이 있을 때만 위반으로 판단할 것.
 
 4. 건전한 분위기를 해치거나 불필요한 갈등·불편을 유발하는 행위
    - 타인을 자극하는 시비, 조롱, 분란 조장, 분탕 목적의 발언
@@ -70,7 +112,8 @@ SERVER_RULES = """
 [제재 원칙]
 - 위 사항은 정도에 따라 경고(2회 누적 시 제재) ~ 즉시 제재까지 차등 적용됩니다.
 - 명백하고 심각한 위반(혐오발언, 신상 공개, 성적/폭력적 콘텐츠, 위협, 핵 사용 조장 등)은 경고 단계 없이 바로 강한 조치가 필요할 수 있습니다.
-- 경미한 예절 위반(가벼운 반말, 사소한 친목 발언 등)은 낮은 등급으로 판단하세요.
+- 허용된 용용체·음슴체·경미한 경어는 예절 위반으로 분류하지 말고, 실제 무례·시비가 있는
+  경미한 예절 위반만 낮은 등급으로 판단하세요.
 - [증거 기준] 이 커뮤니티는 "합리적인 의심이 없는 정도의 증명"을 제재 기준으로 삼습니다.
   메시지 내용이 단순 의혹 제기·정황 언급 수준인지, 명백한 규정 위반 발언인지 구분하고,
   애매하면 낮은 등급으로 보수적으로 판단하세요. 다만 "의혹 제기" 형식을 빌린
@@ -85,31 +128,77 @@ SERVER_RULES = """
 # '-'/'_'/공백/대소문자 차이를 무시한다 (예: "핵의심신고" ↔ #핵-의심-신고).
 # 채널 이름이 바뀌면 이름 키는 더 이상 매칭되지 않으므로, ID를 알면 ID 등록을 권장.
 CHANNEL_CONTEXT_NOTES = {
+    # 팀원찾기 채널: 같은 서버 음성채널 초대 링크 공유 허용
+    1410654534769840209: (
+        "이 채널은 같은 한국 타르코프 커뮤니티 서버의 음성채널로 팀원을 초대하는 곳입니다. "
+        "시스템이 대상 서버와 음성채널 여부를 확인한 내부 초대 링크는 정상이며, 링크 자체를 "
+        "무단 홍보로 판단하지 마세요. 다른 서버 초대 링크는 시스템이 AI 판단 전에 차단합니다."
+    ),
+    # 셰르파링 대기실: 신규 교육생을 같은 서버 교육 음성채널로 인솔하는 운영 공간
+    1442471746660995113: (
+        "이 채널은 Escape from Tarkov에 새로 유입되어 정착이 어려운 교육생이 대기하는 "
+        "셰르파링 대기실입니다. 셰르파는 숙련자로서 신규 이용자를 가르치는 선생님 역할이며, "
+        "헬퍼는 교육 진행을 돕는 운영 인력입니다. 교육생에게 같은 서버의 셰르파링 #1·#2·#3, "
+        "셰르파-음성 등 교육용 음성채널로 들어오거나 이동해 달라고 안내·유도하는 것은 정상적인 "
+        "교육 운영이며 무단 홍보·불필요한 유도·친목 위반이 아닙니다. 같은 서버 교육 음성채널의 "
+        "초대 링크 공유도 정상입니다. 단, 다른 Discord 서버나 외부 커뮤니티로 이동시키는 초대, "
+        "교육을 빙자한 광고·현금 요구·개인정보 수집은 허용하지 않습니다."
+    ),
     # 물물교환 채널: 게임 내 화폐로 하는 아이템 거래 전용 채널
-    1526179570192093314: (
+    1506874360886198363: (
         "이 채널은 게임 아이템을 게임 내 화폐(루블/달러/유로)로 사고팔거나 맞교환하는 "
-        "물물교환 전용 채널입니다. 아이템 판매/구매/교환 글과 가격 표기는 이 채널의 "
-        "정상적인 용도이므로 위반이 아닙니다. 한국 플레이어들은 유로든 루블이든 게임 내 "
-        "화폐 금액을 통상적으로 모두 '원'으로 표기하므로, '원' 표기만으로 현금 거래(RMT)로 "
-        "판단하지 마세요.\n"
-        "이 채널에서는 아래의 명확한 정황이 있을 때만 위반으로 판단합니다:\n"
-        "- 개인 DM이나 디스코드 밖 연락처(카톡, 오픈채팅 등)로 거래를 유도하는 경우\n"
-        "- 계좌번호 등 현실 결제 수단(계좌이체, 문화상품권, 페이팔 등)이 올라오는 경우"
+        "물물교환 전용 채널입니다. 거래 대화를 이 채널 안에서 공개적으로 이어가고 게임 내 "
+        "플리마켓과 게임 내 재화로 교환하는 방식은 정상이며 위반이 아닙니다. 한국 플레이어들은 "
+        "달러·루블·유로 등 게임 내 화폐 금액을 관용적으로 모두 '원'으로 표기하므로, 통화 단어나 "
+        "금액 표기만으로 현금 거래(RMT)로 판단하지 마세요. 반드시 현재 메시지와 같은 거래 글의 "
+        "앞뒤 대화를 함께 확인하세요.\n"
+        "물물교환 게시글을 이용하려면 서버가 지정한 오버롤 인증 게시판에서 인증하며, 해당 내부 "
+        "게시판 링크와 인증 안내를 공유하는 것은 정상입니다. 본 커뮤니티는 인게임 거래를 중개하거나 "
+        "보증하지 않습니다.\n"
+        "[물물교환 게시글 필수 규정]\n"
+        "- 거래 관련 질문·가격 협의·전달 방법 등 모든 대화는 해당 물물교환 게시글 안에서 공개적으로 진행합니다.\n"
+        "- '개인 DM으로 연락해 달라', '디엠 주세요' 등 거래를 개인 DM으로 옮기는 문구는 전면 금지합니다.\n"
+        "- 카톡·오픈채팅·텔레그램 등 외부 연락처로 거래를 옮기는 것도 금지합니다.\n"
+        "- 현금·상품권·계좌·입금·송금·계좌이체·페이팔 등 현실 재화나 결제 수단을 이용한 거래는 금지합니다.\n"
+        "위 금지 행위를 실제로 제안·요청·동의하는 경우에만 규칙 3 위반입니다. 규정을 공지하거나, "
+        "금지 사실을 설명·질문·인용하거나, 'DM 거래 X', '게시글 안에서 대화해주세요'라고 제지하는 "
+        "메시지는 정상이며 위반이 아닙니다. 다만 금지 안내를 언급한 뒤에도 '몰래', '그래도', "
+        "'규정 무시' 등의 표현으로 실제 DM·현물 거래를 유도하면 위반입니다."
+    ),
+    # 영상공유 채널: 영상과 유튜브 채널 소개·공유 허용
+    1409874543295856710: (
+        "이 채널은 영상 콘텐츠를 공유하고 소개하는 전용 채널입니다. 유튜브 영상 링크, 쇼츠, "
+        "라이브 다시보기, 유튜브 채널 링크와 채널 소개를 올리는 것은 이 채널의 정상적인 용도이며, "
+        "본인 채널을 공유하는 경우도 무단 홍보나 광고로 판단하지 마세요. 영상 제목·설명·썸네일을 "
+        "소개하는 문구와 반복적이지 않은 영상 추천도 정상입니다.\n"
+        "단, 영상공유와 관계없는 상품·서비스·추천인 광고, 피싱·악성 링크, 다른 디스코드 서버 초대, "
+        "도배 및 서버의 다른 콘텐츠 규정 위반까지 허용되는 것은 아닙니다. 링크가 유튜브라는 이유만으로 "
+        "통과시키거나 제재하지 말고, 이 채널의 영상공유 목적과 실제 게시 문맥을 기준으로 판단하세요."
     ),
     # 핵 의심 신고 채널: 서버가 지정한 제보 채널이므로 의심 유저 지목 글이 정상
     1445049743150415923: (
         "이 채널은 서버가 지정한 핵(치트) 의심 유저 신고 전용 채널입니다. 본인이 느끼기에 "
-        "의심스러운 유저의 닉네임과 전적(오버롤) 스크린샷, 킬캠/클립 등을 올려 제보하는 것이 "
-        "이 채널의 정상적인 용도입니다. 따라서 특정 유저를 지목하며 핵 의혹을 제기하는 글은 "
+        "의심스러운 플레이어의 게임 닉네임, 함께 레이드한 서버(지역/서버), 맵, 의심 사유를 적고 "
+        "전적(오버롤) 스크린샷이나 킬캠/클립을 올려 제보하는 것이 이 채널의 정상적인 용도입니다. "
+        "게임 닉네임·레이드 서버·맵·오버롤은 신고에 필요한 게임 내 정보입니다. 레이드 서버 표기는 "
+        "다른 Discord 서버 초대나 현실 위치 공개가 아니며, '핵 의심'이라는 표현도 핵 사용 조장이 "
+        "아닙니다. 따라서 특정 유저를 지목하며 핵 의혹을 제기하는 글은 "
         "규칙 4의 '공개 저격'이 아니라 규칙 4가 허용한 '지정된 신고 채널을 통한 의혹 제보'이므로 "
         "위반이 아닙니다. 확실한 증거 없이 개인적인 의심만으로 올린 제보도 이 채널에서는 "
-        "정상입니다.\n"
+        "정상입니다. AI가 첨부된 스크린샷을 본문에서 확인할 수 없거나 신고 양식 일부가 빠졌더라도 "
+        "그 사실만으로 제재 규정 위반으로 판단하지 마세요. 양식 보완은 관리자 안내 대상입니다.\n"
         "이 채널에서도 다음은 위반으로 판단합니다:\n"
         "- 제보 수준을 넘어선 욕설·조롱·패드립 등 모욕 발언\n"
         "- 신고 대상의 게임 닉네임이 아닌 현실 신상 정보(실명, 연락처, SNS 등) 공개\n"
         "- 핵 사용을 옹호·조장하거나 핵 판매/구매를 유도하는 발언"
     ),
 }
+
+# 다른 커뮤니티에서는 코드를 수정하지 않고 UTF-8 JSON 정책 파일만 연결할 수 있다.
+# 비워두면 위의 기존 Tarkov 커뮤니티 정책을 그대로 사용한다.
+POLICY_FILE = os.environ.get("POLICY_FILE", "").strip()
+if POLICY_FILE:
+    SERVER_RULES, CHANNEL_CONTEXT_NOTES = load_policy_file(POLICY_FILE)
 
 # ══════════════════════════════════════════════════════════════════
 # 수동 검수 모드 (운영 초기 안전장치)
@@ -120,6 +209,20 @@ CHANNEL_CONTEXT_NOTES = {
 # 주의: 값을 바꾼 뒤에는 봇 재시작 필요. 검수 모드 동안에는 위반 점수도 쌓이지 않는다.
 # ══════════════════════════════════════════════════════════════════
 MANUAL_REVIEW_MODE = True
+
+# 사용자에게 제재/경고 DM을 보내지 않는다. 관리자 검수 카드와 내부 로그는 계속 유지된다.
+# 향후 True로 켜면 관리자 확정 제재 DM에 원문·채널·시각·메시지 링크·사유가 함께 전달된다.
+USER_SANCTION_DM_ENABLED = False
+
+# 수동 검수 감지 때도 기본적으로 사용자에게 아무 메시지도 보내지 않는다.
+# 꼭 테스트 안내가 필요할 때만 True로 바꾸면 아래의 공손한 안내문만 전송된다.
+MANUAL_REVIEW_USER_NOTICE_ENABLED = False
+MANUAL_REVIEW_TEST_NOTICE = (
+    "안녕하세요. 현재 '{guild_name}' 서버에서 BB봇의 판단 기능을 점검하고 있습니다.\n"
+    "이 안내는 테스트 과정에서 전달된 것으로 실제 경고나 제재가 아니며, "
+    "회원님의 이용 기록이나 권한에 어떠한 불이익도 적용되지 않습니다.\n"
+    "갑작스러운 안내로 불편을 드렸다면 죄송합니다. 확인해 주셔서 감사합니다."
+)
 
 # ── AI 판단 등급별 부여 점수 ─────────────────────────────────────────
 # AI는 메시지를 아래 5개 등급 중 하나로 분류합니다.
@@ -153,6 +256,9 @@ STRIKE_DECAY_RATIO = 0.5
 # 사용할 모델 (1차: Gemini, 2차 폴백: Groq)
 GEMINI_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "openai/gpt-oss-120b"
+# 핵의심 신고 이미지 OCR·비전 분석용 멀티모달 모델.
+GEMINI_VISION_MODEL = "gemini-2.5-flash"
+GROQ_VISION_MODEL = "qwen/qwen3.6-27b"
 
 # ── 킥/밴 자동 실행 제한 (커뮤니티 정책: 경고 2회 이후 제재는 운영진이 최종 결정) ──
 # 실제 서버 정책상 킥/밴처럼 되돌리기 힘든 조치는 운영진 확인 후 결정되어야 하므로,
@@ -177,13 +283,26 @@ ALLOW_ADMINISTRATOR_PERMISSION = True
 # 조치 내용만 공개 채널에 게시한다. 특정인을 비난하기 위한 목적이 아니라
 # 운영 기준을 투명하게 안내하기 위한 목적이다.
 # 사용하려면 .env에 PUBLIC_LOG_CHANNEL_ID를 설정하세요. 비워두면 비활성화.
-PUBLIC_SANCTION_LOG_ENABLED = True
+PUBLIC_SANCTION_LOG_ENABLED = False
 # 공개 로그에 올릴 최소 등급 (이 미만의 경미한 위반은 공개하지 않음)
 PUBLIC_LOG_MIN_LEVEL = "MODERATE"   # "MINOR" | "MODERATE" | "SEVERE" | "EXTREME"
 
 # ── 대규모 서버용 성능/비용 설정 ─────────────────────────────────────
 # 동시에 처리할 수 있는 최대 외부 AI 호출 수 (트래픽이 몰려도 이 이상 동시 호출 안 함)
 MAX_CONCURRENT_AI_CALLS = 8
+
+# 전체 워커와 별도로 제공자별 동시 요청을 좁혀 폴백 시 무료 한도 연쇄 초과를 막는다.
+GEMINI_MAX_CONCURRENT_CALLS = 2
+GROQ_MAX_CONCURRENT_CALLS = 2
+
+# 429를 받은 제공자를 메시지마다 재호출하면 남은 제공자와 재검사 큐까지 함께 밀린다.
+# 제공자별로 이 시간 동안 회로를 열어 즉시 다음 판단망으로 넘긴다.
+CLOUD_RATE_LIMIT_COOLDOWN_SECONDS = 60
+
+# 실시간 판단 순서. 로컬 Ollama가 없거나 회로 차단 중이면 즉시 다음 클라우드로 넘어간다.
+REALTIME_PROVIDER_ORDER = _parse_provider_order(
+    os.environ.get("REALTIME_PROVIDER_ORDER", "ollama,gemini,groq")
+)
 
 # 메시지 처리 대기열(큐)의 최대 크기. 초과분은 버리고 로그만 남김 (폭주 시 봇 다운 방지)
 MAX_QUEUE_SIZE = 5000
@@ -195,6 +314,21 @@ MAX_QUEUE_AGE_SECONDS = 120
 CACHE_TTL_SECONDS = 600
 CACHE_MAX_ENTRIES = 20000
 
+# 한국어 채팅의 분할 발화("이거", "진짜", "좋네"처럼 숨 쉬는 타이밍마다 전송)를
+# 한 문장처럼 판단하기 위한 짧은 문맥 버퍼. 같은 채널에서 같은 작성자가 연속으로 보낸
+# 메시지 후보만 결합한다. 사이에 끼어든 다른 사용자의 메시지는 별도 화자로 함께 제공해
+# 질문·답변 흐름을 보존하며, 절대로 현재 사용자의 문장 조각으로 붙이지 않는다.
+SPLIT_MESSAGE_CONTEXT_ENABLED = True
+SPLIT_MESSAGE_SETTLE_SECONDS = 2.5
+SPLIT_MESSAGE_WINDOW_SECONDS = 12
+SPLIT_MESSAGE_MAX_MESSAGES = 8
+SPLIT_MESSAGE_MAX_CHARS = 800
+
+# Discord 답글은 "네", "그거", "맞음"처럼 원문을 생략하는 경우가 많다. 답글 원문을
+# 별도 화자의 비신뢰 문맥으로 AI에 함께 제공하되, 원문의 위반을 답글 작성자에게 전가하지 않는다.
+REPLY_CONTEXT_ENABLED = True
+REPLY_CONTEXT_MAX_CHARS = 1200
+
 # ── 오탐 학습 (검수 카드의 "✅ 정상 (조치 안 함)" 버튼과 연동) ──────────
 # 관리자가 오탐으로 확정한 메시지는 DB에 저장되어 (봇 재시작에도 유지):
 # 1) 동일한 내용(공백/대소문자 무시)이 다시 올라오면 감지 자체를 건너뛰고,
@@ -202,6 +336,7 @@ CACHE_MAX_ENTRIES = 20000
 FALSE_POSITIVE_PROMPT_EXAMPLES = 15      # 프롬프트에 포함할 최근 오탐 사례 수 (0 = 프롬프트 학습 비활성)
 FALSE_POSITIVE_EXAMPLE_MAX_CHARS = 120   # 사례 하나당 프롬프트에 넣을 원문 길이 제한
 FALSE_POSITIVE_REFRESH_SECONDS = 300     # 오탐 사례 목록을 DB에서 다시 읽는 주기(초)
+LEARNING_EXPLANATION_MAX_CHARS = 500     # 관리자가 정상 학습 시 입력하는 근거 최대 길이
 
 # ── AI 판단 장애 알림 ────────────────────────────────────────────────
 # Gemini와 Groq가 둘 다 실패하면 메시지는 안전하게 "위반 없음" 처리되지만(무고한 제재 방지),
@@ -210,6 +345,14 @@ FALSE_POSITIVE_REFRESH_SECONDS = 300     # 오탐 사례 목록을 DB에서 다�
 AI_OUTAGE_ALERT_THRESHOLD = 5
 # 장애가 길어져도 이 간격(분)보다 자주 경고를 반복하지는 않음
 AI_OUTAGE_ALERT_COOLDOWN_MINUTES = 60
+
+# 모든 AI 제공자가 실패한 메시지는 위반 없음으로 버리지 않고 SQLite 보류 큐에 저장해
+# 제공자 복구 후 다시 판단한다. 재부팅되어도 큐가 유지된다.
+AI_RETRY_ENABLED = True
+AI_RETRY_INITIAL_DELAY_SECONDS = 30
+AI_RETRY_MAX_DELAY_SECONDS = 300
+AI_RETRY_POLL_SECONDS = 5
+AI_RETRY_BATCH_SIZE = 10
 
 # ── 메시지 누락(드롭) 알림 ───────────────────────────────────────────
 # 큐가 가득 차거나(MAX_QUEUE_SIZE 초과) 큐에서 너무 오래 대기해(MAX_QUEUE_AGE_SECONDS)
@@ -268,6 +411,52 @@ SPAM_REPEAT_THRESHOLD = 10
 # 초대 링크/외부 링크 자동 감지 (정규식은 filters.py에서 사용)
 BLOCK_DISCORD_INVITES = True
 
+# 기본 타르코프 정책에서만 적용되는 정보 사이트 오탐 방지 목록이다. 서브도메인은 자동 허용한다.
+# POLICY_FILE로 다른 커뮤니티 정책을 연결하면 타르코프 전용 후처리는 자동으로 꺼진다.
+TARKOV_INFO_LINK_EXEMPTION_ENABLED = not bool(POLICY_FILE)
+TARKOV_INFO_SITE_DOMAINS = (
+    "escapefromtarkov.com",
+    "tarkov.dev",
+    "escapefromtarkov.fandom.com",
+    "tarkov-market.com",
+    "tarkov.help",
+    "tarkovtracker.io",
+    "tarkov-changes.com",
+    "eft-ammo.com",
+    "eft.monster",
+    "tarkov-ballistics.com",
+)
+TARKOV_INFO_SITE_PATH_PREFIXES = {
+    "mapgenie.io": ("/tarkov/",),
+    "reddit.com": ("/r/escapefromtarkov", "/r/tarkov"),
+}
+
+# 아래 채널에서는 Discord API로 대상 길드/채널을 확인한 뒤, 같은 서버의 음성·스테이지
+# 초대만 허용한다. 다른 서버 초대와 텍스트 채널 초대는 기존처럼 차단한다.
+INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
+    "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS",
+    "1410654534769840209,1442471746660995113"
+))
+
+# 물물교환 채널에서는 한 줄만 보고 게임 내 거래를 RMT로 오판하지 않도록 최근 대화도
+# AI 판단 문맥으로 함께 보낸다. 포럼 글/스레드는 부모 채널 ID·이름을 기준으로 매칭한다.
+BARTER_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
+    "BARTER_CHANNEL_IDS", "1506874360886198363"
+))
+BARTER_CHANNEL_NAMES = tuple(
+    name.strip() for name in os.environ.get("BARTER_CHANNEL_NAMES", "물물교환").split(",")
+    if name.strip()
+)
+# 보통의 거래 글 전체를 포함하고 포럼 시작 글은 별도로 항상 보존하되, 장기 대화로
+# API 토큰과 개인정보 노출이 불필요하게 늘지 않도록 메시지 수와 총 글자 수를 이중 제한한다.
+BARTER_CONTEXT_MESSAGE_LIMIT = 200
+BARTER_CONTEXT_MAX_CHARS = 16000
+
+# 서버가 지정한 물물교환 오버롤 인증 게시판. 정확한 서버/채널 경로와 그 아래 메시지 링크만 허용한다.
+BARTER_VERIFICATION_CHANNEL_URL_PREFIXES = (
+    "https://discord.com/channels/719020590341685258/1445045515971592294",
+)
+
 # 이 길이 이하의 메시지는 AI 호출 없이 바로 통과 (이모지, 짧은 반응 등 비용 절감)
 MIN_LENGTH_FOR_AI_CHECK = 4
 
@@ -285,6 +474,12 @@ _DEFAULT_WATCHED_CHANNEL_IDS = [
     1412298919043661924,  # PVE
     1412299355431632987,  # Arena
     1475842559275438161,  # PVE-TTS
+    1410654534769840209,  # 팀원찾기
+    1506874360886198363,  # 물물교환 포럼(활성/보관 게시글 포함)
+    1409874543295856710,  # 영상공유
+    1445049743150415923,  # 핵 의심 신고
+    1445045515971592294,  # 물물교환 오버롤 인증 게시판
+    1442471746660995113,  # 셰르파링 대기실(음성채널 내 텍스트)
 ]
 _watched_channel_ids_env = os.environ.get("WATCHED_CHANNEL_IDS")
 WATCHED_CHANNEL_IDS = (
@@ -320,13 +515,38 @@ BATCH_BACKEND = "auto"
 OLLAMA_BASE_URL = "http://localhost:11434"
 # 한국어 뉘앙스 판단이 중요하므로 한국어 성능이 검증된 모델 권장.
 # VRAM 여유가 있으면 더 큰 모델로, 부족하면 작은 모델로 바꾸세요.
-OLLAMA_MODEL = "qwen2.5:14b"
+OLLAMA_MODEL = "qwen3:14b"
+# 이미지 OCR은 일반 Qwen3 텍스트 모델이 처리할 수 없어 별도 VL 모델을 사용한다.
+# `ollama pull qwen3-vl:4b`로 한 번 내려받으면 클라우드 무료 한도와 무관하게 동작한다.
+OLLAMA_VISION_MODEL = "qwen3-vl:4b"
+
+# ── 핵의심 신고 이미지 OCR·비전 분석 ───────────────────────────────
+# 지정 채널의 PNG/JPEG/WebP 첨부만 읽는다. 이미지의 핵 사용 여부를 자동 확정하지 않고,
+# 보이는 텍스트·닉네임·레이드 서버·맵·관찰사항을 추출해 기존 규칙 판단의 참고자료로 제공한다.
+VISION_ANALYSIS_ENABLED = True
+VISION_CHANNEL_IDS = _parse_channel_id_list(os.environ.get(
+    "VISION_CHANNEL_IDS", "1445049743150415923"
+))
+VISION_CHANNEL_NAMES = tuple(
+    name.strip() for name in os.environ.get(
+        "VISION_CHANNEL_NAMES", "핵의심신고,핵의심 신고"
+    ).split(",") if name.strip()
+)
+VISION_PROVIDER_ORDER = _parse_provider_order(
+    os.environ.get("VISION_PROVIDER_ORDER", "ollama,gemini,groq")
+)
+VISION_MAX_IMAGES = 3
+VISION_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# Base64 변환 시 약 4/3로 커지므로 공식 API의 20MB 요청 상한보다 충분히 낮게 둔다.
+VISION_MAX_TOTAL_BYTES = 10 * 1024 * 1024
+VISION_TIMEOUT_SECONDS = 45
+VISION_UNAVAILABLE_COOLDOWN_SECONDS = 300
 
 # ══════════════════════════════════════════════════════════════════
-# 실시간 판단의 3차 폴백: 로컬 Ollama
+# 실시간 판단의 호출 한도 없는 로컬 판단망: Ollama
 # Gemini도 Groq도 무료 티어라 일일 한도가 있고, 둘 다 소진되면 실시간 판단이 전부
-# 실패해 메시지가 "위반 없음"으로 통과한다(= 키워드 필터만 남은 사실상 무감시 상태).
-# 로컬 Ollama는 호출 한도가 없으므로 마지막 그물로 쓴다.
+# 실패할 수 있다. 로컬 Ollama는 호출 한도가 없으므로 기본 순서에서 먼저 사용하고,
+# 전 제공자 실패 메시지는 AI_RETRY 설정에 따라 복구 후 다시 판단한다.
 # 봇을 돌리는 PC에 Ollama가 떠 있어야 하며, 없으면 자동으로 건너뛰므로
 # (아래 UNAVAILABLE_COOLDOWN 참고) 켜 둔 채로 두어도 손해는 없다.
 # ══════════════════════════════════════════════════════════════════
@@ -348,6 +568,10 @@ OLLAMA_REALTIME_TIMEOUT_SECONDS = 60
 # 0으로 두면 매번 시도한다.
 OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS = 300
 
+# 로컬 주소를 사용할 때 봇 시작 과정에서 Ollama 서버가 꺼져 있으면 자동으로 숨김 기동한다.
+OLLAMA_AUTO_START = True
+OLLAMA_STARTUP_TIMEOUT_SECONDS = 15
+
 # 완성된 리포트를 저장할 로컬 폴더 (Markdown 파일)
 REPORT_OUTPUT_DIR = "./reports"
 
@@ -368,6 +592,13 @@ VIOLATION_CONTENT_RETENTION_DAYS = 90
 # 양수일 때만 REPORT_OUTPUT_DIR의 audit_report_*.md 파일을 대상으로 한다.
 REPORT_RETENTION_DAYS = 180
 
+# KPI 운영 보고·대시보드 동기화. 외부 사이트가 아직 연결되지 않아도 검수 결과는
+# SQLite와 내구성 대기열에 먼저 저장되며, 나중에 사이트를 연결하면 과거분까지 전송한다.
+KPI_SYNC_INTERVAL_SECONDS = 60
+KPI_SYNC_BATCH_SIZE = 50
+KPI_SYNC_MAX_RETRY_SECONDS = 900
+KPI_REPORT_HOUR_KST = 9
+
 
 def validate_config() -> None:
     """운영 중 무감시·과잉 제재를 만들 수 있는 잘못된 설정을 시작 시 차단한다."""
@@ -375,18 +606,110 @@ def validate_config() -> None:
     valid_levels = {"NONE", "MINOR", "MODERATE", "SEVERE", "EXTREME"}
     valid_actions = {"NONE", "WARN", "DELETE", "TIMEOUT", "KICK", "BAN"}
     valid_batch_backends = {"auto", "gemini", "groq", "ollama"}
+    valid_realtime_providers = {"gemini", "groq", "ollama"}
 
     if MAX_CONCURRENT_AI_CALLS <= 0:
         errors.append("MAX_CONCURRENT_AI_CALLS는 1 이상이어야 합니다.")
+    for name, value in (
+        ("GEMINI_MAX_CONCURRENT_CALLS", GEMINI_MAX_CONCURRENT_CALLS),
+        ("GROQ_MAX_CONCURRENT_CALLS", GROQ_MAX_CONCURRENT_CALLS),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{name}는 1 이상의 정수여야 합니다.")
+    if (isinstance(CLOUD_RATE_LIMIT_COOLDOWN_SECONDS, bool)
+            or not isinstance(CLOUD_RATE_LIMIT_COOLDOWN_SECONDS, (int, float))
+            or CLOUD_RATE_LIMIT_COOLDOWN_SECONDS <= 0):
+        errors.append("CLOUD_RATE_LIMIT_COOLDOWN_SECONDS는 0보다 커야 합니다.")
+    if (not REALTIME_PROVIDER_ORDER
+            or len(set(REALTIME_PROVIDER_ORDER)) != len(REALTIME_PROVIDER_ORDER)
+            or any(provider not in valid_realtime_providers
+                   for provider in REALTIME_PROVIDER_ORDER)):
+        errors.append(
+            "REALTIME_PROVIDER_ORDER는 gemini/groq/ollama를 중복 없이 하나 이상 지정해야 합니다."
+        )
+    if not isinstance(VISION_ANALYSIS_ENABLED, bool):
+        errors.append("VISION_ANALYSIS_ENABLED는 True 또는 False여야 합니다.")
+    if (not VISION_PROVIDER_ORDER
+            or len(set(VISION_PROVIDER_ORDER)) != len(VISION_PROVIDER_ORDER)
+            or any(provider not in valid_realtime_providers
+                   for provider in VISION_PROVIDER_ORDER)):
+        errors.append(
+            "VISION_PROVIDER_ORDER는 gemini/groq/ollama를 중복 없이 하나 이상 지정해야 합니다."
+        )
+    if any(isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0
+           for channel_id in VISION_CHANNEL_IDS):
+        errors.append("VISION_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다.")
+    if len(VISION_CHANNEL_IDS) != len(set(VISION_CHANNEL_IDS)):
+        errors.append("VISION_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(not isinstance(name, str) or not name.strip() for name in VISION_CHANNEL_NAMES):
+        errors.append("VISION_CHANNEL_NAMES에는 비어 있지 않은 채널 이름만 사용할 수 있습니다.")
+    for name, value in (
+        ("VISION_MAX_IMAGES", VISION_MAX_IMAGES),
+        ("VISION_MAX_IMAGE_BYTES", VISION_MAX_IMAGE_BYTES),
+        ("VISION_MAX_TOTAL_BYTES", VISION_MAX_TOTAL_BYTES),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{name}는 1 이상의 정수여야 합니다.")
+    if VISION_MAX_TOTAL_BYTES < VISION_MAX_IMAGE_BYTES:
+        errors.append("VISION_MAX_TOTAL_BYTES는 개별 이미지 크기 제한 이상이어야 합니다.")
+    for name, value in (
+        ("VISION_TIMEOUT_SECONDS", VISION_TIMEOUT_SECONDS),
+        ("VISION_UNAVAILABLE_COOLDOWN_SECONDS", VISION_UNAVAILABLE_COOLDOWN_SECONDS),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"{name}는 0보다 큰 숫자여야 합니다.")
     if DROP_ALERT_THRESHOLD <= 0 or DROP_ALERT_COOLDOWN_MINUTES <= 0:
         errors.append("DROP_ALERT_THRESHOLD와 DROP_ALERT_COOLDOWN_MINUTES는 1 이상이어야 합니다.")
+    if not isinstance(AI_RETRY_ENABLED, bool):
+        errors.append("AI_RETRY_ENABLED는 True 또는 False여야 합니다.")
+    for name, value in (
+        ("AI_RETRY_INITIAL_DELAY_SECONDS", AI_RETRY_INITIAL_DELAY_SECONDS),
+        ("AI_RETRY_MAX_DELAY_SECONDS", AI_RETRY_MAX_DELAY_SECONDS),
+        ("AI_RETRY_POLL_SECONDS", AI_RETRY_POLL_SECONDS),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"{name}는 0보다 큰 숫자여야 합니다.")
+    if (isinstance(AI_RETRY_BATCH_SIZE, bool)
+            or not isinstance(AI_RETRY_BATCH_SIZE, int)
+            or AI_RETRY_BATCH_SIZE <= 0):
+        errors.append("AI_RETRY_BATCH_SIZE는 1 이상의 정수여야 합니다.")
+    if AI_RETRY_MAX_DELAY_SECONDS < AI_RETRY_INITIAL_DELAY_SECONDS:
+        errors.append("AI_RETRY_MAX_DELAY_SECONDS는 초기 지연보다 작을 수 없습니다.")
     if MAX_QUEUE_SIZE <= 0 or MAX_QUEUE_AGE_SECONDS <= 0:
         errors.append("큐 크기와 최대 대기시간은 1 이상이어야 합니다.")
     if CACHE_TTL_SECONDS <= 0 or CACHE_MAX_ENTRIES <= 0:
         errors.append("캐시 TTL과 최대 항목 수는 1 이상이어야 합니다.")
+    if not isinstance(SPLIT_MESSAGE_CONTEXT_ENABLED, bool):
+        errors.append("SPLIT_MESSAGE_CONTEXT_ENABLED는 True/False여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_SETTLE_SECONDS, bool)
+            or not isinstance(SPLIT_MESSAGE_SETTLE_SECONDS, (int, float))
+            or SPLIT_MESSAGE_SETTLE_SECONDS < 0):
+        errors.append("SPLIT_MESSAGE_SETTLE_SECONDS는 0 이상의 숫자여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_WINDOW_SECONDS, bool)
+            or not isinstance(SPLIT_MESSAGE_WINDOW_SECONDS, (int, float))
+            or SPLIT_MESSAGE_WINDOW_SECONDS <= 0):
+        errors.append("SPLIT_MESSAGE_WINDOW_SECONDS는 0보다 큰 숫자여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_MAX_MESSAGES, bool)
+            or not isinstance(SPLIT_MESSAGE_MAX_MESSAGES, int)
+            or SPLIT_MESSAGE_MAX_MESSAGES < 2):
+        errors.append("SPLIT_MESSAGE_MAX_MESSAGES는 2 이상의 정수여야 합니다.")
+    if (isinstance(SPLIT_MESSAGE_MAX_CHARS, bool)
+            or not isinstance(SPLIT_MESSAGE_MAX_CHARS, int)
+            or SPLIT_MESSAGE_MAX_CHARS <= 0):
+        errors.append("SPLIT_MESSAGE_MAX_CHARS는 1 이상의 정수여야 합니다.")
+    if not isinstance(REPLY_CONTEXT_ENABLED, bool):
+        errors.append("REPLY_CONTEXT_ENABLED는 True/False여야 합니다.")
+    if (isinstance(REPLY_CONTEXT_MAX_CHARS, bool)
+            or not isinstance(REPLY_CONTEXT_MAX_CHARS, int)
+            or REPLY_CONTEXT_MAX_CHARS <= 0):
+        errors.append("REPLY_CONTEXT_MAX_CHARS는 1 이상의 정수여야 합니다.")
     if (FALSE_POSITIVE_PROMPT_EXAMPLES < 0 or FALSE_POSITIVE_EXAMPLE_MAX_CHARS <= 0
             or FALSE_POSITIVE_REFRESH_SECONDS <= 0):
         errors.append("오탐 학습 설정(FALSE_POSITIVE_*) 값이 올바르지 않습니다.")
+    if (isinstance(LEARNING_EXPLANATION_MAX_CHARS, bool)
+            or not isinstance(LEARNING_EXPLANATION_MAX_CHARS, int)
+            or not 10 <= LEARNING_EXPLANATION_MAX_CHARS <= 1000):
+        errors.append("LEARNING_EXPLANATION_MAX_CHARS는 10~1000의 정수여야 합니다.")
     if SPAM_WINDOW_SECONDS <= 0 or not 2 <= SPAM_REPEAT_THRESHOLD <= 20:
         errors.append("스팸 시간은 양수이고 반복 임계값은 2~20이어야 합니다.")
     if MIN_LENGTH_FOR_AI_CHECK < 0:
@@ -403,6 +726,22 @@ def validate_config() -> None:
             or not isinstance(REPORT_RETENTION_DAYS, int)
             or REPORT_RETENTION_DAYS < 0):
         errors.append("REPORT_RETENTION_DAYS는 0 이상의 정수여야 합니다.")
+    if (isinstance(KPI_SYNC_INTERVAL_SECONDS, bool)
+            or not isinstance(KPI_SYNC_INTERVAL_SECONDS, (int, float))
+            or KPI_SYNC_INTERVAL_SECONDS <= 0):
+        errors.append("KPI_SYNC_INTERVAL_SECONDS는 0보다 커야 합니다.")
+    if (isinstance(KPI_SYNC_BATCH_SIZE, bool)
+            or not isinstance(KPI_SYNC_BATCH_SIZE, int)
+            or KPI_SYNC_BATCH_SIZE <= 0):
+        errors.append("KPI_SYNC_BATCH_SIZE는 1 이상의 정수여야 합니다.")
+    if (isinstance(KPI_SYNC_MAX_RETRY_SECONDS, bool)
+            or not isinstance(KPI_SYNC_MAX_RETRY_SECONDS, (int, float))
+            or KPI_SYNC_MAX_RETRY_SECONDS < KPI_SYNC_INTERVAL_SECONDS):
+        errors.append("KPI_SYNC_MAX_RETRY_SECONDS는 동기화 주기 이상이어야 합니다.")
+    if (isinstance(KPI_REPORT_HOUR_KST, bool)
+            or not isinstance(KPI_REPORT_HOUR_KST, int)
+            or not 0 <= KPI_REPORT_HOUR_KST <= 23):
+        errors.append("KPI_REPORT_HOUR_KST는 0~23의 정수여야 합니다.")
     if BATCH_BACKEND not in valid_batch_backends:
         errors.append("BATCH_BACKEND는 auto/gemini/groq/ollama 중 하나여야 합니다.")
     if not isinstance(REPORT_OUTPUT_DIR, str) or not REPORT_OUTPUT_DIR.strip():
@@ -418,8 +757,17 @@ def validate_config() -> None:
         errors.append("OLLAMA_REALTIME_TIMEOUT_SECONDS는 0보다 커야 합니다.")
     if OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS < 0:
         errors.append("OLLAMA_UNAVAILABLE_COOLDOWN_SECONDS는 0 이상이어야 합니다.")
+    if not isinstance(OLLAMA_AUTO_START, bool):
+        errors.append("OLLAMA_AUTO_START는 True 또는 False여야 합니다.")
+    if (isinstance(OLLAMA_STARTUP_TIMEOUT_SECONDS, bool)
+            or not isinstance(OLLAMA_STARTUP_TIMEOUT_SECONDS, (int, float))
+            or OLLAMA_STARTUP_TIMEOUT_SECONDS <= 0):
+        errors.append("OLLAMA_STARTUP_TIMEOUT_SECONDS는 0보다 커야 합니다.")
     if not all(isinstance(model, str) and model.strip()
-               for model in (GEMINI_MODEL, GROQ_MODEL, OLLAMA_MODEL)):
+               for model in (
+                   GEMINI_MODEL, GROQ_MODEL, OLLAMA_MODEL,
+                   GEMINI_VISION_MODEL, GROQ_VISION_MODEL, OLLAMA_VISION_MODEL,
+               )):
         errors.append("AI 모델 이름은 비어 있지 않은 문자열이어야 합니다.")
     if not 0 <= BATCH_RUN_HOUR_KST <= 23:
         errors.append("BATCH_RUN_HOUR_KST는 0~23이어야 합니다.")
@@ -436,6 +784,14 @@ def validate_config() -> None:
         errors.append("AUTO_ACTION_CEILING은 WARN/DELETE/TIMEOUT 중 하나여야 합니다.")
     if not isinstance(ALLOW_ADMINISTRATOR_PERMISSION, bool):
         errors.append("ALLOW_ADMINISTRATOR_PERMISSION은 True 또는 False여야 합니다.")
+    if not isinstance(USER_SANCTION_DM_ENABLED, bool):
+        errors.append("USER_SANCTION_DM_ENABLED는 True 또는 False여야 합니다.")
+    if not isinstance(MANUAL_REVIEW_USER_NOTICE_ENABLED, bool):
+        errors.append("MANUAL_REVIEW_USER_NOTICE_ENABLED는 True 또는 False여야 합니다.")
+    if not isinstance(PUBLIC_SANCTION_LOG_ENABLED, bool):
+        errors.append("PUBLIC_SANCTION_LOG_ENABLED는 True 또는 False여야 합니다.")
+    if not isinstance(MANUAL_REVIEW_TEST_NOTICE, str) or not MANUAL_REVIEW_TEST_NOTICE.strip():
+        errors.append("MANUAL_REVIEW_TEST_NOTICE는 비어 있지 않은 문자열이어야 합니다.")
     if IMMEDIATE_ACTION_FOR_EXTREME not in valid_actions | {None}:
         errors.append("IMMEDIATE_ACTION_FOR_EXTREME 값이 올바르지 않습니다.")
     threshold_rows_valid = all(isinstance(row, (tuple, list)) and len(row) == 3
@@ -467,6 +823,35 @@ def validate_config() -> None:
         errors.append("WATCHED_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다.")
     if len(WATCHED_CHANNEL_IDS) != len(set(WATCHED_CHANNEL_IDS)):
         errors.append("WATCHED_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0
+           for channel_id in INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS):
+        errors.append(
+            "INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다."
+        )
+    if len(INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS) != len(
+            set(INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS)):
+        errors.append("INTERNAL_VOICE_INVITE_SOURCE_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(isinstance(channel_id, bool) or not isinstance(channel_id, int) or channel_id <= 0
+           for channel_id in BARTER_CHANNEL_IDS):
+        errors.append("BARTER_CHANNEL_IDS에는 양의 정수 채널 ID만 사용할 수 있습니다.")
+    if len(BARTER_CHANNEL_IDS) != len(set(BARTER_CHANNEL_IDS)):
+        errors.append("BARTER_CHANNEL_IDS에 중복 채널이 있습니다.")
+    if any(not isinstance(name, str) or not name.strip() for name in BARTER_CHANNEL_NAMES):
+        errors.append("BARTER_CHANNEL_NAMES에는 비어 있지 않은 채널 이름만 사용할 수 있습니다.")
+    if (isinstance(BARTER_CONTEXT_MESSAGE_LIMIT, bool)
+            or not isinstance(BARTER_CONTEXT_MESSAGE_LIMIT, int)
+            or BARTER_CONTEXT_MESSAGE_LIMIT <= 0):
+        errors.append("BARTER_CONTEXT_MESSAGE_LIMIT는 1 이상의 정수여야 합니다.")
+    if (isinstance(BARTER_CONTEXT_MAX_CHARS, bool)
+            or not isinstance(BARTER_CONTEXT_MAX_CHARS, int)
+            or BARTER_CONTEXT_MAX_CHARS <= 0):
+        errors.append("BARTER_CONTEXT_MAX_CHARS는 1 이상의 정수여야 합니다.")
+    if (not isinstance(BARTER_VERIFICATION_CHANNEL_URL_PREFIXES, tuple)
+            or not BARTER_VERIFICATION_CHANNEL_URL_PREFIXES
+            or any(not isinstance(url, str)
+                   or not url.startswith("https://discord.com/channels/")
+                   for url in BARTER_VERIFICATION_CHANNEL_URL_PREFIXES)):
+        errors.append("BARTER_VERIFICATION_CHANNEL_URL_PREFIXES에는 Discord 채널 URL을 설정해야 합니다.")
 
     if errors:
         raise ValueError("설정 오류:\n- " + "\n- ".join(errors))

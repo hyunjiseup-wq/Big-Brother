@@ -11,15 +11,31 @@ class StartupLauncherTests(unittest.TestCase):
         script = (ROOT / "register_startup.bat").read_text(encoding="utf-8")
         self.assertIn("$actualTarget -ne $expectedTarget", script)
         self.assertIn("$actualWork -ne $expectedWork", script)
-        self.assertIn("IsNullOrWhiteSpace($s.Arguments)", script)
+        self.assertIn("$s.Arguments -ne $env:AUTOMOD_ARGUMENTS", script)
+        self.assertIn("$s.WindowStyle -ne 7", script)
 
     def test_registration_sets_target_and_working_directory(self):
         script = (ROOT / "register_startup.bat").read_text(encoding="utf-8")
-        self.assertIn("$s.TargetPath=$env:AUTOMOD_LAUNCHER", script)
+        self.assertIn("$s.TargetPath=$env:AUTOMOD_HOST", script)
+        self.assertIn("$s.Arguments=$env:AUTOMOD_ARGUMENTS", script)
         self.assertIn("$s.WorkingDirectory=$env:AUTOMOD_WORKDIR", script)
+        self.assertIn("$s.WindowStyle=7", script)
+
+    def test_hidden_launcher_uses_no_window_and_rotating_log(self):
+        script = (ROOT / "run_bot_hidden.vbs").read_text(encoding="utf-8")
+        self.assertIn('processEnv("AUTOMOD_HEADLESS") = "1"', script)
+        self.assertIn("shell.Run command, 0, False", script)
+        self.assertIn("bot_runtime.log", script)
+        self.assertIn("5242880", script)
 
 
 class BotLauncherTests(unittest.TestCase):
+    def test_headless_mode_never_waits_for_keyboard_input(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        pause_lines = [line.strip() for line in script.splitlines() if "pause" in line]
+        self.assertTrue(pause_lines)
+        self.assertTrue(all(line == "if not defined AUTOMOD_HEADLESS pause" for line in pause_lines))
+
     def test_environment_check_includes_database_integrity(self):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn("database.validate_database_integrity()", script)

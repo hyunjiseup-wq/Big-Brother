@@ -17,6 +17,7 @@ import os
 import argparse
 import asyncio
 import datetime
+import re
 from pathlib import Path
 from collections import defaultdict
 
@@ -26,7 +27,8 @@ from dotenv import load_dotenv
 import config
 import database
 import learning
-from moderator import classify_batch, get_channel_note
+import vision
+from moderator import classify_batch, get_channel_note, is_barter_channel
 
 load_dotenv()
 
@@ -51,7 +53,7 @@ async def collect_messages(channel: discord.TextChannel, after_message_id):
     messages = []
     truncated = False
     async for msg in channel.history(after=after, limit=None, oldest_first=True):
-        if msg.author.bot or not msg.content.strip():
+        if msg.author.bot or (not msg.content.strip() and not vision.has_image_attachments(msg)):
             continue
         messages.append(msg)
         if len(messages) >= config.BATCH_MAX_MESSAGES_PER_CHANNEL:
@@ -69,6 +71,79 @@ def _chunk(lst, size):
         yield lst[i:i + size]
 
 
+async def _batch_reply_parent(message, batch_by_id: dict[int, object]):
+    """배치 항목의 Discord 답글 원문을 같은 묶음 또는 API에서 한 단계만 확인한다."""
+    if not config.REPLY_CONTEXT_ENABLED:
+        return None
+    reference = getattr(message, "reference", None)
+    parent_id = getattr(reference, "message_id", None)
+    if parent_id is None:
+        return None
+    parent = batch_by_id.get(parent_id) or getattr(reference, "resolved", None)
+    if parent is None or getattr(parent, "id", None) != parent_id:
+        fetch_message = getattr(message.channel, "fetch_message", None)
+        if fetch_message is None:
+            return None
+        try:
+            parent = await fetch_message(parent_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+    content = (getattr(parent, "content", "") or "").strip()
+    if not content:
+        return None
+    return parent, content[:config.REPLY_CONTEXT_MAX_CHARS]
+
+
+async def collect_barter_conversation_context(channel, before_message) -> list[tuple]:
+    """체크포인트·배치 경계를 넘어 물물교환 글의 선행 대화를 제한된 크기로 가져온다."""
+    remaining_chars = config.BARTER_CONTEXT_MAX_CHARS
+    collected = []
+    starter_entry = None
+    starter_id = None
+
+    if getattr(channel, "parent", None) is not None:
+        fetch_message = getattr(channel, "fetch_message", None)
+        if fetch_message is not None and getattr(channel, "id", None) != before_message.id:
+            try:
+                starter = await fetch_message(channel.id)
+                content = (getattr(starter, "content", "") or "").strip()
+                if content and not getattr(getattr(starter, "author", None), "bot", False):
+                    content = content[:min(2000, remaining_chars)]
+                    starter_id = getattr(starter, "id", None)
+                    starter_entry = (
+                        getattr(getattr(starter, "author", None), "id", None), content
+                    )
+                    remaining_chars -= len(content)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+    try:
+        async for prior in channel.history(
+                limit=config.BARTER_CONTEXT_MESSAGE_LIMIT,
+                before=before_message,
+                oldest_first=False):
+            if remaining_chars <= 0:
+                break
+            if getattr(getattr(prior, "author", None), "bot", False):
+                continue
+            if starter_id is not None and getattr(prior, "id", None) == starter_id:
+                continue
+            content = (getattr(prior, "content", "") or "").strip()
+            if not content:
+                continue
+            if len(content) > remaining_chars:
+                content = "…" if remaining_chars == 1 else "…" + content[-(remaining_chars - 1):]
+            collected.append((getattr(getattr(prior, "author", None), "id", None), content))
+            remaining_chars -= len(content)
+    except (discord.Forbidden, discord.HTTPException):
+        return [starter_entry] if starter_entry else []
+
+    collected.reverse()
+    if starter_entry:
+        collected.insert(0, starter_entry)
+    return collected
+
+
 async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
     """한 채널을 감사하고 결과(검토 건수 + 플래그된 메시지 목록)를 반환한다."""
     checkpoint = await database.get_checkpoint(channel.guild.id, channel.id)
@@ -79,6 +154,7 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
                 "period_start": None, "period_end": None}
 
     channel_note = get_channel_note(channel)  # 채널별 특수 규칙 (없으면 None)
+    barter_mode = is_barter_channel(channel)
     # 과거 오탐 사례를 프롬프트에 포함해 같은 유형의 오탐을 줄인다
     fp_examples = await learning.get_prompt_examples(channel.guild.id, channel)
     flagged = []
@@ -86,34 +162,78 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
     failure = None
     for batch in _chunk(messages, config.BATCH_SIZE):
         # 확정 오탐은 AI에 보내지 않아 재오탐과 API 비용을 함께 줄인다.
-        candidates = [
-            m for m in batch
-            if not await learning.is_known_false_positive(
-                channel.guild.id, channel, m.content
-            )
+        known_false_positives = [
+            (False if (vision.has_image_attachments(m)
+                       or getattr(getattr(m, "reference", None), "message_id", None)) else
+             await learning.is_known_false_positive(channel.guild.id, channel, m.content))
+            for m in batch
         ]
-        if not candidates:
+        if all(known_false_positives):
             processed_messages.extend(batch)
             continue
+
+        # 물물교환에서는 정상 확정 메시지도 대화 의미를 구성할 수 있으므로 현재 묶음 전체를
+        # 문맥에 남기고, 결과를 기록할 때만 확정 오탐 항목을 제외한다.
+        if barter_mode:
+            candidates = list(batch)
+            candidate_known_flags = known_false_positives
+        else:
+            candidates = [m for m, known in zip(batch, known_false_positives) if not known]
+            candidate_known_flags = [False] * len(candidates)
+
         author_refs = {}
-        payload = [
-            {
-                "index": i,
-                "author_ref": author_refs.setdefault(m.author.id, f"user_{len(author_refs) + 1}"),
-                "content": m.content,
-            }
-            for i, m in enumerate(candidates)
-        ]
+        context_turns = []
+        if barter_mode:
+            prior_turns = await collect_barter_conversation_context(channel, batch[0])
+            for author_id, content in prior_turns:
+                author_ref = author_refs.setdefault(
+                    author_id, f"user_{len(author_refs) + 1}"
+                )
+                context_turns.append({"speaker": author_ref, "content": content})
         try:
+            visual_contexts = [
+                await vision.analyze_message_attachments(message)
+                for message in candidates
+            ]
+            batch_by_id = {getattr(m, "id", None): m for m in batch}
+            reply_parents = [
+                await _batch_reply_parent(message, batch_by_id)
+                for message in candidates
+            ]
+            payload = []
+            for i, (m, visual_context, reply_parent) in enumerate(zip(
+                    candidates, visual_contexts, reply_parents)):
+                item = {
+                    "index": i,
+                    "author_ref": author_refs.setdefault(
+                        m.author.id, f"user_{len(author_refs) + 1}"
+                    ),
+                    "content": m.content,
+                    **({"visual_context": visual_context}
+                       if visual_context is not None else {}),
+                }
+                if reply_parent is not None:
+                    parent, parent_content = reply_parent
+                    parent_author_id = getattr(getattr(parent, "author", None), "id", None)
+                    item["reply_to"] = {
+                        "author_ref": author_refs.setdefault(
+                            parent_author_id, f"user_{len(author_refs) + 1}"
+                        ),
+                        "content": parent_content,
+                    }
+                payload.append(item)
             results = await classify_batch(payload, backend=backend,
-                                           channel_note=channel_note, fp_examples=fp_examples)
+                                           channel_note=channel_note, fp_examples=fp_examples,
+                                           barter_context=barter_mode,
+                                           conversation_context=context_turns)
         except Exception as e:
             failure = str(e)[:500]
             print(f"[batch_audit] #{channel.name} 배치 판단 실패, 체크포인트 보류: {failure}")
             break
 
-        for r, m in zip(results, candidates):
-            if r.level == "NONE":
+        for r, m, known, visual_context in zip(
+                results, candidates, candidate_known_flags, visual_contexts):
+            if known or r.level == "NONE":
                 continue
             flagged.append({
                 "message": m,
@@ -121,6 +241,7 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
                 "rule_violated": r.rule_violated,
                 "reason": r.reason,
                 "provider": r.provider,
+                "visual_context": visual_context,
             })
         processed_messages.extend(batch)
 
@@ -231,6 +352,37 @@ def prune_expired_reports(retention_days: int) -> int:
     return removed
 
 
+async def backfill_audit_metrics_from_reports(guild_id: int) -> int:
+    """기존 Markdown에서 요약 숫자만 읽어 감사 커버리지 KPI를 한 번 백필한다."""
+    report_dir = Path(config.REPORT_OUTPUT_DIR)
+    if not report_dir.is_dir():
+        return 0
+    inserted = 0
+    for path in sorted(report_dir.glob("audit_report_*.md")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        reviewed_match = re.search(r"^- 검토한 메시지:\s*(\d+)건", text, re.MULTILINE)
+        flagged_match = re.search(r"^- 규정 위반 의심:\s*(\d+)건", text, re.MULTILINE)
+        if not reviewed_match or not flagged_match:
+            continue
+        failed_match = re.search(
+            r"^- .*판단 실패로 재시도가 필요한 채널:\s*(\d+)개", text, re.MULTILINE
+        )
+        scope = text.split("## 유저별 정리", 1)[0]
+        target_channels = len(re.findall(r"^- #", scope, re.MULTILINE))
+        row_id = await database.record_audit_run_metrics(
+            guild_id, "legacy-report", int(reviewed_match.group(1)),
+            int(flagged_match.group(1)), int(failed_match.group(1)) if failed_match else 0,
+            target_channels, str(path.resolve()), path.stat().st_mtime,
+        )
+        inserted += int(row_id > 0)
+    return inserted
+
+
 async def send_report_to_discord(guild: discord.Guild, report_text: str, file_path: str):
     raw = os.environ.get("REPORT_CHANNEL_ID", "").strip()
     channel_id = None
@@ -286,9 +438,18 @@ async def _post_review_cards(audit_results: list, on_flagged):
         try:
             review_id = await database.create_review_record(
                 message.guild.id, message.author.id, message.channel.id, message.id,
-                message.content, f["level"], f["reason"],
+                vision.learning_evidence(message.content, f.get("visual_context")),
+                f["level"], f["reason"],
                 "배치 감사 검토 대기" if will_post else "배치 감사 검토 대기 (카드 상한 초과로 미게시)",
                 f["provider"], card_delivered=will_post,
+                rule_violated=f["rule_violated"], detection_source="batch",
+                channel_name=getattr(message.channel, "name", None),
+                channel_group=(
+                    getattr(getattr(message.channel, "parent", None), "name", None)
+                    if isinstance(message.channel, discord.Thread)
+                    else getattr(message.channel, "name", None)
+                ),
+                learning_scope_channel_id=learning.channel_scope_id(message.channel),
             )
         except Exception as e:
             print(f"[batch_audit] 검수 레코드 저장 실패: {e}")
@@ -299,7 +460,7 @@ async def _post_review_cards(audit_results: list, on_flagged):
             continue
         try:
             await on_flagged(message, f["level"], f["reason"], f["rule_violated"],
-                             f["provider"], review_id)
+                             f["provider"], review_id, f.get("visual_context"))
             posted += 1
         except Exception as e:
             print(f"[batch_audit] 검토 카드 전송 실패: {e}")
@@ -312,6 +473,66 @@ async def _post_review_cards(audit_results: list, on_flagged):
     if stored_only:
         print(f"[batch_audit] 카드 상한({limit}건)을 넘은 {stored_only}건은 카드 없이 검수 대기로 저장했습니다. "
               f"`!BB 검토대기`에서 확인하세요 (BATCH_REVIEW_CARD_LIMIT 조정 가능).")
+
+
+async def _expand_audit_targets(guild: discord.Guild) -> list:
+    """등록 채널을 실제 메시지 이력을 가진 채널/포럼 게시글 목록으로 확장한다."""
+    targets = []
+    seen_ids = set()
+
+    def add_target(channel) -> None:
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None or channel_id in seen_ids or not hasattr(channel, "history"):
+            return
+        seen_ids.add(channel_id)
+        targets.append(channel)
+
+    for channel_id in config.WATCHED_CHANNEL_IDS:
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            print(f"[batch_audit] 채널 ID {channel_id}를 찾을 수 없습니다 (봇 권한/오타 확인).")
+            continue
+
+        if hasattr(channel, "history"):
+            add_target(channel)
+            continue
+
+        # ForumChannel 자체에는 history가 없고 실제 메시지는 각 Thread에 있다.
+        # 활성 게시글과 최근 보관 게시글을 모두 펼쳐야 물물교환 대화 전체가 감사된다.
+        active_threads = list(getattr(channel, "threads", ()) or ())
+        for thread in active_threads:
+            add_target(thread)
+
+        archived_count = 0
+        archived_threads = getattr(channel, "archived_threads", None)
+        if callable(archived_threads):
+            cutoff = discord.utils.utcnow() - datetime.timedelta(
+                days=config.BATCH_FIRST_RUN_LOOKBACK_DAYS
+            )
+            try:
+                async for thread in archived_threads(limit=None):
+                    archived_at = getattr(thread, "archive_timestamp", None)
+                    if archived_at is not None and archived_at < cutoff:
+                        break
+                    before = len(targets)
+                    add_target(thread)
+                    if len(targets) > before:
+                        archived_count += 1
+            except (discord.Forbidden, discord.HTTPException) as e:
+                print(
+                    f"[batch_audit] #{channel.name} 보관 게시글 조회 실패: "
+                    f"{type(e).__name__}"
+                )
+
+        if not active_threads and not archived_count:
+            print(f"[batch_audit] #{channel.name}: 감사할 활성/최근 보관 게시글이 없습니다.")
+        else:
+            print(
+                f"[batch_audit] #{channel.name}: 활성 게시글 {len(active_threads)}개, "
+                f"최근 보관 게시글 {archived_count}개를 감사합니다."
+            )
+
+    return targets
 
 
 async def run_full_audit(guild: discord.Guild, backend: str = None, on_flagged=None) -> str:
@@ -334,14 +555,7 @@ async def run_full_audit(guild: discord.Guild, backend: str = None, on_flagged=N
             return None
 
         audit_results = []
-        for channel_id in config.WATCHED_CHANNEL_IDS:
-            channel = guild.get_channel(channel_id)
-            if channel is None:
-                print(f"[batch_audit] 채널 ID {channel_id}를 찾을 수 없습니다 (봇 권한/오타 확인).")
-                continue
-            if not hasattr(channel, "history"):
-                print(f"[batch_audit] #{channel.name}은 메시지 이력을 지원하는 채널이 아닙니다.")
-                continue
+        for channel in await _expand_audit_targets(guild):
             result = await audit_channel(channel, backend)
             audit_results.append(result)
             print(f"[batch_audit] #{channel.name}: {result['reviewed_count']}건 검토, "
@@ -353,6 +567,14 @@ async def run_full_audit(guild: discord.Guild, backend: str = None, on_flagged=N
         report_text = build_report_markdown(audit_results)
         file_path = save_report_file(report_text)
         print(f"[batch_audit] 리포트 저장 완료: {file_path}")
+
+        await database.record_audit_run_metrics(
+            int(guild.id), backend,
+            sum(result["reviewed_count"] for result in audit_results),
+            sum(len(result["flagged"]) for result in audit_results),
+            sum(bool(result.get("error")) for result in audit_results),
+            len(audit_results), str(Path(file_path).resolve()),
+        )
 
         await send_report_to_discord(guild, report_text, file_path)
 
