@@ -324,6 +324,11 @@ SPLIT_MESSAGE_WINDOW_SECONDS = 12
 SPLIT_MESSAGE_MAX_MESSAGES = 8
 SPLIT_MESSAGE_MAX_CHARS = 800
 
+# Discord 답글은 "네", "그거", "맞음"처럼 원문을 생략하는 경우가 많다. 답글 원문을
+# 별도 화자의 비신뢰 문맥으로 AI에 함께 제공하되, 원문의 위반을 답글 작성자에게 전가하지 않는다.
+REPLY_CONTEXT_ENABLED = True
+REPLY_CONTEXT_MAX_CHARS = 1200
+
 # ── 오탐 학습 (검수 카드의 "✅ 정상 (조치 안 함)" 버튼과 연동) ──────────
 # 관리자가 오탐으로 확정한 메시지는 DB에 저장되어 (봇 재시작에도 유지):
 # 1) 동일한 내용(공백/대소문자 무시)이 다시 올라오면 감지 자체를 건너뛰고,
@@ -691,6 +696,12 @@ def validate_config() -> None:
             or not isinstance(SPLIT_MESSAGE_MAX_CHARS, int)
             or SPLIT_MESSAGE_MAX_CHARS <= 0):
         errors.append("SPLIT_MESSAGE_MAX_CHARS는 1 이상의 정수여야 합니다.")
+    if not isinstance(REPLY_CONTEXT_ENABLED, bool):
+        errors.append("REPLY_CONTEXT_ENABLED는 True/False여야 합니다.")
+    if (isinstance(REPLY_CONTEXT_MAX_CHARS, bool)
+            or not isinstance(REPLY_CONTEXT_MAX_CHARS, int)
+            or REPLY_CONTEXT_MAX_CHARS <= 0):
+        errors.append("REPLY_CONTEXT_MAX_CHARS는 1 이상의 정수여야 합니다.")
     if (FALSE_POSITIVE_PROMPT_EXAMPLES < 0 or FALSE_POSITIVE_EXAMPLE_MAX_CHARS <= 0
             or FALSE_POSITIVE_REFRESH_SECONDS <= 0):
         errors.append("오탐 학습 설정(FALSE_POSITIVE_*) 값이 올바르지 않습니다.")

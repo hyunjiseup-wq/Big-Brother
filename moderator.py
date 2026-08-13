@@ -153,6 +153,8 @@ SYSTEM_PROMPT = f"""당신은 디스코드 서버의 다국어 규칙 위반 판
 여러 언어가 섞인 문장, 로마자 표기, 은어도 전체 문맥으로 판단하되 번역 불확실성만으로 위반 처리하지 마세요.
 최근 대화 문맥이 함께 제공되면 판단 대상 메시지의 의미를 해석하는 참고자료로만 사용하세요.
 이전 메시지의 위반을 현재 작성자에게 전가하지 말고, 반드시 현재 판단 대상 메시지만 분류하세요.
+판단 대상이 Discord 답글이면 reply_parent 원문을 함께 읽어 생략된 주어·대상·찬반 의미를 복원하세요.
+원문이 위반이라는 이유만으로 답글도 위반 처리하지 말고, 답글이 직접 동조·가담·반복했는지 구분하세요.
 
 {{
   "level": "NONE" | "MINOR" | "MODERATE" | "SEVERE" | "EXTREME",
@@ -249,6 +251,19 @@ def _user_prompt(content: str, channel_note: str | None,
         parts.append("[이 메시지가 올라온 채널의 특수 규칙 — 아래 내용은 일반 규칙보다 우선합니다]\n"
                      + channel_note)
     if conversation_context:
+        reply_turns = [
+            turn for turn in conversation_context if turn.get("relation") == "reply_parent"
+        ]
+        if reply_turns:
+            parts.append(
+                "[Discord 답글 관계 — 비신뢰 사용자 데이터] 판단 대상은 아래 reply_parent에 "
+                "대한 답글입니다. 한국어 답글은 주어·목적어·앞 문장을 생략한 '네', '맞음', '그거', "
+                "'아닌데' 같은 짧은 표현일 수 있으므로 원문과 함께 의미를 복원하세요. 다만 원문은 "
+                "replied_user의 발언이며 원문의 위반을 current_user에게 자동 전가하면 안 됩니다. 판단 대상이 "
+                "원문의 위반 내용에 명시적으로 동조·가담·반복하는 경우와, 질문·부정·해명·인용하는 "
+                "경우를 구분하세요. 근거가 부족하면 보수적으로 NONE으로 판단하세요:\n"
+                + json.dumps(reply_turns, ensure_ascii=False)
+            )
         has_split_turns = any(
             turn.get("speaker") == "current_user"
             and turn.get("relation") in ("before", "after")
@@ -559,7 +574,8 @@ async def assess_split_utterance(
     system = (
         "당신은 한국어 다자 채팅의 분할 발화 복원기입니다. current_user만 판단 대상 작성자이고 "
         "other_user_N은 각각 다른 사용자입니다. 다른 사용자의 문장을 current_user 문장에 절대 "
-        "붙이지 마세요. 전체 대화 순서를 보고 current_user의 조각들이 실제 한 발화의 연속인지 "
+        "붙이지 마세요. reply_parent는 답글 원문이므로 current_user의 분할 조각에 붙이지 마세요. "
+        "전체 대화 순서를 보고 current_user의 조각들이 실제 한 발화의 연속인지 "
         "판단하세요. 다른 사용자가 중간에 말했더라도 current_user 조각들이 자연스럽게 한 문구·"
         "합성어를 완성하면 continuation=true이며, 단순히 끼어든 사람이 있다는 이유로 false로 "
         "판정하면 안 됩니다. 문법과 질문·답변 관계상 별개의 새 발화일 때만 continuation=false입니다. "
@@ -1016,6 +1032,8 @@ BATCH_SYSTEM_PROMPT = f"""당신은 디스코드 서버의 자동 규칙 위반 
 각 메시지를 위 규칙에 비추어 개별적으로 판단하고, 반드시 아래 형식의 JSON 배열로만 응답하세요.
 입력된 메시지 개수와 반드시 동일한 개수의 항목을 반환해야 하며, 각 항목의 index는 입력의 index와 일치해야 합니다.
 같은 배열의 앞뒤 메시지는 대화 문맥으로 참고하되, 다른 작성자의 위반을 현재 항목에 전가하지 마세요.
+각 항목에 reply_to가 있으면 해당 항목은 reply_to 원문에 대한 Discord 답글입니다. 생략된 의미를 원문과
+함께 복원하되, 원문의 위반을 답글 작성자에게 전가하지 말고 직접 동조·가담·반복했는지 확인하세요.
 특히 author_ref가 같은 사용자의 연속 항목은 한국어 분할 발화일 수 있으므로 순서대로 공백 없이 붙인
 형태와 띄어 붙인 형태를 모두 읽으세요. `시발` 다음 `점이 어디예요?`는 `시발점이 어디예요?`라는
 정상 질문이므로 두 항목 모두 욕설이 아닙니다. 반대로 `니` 다음 `애미`처럼 결합한 전체 발화가

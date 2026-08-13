@@ -316,6 +316,12 @@ async def _split_message_context(message: discord.Message, *, settle: bool = Fal
 
     current = snapshot[current_index]
     author_id = current[1]
+    reference = getattr(message, "reference", None)
+    reply_parent_id = getattr(reference, "message_id", None)
+    reply_parent_entry = next(
+        (entry for entry in snapshot if entry[0] == reply_parent_id), None
+    )
+    reply_author_id = reply_parent_entry[1] if reply_parent_entry else None
     selected_before = [
         entry for entry in snapshot[:current_index]
         if current[2] - entry[2] <= config.SPLIT_MESSAGE_WINDOW_SECONDS
@@ -330,7 +336,7 @@ async def _split_message_context(message: discord.Message, *, settle: bool = Fal
     context = []
     other_authors = {}
     for relation, group in (("before", selected_before), ("after", selected_after)):
-        for _, entry_author_id, _, raw_content in group:
+        for entry_message_id, entry_author_id, _, raw_content in group:
             content = (raw_content or "").strip()
             if not content or remaining_chars <= 0:
                 continue
@@ -338,16 +344,107 @@ async def _split_message_context(message: discord.Message, *, settle: bool = Fal
             remaining_chars -= len(content)
             if entry_author_id == author_id:
                 speaker = "current_user"
+            elif reply_author_id is not None and entry_author_id == reply_author_id:
+                speaker = "replied_user"
             else:
                 speaker = other_authors.setdefault(
                     entry_author_id, f"other_user_{len(other_authors) + 1}"
                 )
             context.append({
                 "speaker": speaker,
-                "relation": relation,
+                "relation": "reply_parent" if entry_message_id == reply_parent_id else relation,
                 "content": content,
             })
     return context
+
+
+def _reply_parent_id(message: discord.Message) -> int | None:
+    if not config.REPLY_CONTEXT_ENABLED:
+        return None
+    value = getattr(getattr(message, "reference", None), "message_id", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _reply_message_context(
+        message: discord.Message, existing_context: list[dict] | None = None) -> list[dict]:
+    """Discord 답글 원문을 가져와 생략된 주어·대상을 해석할 명시적 문맥으로 만든다."""
+    parent_id = _reply_parent_id(message)
+    if parent_id is None or any(
+            turn.get("relation") == "reply_parent" for turn in (existing_context or [])):
+        return []
+
+    reference = getattr(message, "reference", None)
+    parent = getattr(reference, "resolved", None)
+    if parent is None or getattr(parent, "id", None) != parent_id:
+        fetch_message = getattr(message.channel, "fetch_message", None)
+        if fetch_message is None:
+            return []
+        try:
+            parent = await fetch_message(parent_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return []
+
+    content = (getattr(parent, "content", "") or "").strip()
+    if not content:
+        return []
+    parent_author_id = getattr(getattr(parent, "author", None), "id", None)
+    speaker = "current_user" if parent_author_id == message.author.id else "replied_user"
+    return [{
+        "speaker": speaker,
+        "relation": "reply_parent",
+        "content": content[:config.REPLY_CONTEXT_MAX_CHARS],
+    }]
+
+
+def _has_recent_same_author_fragment(message: discord.Message) -> bool:
+    """현재 메시지 앞에 같은 작성자의 짧은 간격 메시지가 있어 재구성이 필요한지 확인한다."""
+    key = (int(message.guild.id), int(message.channel.id))
+    entries = list(_split_message_buffers.get(key, ()))
+    current = next((entry for entry in reversed(entries) if entry[0] == int(message.id)), None)
+    if current is None:
+        return False
+    own_recent = [
+        entry for entry in entries
+        if (entry[1] == current[1]
+            and 0 <= current[2] - entry[2] <= config.SPLIT_MESSAGE_WINDOW_SECONDS
+            and (entry[3] or "").strip())
+    ]
+    return len(own_recent) >= 2
+
+
+def _newer_same_author_is_processing(message: discord.Message) -> bool:
+    """같은 발화의 최신 조각이 이미 검사 중이면 이전 조각의 중복 판단을 생략한다."""
+    key = (int(message.guild.id), int(message.channel.id))
+    entries = list(_split_message_buffers.get(key, ()))
+    current = next((entry for entry in entries if entry[0] == int(message.id)), None)
+    if current is None:
+        return False
+    newer_ids = {
+        entry[0] for entry in entries
+        if (entry[1] == current[1]
+            and 0 < entry[2] - current[2] <= config.SPLIT_MESSAGE_WINDOW_SECONDS)
+    }
+    return any(key_[0] == message.guild.id and key_[1] in newer_ids for key_ in _processing_keys)
+
+
+async def _conversation_context_for_message(
+        message: discord.Message, *, settle: bool, barter_context: bool) -> tuple[list[dict], list[dict]]:
+    """화자별 분절 문맥과 답글 원문을 합치되 거래 채널의 장기 문맥은 보존한다."""
+    burst_context = await _split_message_context(message, settle=settle)
+    reply_context = await _reply_message_context(message, burst_context)
+    if barter_context:
+        conversation_context = await _barter_conversation_context(message)
+        conversation_context.extend(reply_context)
+        conversation_context.extend(
+            turn for turn in burst_context
+            if turn.get("relation") in ("after", "reply_parent")
+        )
+    else:
+        conversation_context = reply_context + burst_context
+    return conversation_context, burst_context
 
 
 def _split_candidate_contains_keyword(message: discord.Message) -> bool:
@@ -1428,6 +1525,8 @@ async def ai_worker(worker_id: int):
             # 관리자가 오탐으로 확정했던 내용과 동일하면 AI 호출 없이 즉시 통과
             # (재오탐 방지 + 무료 API 한도 절약)
             if (not vision.has_image_attachments(message)
+                    and _reply_parent_id(message) is None
+                    and not _has_recent_same_author_fragment(message)
                     and await learning.is_known_false_positive(
                         message.guild.id, message.channel, message.content)):
                 # 큐 대기 중 수정된 메시지가 과거 원문 기준으로 통과하지 않게 재확인한다.
@@ -1449,17 +1548,13 @@ async def ai_worker(worker_id: int):
             # 같은 문구가 규칙이 다른 채널의 판단 결과를 재사용하지 않게 한다.
             channel_note = get_channel_note(message.channel)
             barter_context = _is_barter_channel(message.channel)
-            burst_context = await _split_message_context(
-                message, settle=settle_for_burst
+            conversation_context, burst_context = await _conversation_context_for_message(
+                message, settle=settle_for_burst, barter_context=barter_context
             )
-            if barter_context:
-                conversation_context = await _barter_conversation_context(message)
-                # 기존 물물교환 선행 대화에, 대상 뒤에 이어진 동일 작성자의 분할 조각만 보탠다.
-                conversation_context.extend(
-                    turn for turn in burst_context if turn.get("relation") == "after"
-                )
-            else:
-                conversation_context = burst_context
+            # 같은 작성자가 2.5초 안에 후속 조각을 보냈고 그 최신 조각도 검사 중이면
+            # 이전 조각은 판단하지 않는다. 최신 조각 하나가 전체 발화를 대표해 중복 카드를 막는다.
+            if settle_for_burst and _newer_same_author_is_processing(message):
+                continue
             try:
                 visual_context = await vision.analyze_message_attachments(message)
             except vision.VisionAnalysisUnavailable as error:
@@ -1618,6 +1713,8 @@ async def ai_retry_worker():
             _processing_keys.add(processing_key)
             try:
                 if (not vision.has_image_attachments(message)
+                        and _reply_parent_id(message) is None
+                        and not _has_recent_same_author_fragment(message)
                         and await learning.is_known_false_positive(
                             guild.id, message.channel, message.content)):
                     await database.delete_moderation_retry(retry_id)
@@ -1625,14 +1722,9 @@ async def ai_retry_worker():
 
                 channel_note = get_channel_note(message.channel)
                 barter_context = _is_barter_channel(message.channel)
-                burst_context = await _split_message_context(message)
-                if barter_context:
-                    conversation_context = await _barter_conversation_context(message)
-                    conversation_context.extend(
-                        turn for turn in burst_context if turn.get("relation") == "after"
-                    )
-                else:
-                    conversation_context = burst_context
+                conversation_context, _ = await _conversation_context_for_message(
+                    message, settle=False, barter_context=barter_context
+                )
                 try:
                     visual_context = await vision.analyze_message_attachments(message)
                 except vision.VisionAnalysisUnavailable as error:
@@ -2318,8 +2410,19 @@ async def _run_moderation(message: discord.Message):
             or (result.decision == "SKIP" and _split_candidate_contains_keyword(message))
         )
     )
+    # 개별 조각은 정상 필터를 통과했더라도 같은 작성자가 12초 안에 이어 보냈다면
+    # 최신 조각을 AI에 올려 전체 발화로 재구성한다. 다른 사용자의 메시지는 결합하지 않는다.
+    split_sequence_needs_ai = (
+        config.SPLIT_MESSAGE_CONTEXT_ENABLED
+        and result.decision == "SKIP"
+        and _has_recent_same_author_fragment(message)
+    )
+    # "네", "맞음", "아닌데"처럼 단독으로는 정상인 짧은 답글도 원문에 따라 의미가
+    # 달라지므로, 답글 원문이 있으면 AI 문맥 판단 대상으로 올린다.
+    reply_needs_ai = result.decision == "SKIP" and _reply_parent_id(message) is not None
 
-    if result.decision == "SKIP" and not keyword_needs_context and not image_needs_ai:
+    if (result.decision == "SKIP" and not keyword_needs_context
+            and not split_sequence_needs_ai and not reply_needs_ai and not image_needs_ai):
         pass  # 정상 메시지, 아무 조치 없음
     elif result.decision == "DECIDED" and not keyword_needs_context and not image_needs_ai:
         # 이벤트 핸들러를 막지 않도록 별도 태스크로 처리 (도배 레이드 시 지연 방지)
@@ -2329,7 +2432,13 @@ async def _run_moderation(message: discord.Message):
         _processing_keys.add(processing_key)
         try:
             _message_queue.put_nowait((
-                message, time.monotonic(), processing_key, keyword_needs_context
+                message, time.monotonic(), processing_key,
+                bool(
+                    config.SPLIT_MESSAGE_CONTEXT_ENABLED
+                    and (message.content or "").strip()
+                    and (keyword_needs_context or split_sequence_needs_ai or reply_needs_ai
+                         or result.decision == "NEEDS_AI")
+                ),
             ))
         except asyncio.QueueFull:
             _processing_keys.discard(processing_key)

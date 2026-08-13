@@ -144,6 +144,8 @@ class ConfigValidationTests(unittest.TestCase):
     def test_invalid_split_message_context_settings_are_rejected(self):
         for name, value in (
             ("SPLIT_MESSAGE_CONTEXT_ENABLED", "true"),
+            ("REPLY_CONTEXT_ENABLED", "true"),
+            ("REPLY_CONTEXT_MAX_CHARS", 0),
             ("SPLIT_MESSAGE_SETTLE_SECONDS", -1),
             ("SPLIT_MESSAGE_WINDOW_SECONDS", 0),
             ("SPLIT_MESSAGE_MAX_MESSAGES", 1),

@@ -577,6 +577,40 @@ class SplitMessageContextTests(unittest.IsolatedAsyncioTestCase):
             {"speaker": "current_user", "relation": "after", "content": "원래 사용자의 다음 말"},
         ])
 
+    async def test_reply_parent_is_labeled_and_never_joined_to_current_user(self):
+        now = 250.0
+        bot._split_message_buffers[(1, 10)].extend((
+            (13, 60, now, "계좌로 보내라는 뜻인가요?"),
+            (14, 50, now + 1, "아니요 게임 내 플리마켓이요"),
+        ))
+        message = self.message(
+            message_id=14, content="아니요 게임 내 플리마켓이요", user_id=50
+        )
+        message.reference = SimpleNamespace(message_id=13, resolved=None)
+        context = await bot._split_message_context(message)
+        self.assertEqual(context, [{
+            "speaker": "replied_user",
+            "relation": "reply_parent",
+            "content": "계좌로 보내라는 뜻인가요?",
+        }])
+
+    async def test_old_reply_parent_is_fetched_when_not_in_split_buffer(self):
+        parent = SimpleNamespace(
+            id=90, content="타 서버로 오라는 뜻인가요?", author=SimpleNamespace(id=60)
+        )
+        message = self.message(message_id=91, content="아뇨 이 서버 음성채널이요")
+        message.reference = SimpleNamespace(message_id=90, resolved=None)
+        message.channel.fetch_message = AsyncMock(return_value=parent)
+        context, burst = await bot._conversation_context_for_message(
+            message, settle=False, barter_context=False
+        )
+        self.assertEqual(burst, [])
+        self.assertEqual(context, [{
+            "speaker": "replied_user", "relation": "reply_parent",
+            "content": "타 서버로 오라는 뜻인가요?",
+        }])
+        message.channel.fetch_message.assert_awaited_once_with(90)
+
     def test_fragmented_keyword_uses_only_same_discord_user_id(self):
         now = 300.0
         bot._split_message_buffers[(1, 10)].extend((
@@ -625,6 +659,56 @@ class SplitMessageContextTests(unittest.IsolatedAsyncioTestCase):
             await bot._run_moderation(second)
         queued_message, _, processing_key, settle = queue.get_nowait()
         self.assertIs(queued_message, second)
+        self.assertTrue(settle)
+        bot._processing_keys.discard(processing_key)
+
+    async def test_second_normal_fragment_is_sent_to_contextual_ai(self):
+        first = self.message(message_id=40, content="그거", user_id=50)
+        second = self.message(message_id=41, content="아니라는 뜻임", user_id=50)
+        bot._record_split_message(first)
+        queue = asyncio.Queue()
+        with (
+            patch.object(bot, "_message_queue", queue),
+            patch.object(
+                bot, "_fast_check_with_invite_context",
+                new=AsyncMock(return_value=bot.FilterResult("SKIP")),
+            ),
+        ):
+            await bot._run_moderation(second)
+        queued_message, _, processing_key, settle = queue.get_nowait()
+        self.assertIs(queued_message, second)
+        self.assertTrue(settle)
+        bot._processing_keys.discard(processing_key)
+
+    async def test_all_ambiguous_ai_messages_wait_for_followup_fragments(self):
+        message = self.message(message_id=42, content="그건 좀")
+        queue = asyncio.Queue()
+        with (
+            patch.object(bot, "_message_queue", queue),
+            patch.object(
+                bot, "_fast_check_with_invite_context",
+                new=AsyncMock(return_value=bot.FilterResult("NEEDS_AI")),
+            ),
+        ):
+            await bot._run_moderation(message)
+        _, _, processing_key, settle = queue.get_nowait()
+        self.assertTrue(settle)
+        bot._processing_keys.discard(processing_key)
+
+    async def test_short_reply_that_filters_as_normal_still_uses_original_context(self):
+        message = self.message(message_id=43, content="맞음")
+        message.reference = SimpleNamespace(message_id=12, resolved=None)
+        queue = asyncio.Queue()
+        with (
+            patch.object(bot, "_message_queue", queue),
+            patch.object(
+                bot, "_fast_check_with_invite_context",
+                new=AsyncMock(return_value=bot.FilterResult("SKIP")),
+            ),
+        ):
+            await bot._run_moderation(message)
+        queued_message, _, processing_key, settle = queue.get_nowait()
+        self.assertIs(queued_message, message)
         self.assertTrue(settle)
         bot._processing_keys.discard(processing_key)
 

@@ -71,6 +71,29 @@ def _chunk(lst, size):
         yield lst[i:i + size]
 
 
+async def _batch_reply_parent(message, batch_by_id: dict[int, object]):
+    """배치 항목의 Discord 답글 원문을 같은 묶음 또는 API에서 한 단계만 확인한다."""
+    if not config.REPLY_CONTEXT_ENABLED:
+        return None
+    reference = getattr(message, "reference", None)
+    parent_id = getattr(reference, "message_id", None)
+    if parent_id is None:
+        return None
+    parent = batch_by_id.get(parent_id) or getattr(reference, "resolved", None)
+    if parent is None or getattr(parent, "id", None) != parent_id:
+        fetch_message = getattr(message.channel, "fetch_message", None)
+        if fetch_message is None:
+            return None
+        try:
+            parent = await fetch_message(parent_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+    content = (getattr(parent, "content", "") or "").strip()
+    if not content:
+        return None
+    return parent, content[:config.REPLY_CONTEXT_MAX_CHARS]
+
+
 async def collect_barter_conversation_context(channel, before_message) -> list[tuple]:
     """체크포인트·배치 경계를 넘어 물물교환 글의 선행 대화를 제한된 크기로 가져온다."""
     remaining_chars = config.BARTER_CONTEXT_MAX_CHARS
@@ -140,7 +163,8 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
     for batch in _chunk(messages, config.BATCH_SIZE):
         # 확정 오탐은 AI에 보내지 않아 재오탐과 API 비용을 함께 줄인다.
         known_false_positives = [
-            (False if vision.has_image_attachments(m) else
+            (False if (vision.has_image_attachments(m)
+                       or getattr(getattr(m, "reference", None), "message_id", None)) else
              await learning.is_known_false_positive(channel.guild.id, channel, m.content))
             for m in batch
         ]
@@ -171,8 +195,15 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
                 await vision.analyze_message_attachments(message)
                 for message in candidates
             ]
-            payload = [
-                {
+            batch_by_id = {getattr(m, "id", None): m for m in batch}
+            reply_parents = [
+                await _batch_reply_parent(message, batch_by_id)
+                for message in candidates
+            ]
+            payload = []
+            for i, (m, visual_context, reply_parent) in enumerate(zip(
+                    candidates, visual_contexts, reply_parents)):
+                item = {
                     "index": i,
                     "author_ref": author_refs.setdefault(
                         m.author.id, f"user_{len(author_refs) + 1}"
@@ -181,8 +212,16 @@ async def audit_channel(channel: discord.TextChannel, backend: str) -> dict:
                     **({"visual_context": visual_context}
                        if visual_context is not None else {}),
                 }
-                for i, (m, visual_context) in enumerate(zip(candidates, visual_contexts))
-            ]
+                if reply_parent is not None:
+                    parent, parent_content = reply_parent
+                    parent_author_id = getattr(getattr(parent, "author", None), "id", None)
+                    item["reply_to"] = {
+                        "author_ref": author_refs.setdefault(
+                            parent_author_id, f"user_{len(author_refs) + 1}"
+                        ),
+                        "content": parent_content,
+                    }
+                payload.append(item)
             results = await classify_batch(payload, backend=backend,
                                            channel_note=channel_note, fp_examples=fp_examples,
                                            barter_context=barter_mode,

@@ -210,6 +210,20 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("위반을 판단 대상에게 전가하지 마세요", prompt)
         self.assertIn('"without_spaces": "시발점이 어디예요?알려주세요"', prompt)
 
+    def test_reply_prompt_restores_omitted_meaning_without_transferring_blame(self):
+        prompt = moderator._user_prompt(
+            "아니요 게임 내 플리마켓이요",
+            None,
+            conversation_context=[{
+                "speaker": "replied_user", "relation": "reply_parent",
+                "content": "계좌로 보내라는 뜻인가요?",
+            }],
+        )
+        self.assertIn("Discord 답글 관계", prompt)
+        self.assertIn("주어·목적어·앞 문장을 생략", prompt)
+        self.assertIn("원문의 위반을 current_user에게 자동 전가하면 안 됩니다", prompt)
+        self.assertIn('"relation": "reply_parent"', prompt)
+
     async def test_split_utterance_assessor_uses_dedicated_local_prompt(self):
         response = Mock()
         response.raise_for_status = Mock()
@@ -274,6 +288,7 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("author_ref가 같은 사용자의 연속 항목", moderator.BATCH_SYSTEM_PROMPT)
         self.assertIn("시발점이 어디예요?", moderator.BATCH_SYSTEM_PROMPT)
         self.assertIn("분할 전송으로 우회한 위반", moderator.BATCH_SYSTEM_PROMPT)
+        self.assertIn("각 항목에 reply_to가 있으면", moderator.BATCH_SYSTEM_PROMPT)
 
     def test_casual_speech_guard_allows_agreed_styles_only(self):
         verdict = moderator.ModerationResult("MINOR", "3", "반말 말투 사용", "ollama")

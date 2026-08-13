@@ -19,6 +19,19 @@ def _message(message_id: int):
 
 
 class BatchAuditCheckpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reply_parent_is_attached_to_batch_item_context(self):
+        parent = SimpleNamespace(
+            id=10, content="계좌로 보내라는 뜻인가요?", author=SimpleNamespace(id=500)
+        )
+        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=parent))
+        reply = SimpleNamespace(
+            id=11, channel=channel,
+            reference=SimpleNamespace(message_id=10, resolved=None),
+        )
+        resolved = await batch_audit._batch_reply_parent(reply, {})
+        self.assertEqual(resolved, (parent, parent.content))
+        channel.fetch_message.assert_awaited_once_with(10)
+
     async def test_collect_messages_keeps_image_only_report(self):
         channel = SimpleNamespace(
             id=1445049743150415923,
