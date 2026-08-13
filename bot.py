@@ -195,6 +195,7 @@ _last_drop_at: datetime.datetime | None = None
 _last_drop_alert_at: datetime.datetime | None = None
 _workers_started = False  # on_ready는 재연결 시마다 다시 호출되므로 워커 중복 생성 방지용
 _pending_bot_timeout_changes: dict[tuple[int, int], tuple[float, float]] = {}
+_pending_bot_bans: dict[tuple[int, int], float] = {}
 
 
 def _remember_bot_timeout_change(guild_id: int, user_id: int, expires_at: float | None):
@@ -221,12 +222,32 @@ def _consume_bot_timeout_change(guild_id: int, user_id: int,
     return False
 
 
+def _remember_bot_ban(guild_id: int, user_id: int):
+    """봇이 실행한 밴을 on_member_ban에서 Discord 직접 조치로 중복 기록하지 않게 한다."""
+    _pending_bot_bans[(int(guild_id), int(user_id))] = time.monotonic() + 30
+
+
+def _consume_bot_ban(guild_id: int, user_id: int) -> bool:
+    key = (int(guild_id), int(user_id))
+    deadline = _pending_bot_bans.pop(key, None)
+    return deadline is not None and time.monotonic() <= deadline
+
+
 def _member_ledger_display(member, user_id: int) -> str:
     if member is None:
         return f"Discord 사용자 {user_id}"
     display_name = getattr(member, "display_name", None)
     account = str(member)
     return f"{display_name} ({account})" if display_name and display_name != account else account
+
+
+def _sanction_actor_text(display: str | None, actor_id: int | None) -> str:
+    """제재 조회 화면에서 이름 변경 후에도 식별 가능한 처리자 표기를 만든다."""
+    if actor_id is None:
+        return display or "처리자 미확인"
+    return f"{display or '이름 미확인'} (`{int(actor_id)}`)"
+
+
 _processing_keys: set[tuple[int, int, str]] = set()
 _background_tasks: set[asyncio.Task] = set()
 _kpi_http_client: httpx.AsyncClient | None = None
@@ -437,10 +458,12 @@ async def apply_action(message: discord.Message, action: str, duration_minutes, 
 
     elif action == "BAN":
         try:
+            _remember_bot_ban(guild.id, member.id)
             await member.ban(reason=reason, delete_message_days=1)
             primary_ok = True
             details.append("밴 성공")
         except (discord.Forbidden, discord.HTTPException) as e:
+            _pending_bot_bans.pop((int(guild.id), int(member.id)), None)
             details.append(f"밴 실패: {type(e).__name__}")
     elif action == "DELETE":
         primary_ok = delete_ok
@@ -943,10 +966,12 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
         elif action == "kick":
             await member.kick(reason=reason)
         elif action == "ban":
+            _remember_bot_ban(guild.id, user_id)
             await guild.ban(member or discord.Object(id=user_id), reason=reason)
     except (discord.Forbidden, discord.HTTPException):
         if member is not None:
             _pending_bot_timeout_changes.pop((int(guild.id), int(member.id)), None)
+        _pending_bot_bans.pop((int(guild.id), int(user_id)), None)
         return await fail(
             "봇 권한 또는 Discord API 오류로 조치를 실행하지 못했습니다 "
             "(봇 역할이 대상 유저의 역할보다 위에 있는지 확인)."
@@ -987,7 +1012,7 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
                     "reason": reason_text or "관리자 검수 확정",
                     "source": "review",
                     "expires_at": timeout_expires_at,
-                    "issued_by_display": str(admin),
+                    "issued_by_display": _member_ledger_display(admin, admin.id),
                     "dedupe_key": f"review:{review_id}:{action}",
                 },
             )
@@ -1001,7 +1026,8 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
                 }[action],
                 reason_text or "관리자 검수 확정", "review",
                 f"review-message:{message_id}:{action}",
-                issued_by_id=admin.id, issued_by_display=str(admin),
+                issued_by_id=admin.id,
+                issued_by_display=_member_ledger_display(admin, admin.id),
                 expires_at=timeout_expires_at,
             )
         points = config.VIOLATION_LEVEL_POINTS.get(level, 0)
@@ -2304,7 +2330,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
     actor, audit_reason = await _recent_timeout_audit_context(after.guild, after.id)
     actor_id = getattr(actor, "id", None)
-    actor_display = str(actor) if actor else None
+    actor_display = _member_ledger_display(actor, actor_id) if actor_id else None
     now = time.time()
     if after_ts > now:
         if before_ts > now:
@@ -2327,6 +2353,58 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             released_by_id=actor_id, released_by_display=actor_display,
             status="expired" if naturally_expired else "released",
         )
+
+
+async def _recent_ban_audit_context(guild: discord.Guild, user_id: int, *, unban: bool):
+    """Discord에서 직접 실행한 밴·밴 해제의 처리자, 사유와 감사 항목 ID를 찾는다."""
+    action = discord.AuditLogAction.unban if unban else discord.AuditLogAction.ban
+    fallback = "Discord에서 관리자가 직접 밴 해제" if unban else "Discord에서 관리자가 직접 밴"
+    # 멤버 이벤트가 감사 로그 생성보다 조금 먼저 도착할 수 있어 짧게 두 번 더 확인한다.
+    for attempt in range(3):
+        try:
+            async for entry in guild.audit_logs(limit=10, action=action):
+                target_id = getattr(getattr(entry, "target", None), "id", None)
+                age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+                if target_id == user_id and 0 <= age <= 30:
+                    actor = getattr(entry, "user", None)
+                    return actor, (entry.reason or fallback), getattr(entry, "id", None)
+        except (discord.Forbidden, discord.HTTPException):
+            break
+        if attempt < 2:
+            await asyncio.sleep(0.5)
+    return None, f"{fallback} (감사 로그 처리자 확인 불가)", None
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    """Discord UI에서 직접 적용한 밴도 처리자와 함께 인수인계 원장에 기록한다."""
+    if _consume_bot_ban(guild.id, user.id):
+        return
+    actor, audit_reason, audit_id = await _recent_ban_audit_context(
+        guild, user.id, unban=False
+    )
+    actor_id = getattr(actor, "id", None)
+    await database.record_sanction(
+        guild.id, user.id, _member_ledger_display(user, user.id),
+        "BAN", audit_reason, "discord_manual",
+        f"discord-ban:{user.id}:{audit_id or int(time.time())}",
+        issued_by_id=actor_id,
+        issued_by_display=_member_ledger_display(actor, actor_id) if actor_id else None,
+    )
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User):
+    """Discord UI에서 직접 해제한 밴의 처리자와 사유를 기존 원장에 반영한다."""
+    actor, audit_reason, _audit_id = await _recent_ban_audit_context(
+        guild, user.id, unban=True
+    )
+    actor_id = getattr(actor, "id", None)
+    await database.release_active_sanctions(
+        guild.id, user.id, "BAN", audit_reason,
+        released_by_id=actor_id,
+        released_by_display=_member_ledger_display(actor, actor_id) if actor_id else None,
+    )
 
 
 @bot.event
@@ -2436,7 +2514,8 @@ async def register_warning_cmd(ctx, member: discord.Member, *, reason: str):
     sanction_id = await database.record_sanction(
         ctx.guild.id, member.id, _member_ledger_display(member, member.id),
         "WARNING", reason, "manual_command", f"manual-warning:{ctx.message.id}",
-        issued_by_id=ctx.author.id, issued_by_display=str(ctx.author),
+        issued_by_id=ctx.author.id,
+        issued_by_display=_member_ledger_display(ctx.author, ctx.author.id),
     )
     await ctx.send(
         f"✅ 경고 기록 `#{sanction_id}`을 인수인계 원장에 등록했습니다. "
@@ -2449,7 +2528,8 @@ async def register_warning_cmd(ctx, member: discord.Member, *, reason: str):
 async def release_warning_cmd(ctx, member: discord.Member, *, reason: str):
     ids = await database.release_active_sanctions(
         ctx.guild.id, member.id, "WARNING", reason,
-        released_by_id=ctx.author.id, released_by_display=str(ctx.author), limit=1,
+        released_by_id=ctx.author.id,
+        released_by_display=_member_ledger_display(ctx.author, ctx.author.id), limit=1,
     )
     if not ids:
         await ctx.send("⚠️ 해당 사용자의 활성 경고 기록을 찾지 못했습니다.")
@@ -2474,7 +2554,8 @@ async def register_timeout_cmd(ctx, member: discord.Member, minutes: int, *, rea
     sanction_id = await database.record_sanction(
         ctx.guild.id, member.id, _member_ledger_display(member, member.id),
         "TIMEOUT", reason, "manual_command", f"manual-timeout:{ctx.message.id}",
-        issued_by_id=ctx.author.id, issued_by_display=str(ctx.author),
+        issued_by_id=ctx.author.id,
+        issued_by_display=_member_ledger_display(ctx.author, ctx.author.id),
         expires_at=until.timestamp(),
     )
     await ctx.send(
@@ -2494,7 +2575,8 @@ async def release_timeout_cmd(ctx, member: discord.Member, *, reason: str):
         return
     ids = await database.release_active_sanctions(
         ctx.guild.id, member.id, "TIMEOUT", reason,
-        released_by_id=ctx.author.id, released_by_display=str(ctx.author),
+        released_by_id=ctx.author.id,
+        released_by_display=_member_ledger_display(ctx.author, ctx.author.id),
     )
     await ctx.send(
         f"✅ 타임아웃을 해제했습니다. 원장 기록 {len(ids)}건을 해제 상태로 변경했습니다."
@@ -2517,9 +2599,16 @@ async def sanction_history_cmd(ctx, member: discord.Member | None = None):
             f"<t:{int(row['released_at'])}:f>"
             if row["released_at"] else "현재 활성"
         )
+        released_actor = (
+            _sanction_actor_text(row["released_by_display"], row["released_by_id"])
+            if row["released_at"] else "아직 해제되지 않음"
+        )
         lines.append(
             f"`#{row['sanction_id']}` **{row['user_display']}** · {row['action_type']} · "
-            f"{row['status']}\n{issued} → {released}\n사유: {row['reason'][:180]}"
+            f"{row['status']}\n{issued} → {released}\n"
+            f"적용 관리자: {_sanction_actor_text(row['issued_by_display'], row['issued_by_id'])}\n"
+            f"해제 관리자: {released_actor}\n"
+            f"사유: {row['reason'][:180]}"
         )
     embed = discord.Embed(
         title="🔒 스태프 제재 인수인계 기록",

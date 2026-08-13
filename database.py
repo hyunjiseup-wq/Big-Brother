@@ -812,8 +812,9 @@ async def get_sanction_history(guild_id: int, user_id: int | None = None,
     async with _connect() as db:
         cursor = await db.execute(
             f"""SELECT id, user_id, user_display, action_type, reason, source, status,
-                       issued_at, expires_at, released_at, issued_by_display,
-                       released_by_display, release_reason
+                       issued_at, expires_at, released_at, issued_by_id,
+                       issued_by_display, released_by_id, released_by_display,
+                       release_reason
                 FROM sanction_records {where}
                 ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END,
                          issued_at DESC LIMIT ?""",
@@ -822,7 +823,8 @@ async def get_sanction_history(guild_id: int, user_id: int | None = None,
         columns = (
             "sanction_id", "user_id", "user_display", "action_type", "reason",
             "source", "status", "issued_at", "expires_at", "released_at",
-            "issued_by_display", "released_by_display", "release_reason",
+            "issued_by_id", "issued_by_display", "released_by_id",
+            "released_by_display", "release_reason",
         )
         return [dict(zip(columns, row)) for row in await cursor.fetchall()]
 

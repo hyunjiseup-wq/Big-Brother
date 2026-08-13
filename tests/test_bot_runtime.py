@@ -124,6 +124,7 @@ class VisionQueueTests(unittest.IsolatedAsyncioTestCase):
 class TimeoutLedgerSuppressionTests(unittest.TestCase):
     def tearDown(self):
         bot._pending_bot_timeout_changes.clear()
+        bot._pending_bot_bans.clear()
 
     def test_bot_timeout_change_is_consumed_once(self):
         bot._remember_bot_timeout_change(1, 2, 1000)
@@ -133,6 +134,62 @@ class TimeoutLedgerSuppressionTests(unittest.TestCase):
     def test_different_timeout_is_not_suppressed(self):
         bot._remember_bot_timeout_change(1, 2, 1000)
         self.assertFalse(bot._consume_bot_timeout_change(1, 2, 1100))
+
+    def test_bot_ban_is_consumed_once(self):
+        bot._remember_bot_ban(1, 2)
+        self.assertTrue(bot._consume_bot_ban(1, 2))
+        self.assertFalse(bot._consume_bot_ban(1, 2))
+
+    def test_staff_actor_text_keeps_stable_discord_id(self):
+        self.assertEqual(bot._sanction_actor_text("관리자", 99), "관리자 (`99`)")
+
+
+class DirectBanLedgerTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self):
+        bot._pending_bot_bans.clear()
+
+    async def test_discord_direct_ban_records_audit_actor(self):
+        actor = SimpleNamespace(id=99, display_name="운영진")
+        user = SimpleNamespace(id=50, display_name="대상유저")
+        entry = SimpleNamespace(
+            id=700, target=user, user=actor, reason="반복 위반",
+            created_at=bot.discord.utils.utcnow(),
+        )
+
+        async def audit_logs(**_kwargs):
+            yield entry
+
+        guild = SimpleNamespace(id=1, audit_logs=audit_logs)
+        with patch.object(bot.database, "record_sanction", new=AsyncMock()) as record:
+            await bot.on_member_ban(guild, user)
+
+        record.assert_awaited_once()
+        self.assertEqual(record.await_args.args[3:7], (
+            "BAN", "반복 위반", "discord_manual", "discord-ban:50:700",
+        ))
+        self.assertEqual(record.await_args.kwargs["issued_by_id"], 99)
+        self.assertIn("운영진", record.await_args.kwargs["issued_by_display"])
+
+    async def test_discord_direct_unban_records_releaser(self):
+        actor = SimpleNamespace(id=99, display_name="운영진")
+        user = SimpleNamespace(id=50, display_name="대상유저")
+        entry = SimpleNamespace(
+            id=701, target=user, user=actor, reason="이의제기 승인",
+            created_at=bot.discord.utils.utcnow(),
+        )
+
+        async def audit_logs(**_kwargs):
+            yield entry
+
+        guild = SimpleNamespace(id=1, audit_logs=audit_logs)
+        with patch.object(
+            bot.database, "release_active_sanctions", new=AsyncMock()
+        ) as release:
+            await bot.on_member_unban(guild, user)
+
+        release.assert_awaited_once()
+        self.assertEqual(release.await_args.args[:4], (1, 50, "BAN", "이의제기 승인"))
+        self.assertEqual(release.await_args.kwargs["released_by_id"], 99)
 
 
 class PermissionWarningTests(unittest.TestCase):
