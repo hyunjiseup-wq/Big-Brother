@@ -137,6 +137,9 @@ async def init_db():
         )
         await _ensure_column(db, "violation_log", "channel_name", "TEXT")
         await _ensure_column(db, "violation_log", "channel_group", "TEXT")
+        # 검수 시점에 스레드가 캐시에서 사라져도 오탐 학습 범위를 잃지 않도록,
+        # 감지 당시 계산한 부모 채널(일반 채널이면 자기 자신)을 별도로 보존한다.
+        await _ensure_column(db, "violation_log", "learning_scope_channel_id", "INTEGER")
         # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
         # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
         await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
@@ -989,7 +992,7 @@ async def create_review_record(
     guild_id, user_id, channel_id, message_id, message_content,
     level, reason, action_taken, provider="unknown", card_delivered=True,
     rule_violated="-", detection_source="realtime",
-    channel_name=None, channel_group=None,
+    channel_name=None, channel_group=None, learning_scope_channel_id=None,
 ) -> int:
     """
     검수 대기(pending) 레코드를 만들고 id를 돌려준다.
@@ -1023,13 +1026,15 @@ async def create_review_record(
                (guild_id, user_id, channel_id, message_id, message_content, level, reason,
                 action_taken, provider, needs_review, review_status, card_delivered,
                 language_group, rule_violated, detection_source, channel_name, channel_group,
-                created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+                learning_scope_channel_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (guild_id, user_id, channel_id, message_id, message_content, level, reason,
              action_taken, provider, int(card_delivered),
              detect_language_group(message_content), str(rule_violated)[:100],
              str(detection_source)[:30], str(channel_name)[:100] if channel_name else None,
-             str(channel_group)[:100] if channel_group else None, time.time()),
+             str(channel_group)[:100] if channel_group else None,
+             int(learning_scope_channel_id) if learning_scope_channel_id else None,
+             time.time()),
         )
         review_id = int(cursor.lastrowid)
         for superseded_id in superseded_ids:
@@ -1247,6 +1252,18 @@ async def get_violation_content(review_id: int, guild_id: int):
         return row[0] if row else None
 
 
+async def get_review_learning_scope(review_id: int, guild_id: int) -> int | None:
+    """감지 당시 저장한 오탐 학습 범위를 반환한다. 이전 스키마 행은 None이다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "SELECT learning_scope_channel_id FROM violation_log "
+            "WHERE id = ? AND guild_id = ?",
+            (review_id, guild_id),
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row and row[0] else None
+
+
 # ── 오탐 학습 (learning.py에서 사용) ─────────────────────────────────
 
 async def add_false_positive(guild_id, content_hash, content, wrong_level,
@@ -1392,6 +1409,72 @@ async def resolve_review_as_false_positive(review_id: int, guild_id: int,
         return {"id": rule_id, "content": content}
 
 
+async def get_false_positive_thread_scope_candidates():
+    """부모 확인이 필요한, 출처 채널 자체에 묶인 활성 규칙 범위를 반환한다."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            """SELECT DISTINCT guild_id, source_channel_id, scope_channel_id
+               FROM false_positive_rules
+               WHERE active = 1 AND scope_channel_id != 0
+                 AND source_channel_id IS NOT NULL
+                 AND scope_channel_id = source_channel_id"""
+        )
+        return await cursor.fetchall()
+
+
+async def migrate_false_positive_thread_scope(guild_id: int, source_channel_id: int,
+                                                old_scope_id: int,
+                                                parent_scope_id: int) -> int:
+    """개별 스레드 규칙을 부모 채널 범위로 병합하고 이전 행은 이력으로 보존한다."""
+    if old_scope_id == parent_scope_id:
+        return 0
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            """SELECT id, content_hash, content, wrong_level, wrong_reason, marked_by,
+                      created_at, updated_at
+               FROM false_positive_rules
+               WHERE guild_id = ? AND source_channel_id = ?
+                 AND scope_channel_id = ? AND active = 1""",
+            (guild_id, source_channel_id, old_scope_id),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            await db.rollback()
+            return 0
+
+        now = time.time()
+        for (_, stored_hash, content, wrong_level, wrong_reason, marked_by,
+             created_at, updated_at) in rows:
+            await db.execute(
+                """INSERT INTO false_positive_rules
+                   (guild_id, scope_channel_id, content_hash, content, wrong_level,
+                    wrong_reason, source_channel_id, marked_by, active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                   ON CONFLICT(guild_id, scope_channel_id, content_hash) DO UPDATE SET
+                       active = 1,
+                       updated_at = MAX(false_positive_rules.updated_at, excluded.updated_at)""",
+                (guild_id, parent_scope_id, stored_hash, content, wrong_level, wrong_reason,
+                 source_channel_id, marked_by, created_at, updated_at),
+            )
+
+        row_ids = [int(row[0]) for row in rows]
+        placeholders = ",".join("?" for _ in row_ids)
+        await db.execute(
+            f"UPDATE false_positive_rules SET active = 0, updated_at = ? "
+            f"WHERE id IN ({placeholders})",
+            (now, *row_ids),
+        )
+        await db.execute(
+            """UPDATE violation_log SET learning_scope_channel_id = ?
+               WHERE guild_id = ? AND channel_id = ?
+                 AND (learning_scope_channel_id IS NULL OR learning_scope_channel_id = ?)""",
+            (parent_scope_id, guild_id, source_channel_id, old_scope_id),
+        )
+        await db.commit()
+        return len(rows)
+
+
 async def get_all_false_positive_rule_keys(include_inactive: bool = False):
     async with _connect() as db:
         cursor = await db.execute(
@@ -1410,8 +1493,9 @@ async def get_recent_false_positive_rules(guild_id: int, scope_channel_id: int,
                FROM false_positive_rules
                WHERE guild_id = ? AND active = 1
                  AND scope_channel_id IN (0, ?)
-               ORDER BY updated_at DESC LIMIT ?""",
-            (guild_id, scope_channel_id, limit),
+               ORDER BY CASE WHEN scope_channel_id = ? THEN 0 ELSE 1 END,
+                        updated_at DESC LIMIT ?""",
+            (guild_id, scope_channel_id, scope_channel_id, limit),
         )
         return await cursor.fetchall()
 

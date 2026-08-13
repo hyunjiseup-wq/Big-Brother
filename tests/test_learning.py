@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import database
 import learning
@@ -51,6 +52,21 @@ class LearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await learning.is_known_false_positive(
             1, 10, "@everyone see https://example.com\x01"
         ))
+
+    async def test_channel_examples_are_prioritized_over_newer_server_examples(self):
+        await learning.record_false_positive(
+            1, 10, "channel-specific safe trade", "MODERATE", "wrong", 99,
+        )
+        await learning.record_false_positive(
+            1, 10, "newer server-wide example", "MODERATE", "wrong", 99,
+            server_wide=True,
+        )
+        learning._examples_cache.clear()
+        with patch.object(learning.config, "FALSE_POSITIVE_PROMPT_EXAMPLES", 1):
+            examples = await learning.get_prompt_examples(1, 10)
+
+        self.assertEqual(examples[0]["scope"], "channel")
+        self.assertEqual(examples[0]["content"], "channel-specific safe trade")
 
     async def test_historical_false_positive_is_backfilled_once(self):
         review_id = await database.log_violation(

@@ -60,7 +60,7 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn(lobby_id, config.WATCHED_CHANNEL_IDS)
 
     def test_barter_policy_distinguishes_game_currency_from_real_payment(self):
-        trade_note = config.CHANNEL_CONTEXT_NOTES[1526179570192093314]
+        trade_note = config.CHANNEL_CONTEXT_NOTES[1506874360886198363]
         self.assertIn("게임 내 플리마켓", trade_note)
         self.assertIn("달러·루블·유로", trade_note)
         self.assertIn("앞뒤 대화", trade_note)
@@ -150,7 +150,7 @@ class ConfigValidationTests(unittest.TestCase):
     def test_default_audit_targets_include_special_operation_channels(self):
         expected = {
             1410654534769840209,  # 팀원찾기
-            1526179570192093314,  # 물물교환
+            1506874360886198363,  # 물물교환 포럼
             1409874543295856710,  # 영상공유
             1445049743150415923,  # 핵 의심 신고
             1445045515971592294,  # 오버롤 인증 게시판

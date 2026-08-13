@@ -288,6 +288,41 @@ class BarterConversationContextTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot.config, "BARTER_CHANNEL_IDS", [10]):
             self.assertTrue(bot._is_barter_channel(channel))
 
+    async def test_uncached_review_thread_fetches_parent_learning_scope(self):
+        guild = SimpleNamespace(
+            id=1,
+            get_channel=lambda _channel_id: None,
+            get_channel_or_thread=lambda _channel_id: None,
+        )
+        thread = SimpleNamespace(
+            id=20, parent_id=10, guild=SimpleNamespace(id=1),
+        )
+        with (
+            patch.object(bot.database, "get_review_learning_scope",
+                         new=AsyncMock(return_value=None)),
+            patch.object(bot.bot, "fetch_channel", new=AsyncMock(return_value=thread)) as fetch,
+        ):
+            scope = await bot._resolve_review_learning_scope(guild, 5, 20)
+
+        self.assertEqual(scope, 10)
+        fetch.assert_awaited_once_with(20)
+
+    async def test_review_uses_persisted_learning_scope_without_discord_fetch(self):
+        guild = SimpleNamespace(
+            id=1,
+            get_channel=lambda _channel_id: None,
+            get_channel_or_thread=lambda _channel_id: None,
+        )
+        with (
+            patch.object(bot.database, "get_review_learning_scope",
+                         new=AsyncMock(return_value=10)),
+            patch.object(bot.bot, "fetch_channel", new=AsyncMock()) as fetch,
+        ):
+            scope = await bot._resolve_review_learning_scope(guild, 5, 20)
+
+        self.assertEqual(scope, 10)
+        fetch.assert_not_awaited()
+
 
 class SplitMessageContextTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):

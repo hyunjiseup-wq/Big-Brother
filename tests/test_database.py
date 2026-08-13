@@ -106,6 +106,25 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         examples = await database.get_moderation_training_examples(1)
         self.assertEqual(examples[0][:3], ("safe message", "normal", "NONE"))
 
+    async def test_review_preserves_learning_scope_and_thread_rules_can_be_migrated(self):
+        review_id = await database.create_review_record(
+            1, 9, 20, 120, "safe trade", "MODERATE", "wrong", "검수 대기",
+            learning_scope_channel_id=20,
+        )
+        self.assertEqual(await database.get_review_learning_scope(review_id, 1), 20)
+        await database.upsert_false_positive_rule(
+            1, 20, "trade-hash", "safe trade", "MODERATE", "wrong", 20, 99,
+        )
+
+        moved = await database.migrate_false_positive_thread_scope(1, 20, 20, 10)
+
+        self.assertEqual(moved, 1)
+        self.assertEqual(await database.get_review_learning_scope(review_id, 1), 10)
+        rules = await database.list_false_positive_rules(1)
+        self.assertEqual([(row[1], row[2]) for row in rules], [(10, "safe trade")])
+        candidates = await database.get_false_positive_thread_scope_candidates()
+        self.assertEqual(candidates, [])
+
     async def test_confirmed_review_creates_violation_training_label(self):
         review_id = await database.log_violation(
             1, 9, 10, "harmful message", "SEVERE", "confirmed reason", "review",

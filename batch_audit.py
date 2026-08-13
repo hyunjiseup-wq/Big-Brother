@@ -397,6 +397,7 @@ async def _post_review_cards(audit_results: list, on_flagged):
                     if isinstance(message.channel, discord.Thread)
                     else getattr(message.channel, "name", None)
                 ),
+                learning_scope_channel_id=learning.channel_scope_id(message.channel),
             )
         except Exception as e:
             print(f"[batch_audit] 검수 레코드 저장 실패: {e}")

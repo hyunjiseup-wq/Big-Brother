@@ -549,6 +549,7 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
             if isinstance(message.channel, discord.Thread)
             else getattr(message.channel, "name", None)
         ),
+        learning_scope_channel_id=learning.channel_scope_id(message.channel),
     )
 
     embed = discord.Embed(
@@ -771,6 +772,55 @@ async def _send_manual_review_test_notice(member: discord.Member, guild_name: st
         return False
 
 
+async def _resolve_review_learning_scope(guild: discord.Guild, review_id: int | None,
+                                         channel_id: int) -> int:
+    """캐시/보관 상태와 무관하게 검수 메시지의 부모 채널 학습 범위를 복원한다."""
+    if review_id:
+        stored_scope = await database.get_review_learning_scope(review_id, guild.id)
+        if stored_scope:
+            return stored_scope
+
+    get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+    channel = get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return int(channel_id)
+    channel_guild = getattr(channel, "guild", None)
+    if channel_guild is not None and int(channel_guild.id) != int(guild.id):
+        return int(channel_id)
+    return learning.channel_scope_id(channel)
+
+
+async def _repair_historical_thread_learning_scopes() -> int:
+    """과거에 개별 스레드 ID로 저장된 채널 학습을 실제 부모 채널로 병합한다."""
+    moved = 0
+    candidates = await database.get_false_positive_thread_scope_candidates()
+    for guild_id, source_channel_id, old_scope_id in candidates:
+        guild = bot.get_guild(int(guild_id))
+        if guild is None:
+            continue
+        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+        channel = get_channel(int(source_channel_id))
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(int(source_channel_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+        channel_guild = getattr(channel, "guild", None)
+        parent_id = getattr(channel, "parent_id", None)
+        if (not parent_id or channel_guild is None
+                or int(channel_guild.id) != int(guild_id)):
+            continue
+        moved += await database.migrate_false_positive_thread_scope(
+            int(guild_id), int(source_channel_id), int(old_scope_id), int(parent_id)
+        )
+    if moved:
+        await learning.initialize()
+    return moved
+
+
 async def _apply_review_action(guild: discord.Guild, log_message: discord.Message,
                                admin, action: str, channel_id: int, message_id: int,
                                user_id: int, review_id: int = 0):
@@ -892,8 +942,9 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
         await send_public_sanction_log(guild, level, rule, public_action)
     else:  # 관리자가 오탐(정상)으로 확정
         server_wide = action == "okg"
-        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
-        channel_for_scope = get_channel(channel_id) or channel_id
+        channel_for_scope = await _resolve_review_learning_scope(
+            guild, review_id, channel_id
+        )
         content_for_learning = "" if original_content == "(내용 없음)" else original_content
         try:
             if review_id:
@@ -1756,6 +1807,9 @@ async def on_ready():
     migrated = await learning.initialize()
     if migrated:
         print(f"[learning] 기존 오탐 이력 {migrated}건을 범위 지정 규칙으로 이전했습니다.")
+    repaired_scopes = await _repair_historical_thread_learning_scopes()
+    if repaired_scopes:
+        print(f"[learning] 개별 스레드 오탐 규칙 {repaired_scopes}건을 부모 채널 범위로 병합했습니다.")
 
     # on_ready는 네트워크 재연결 시마다 다시 불리므로, 워커는 최초 1회만 생성한다.
     # (중복 생성 시 같은 메시지를 여러 워커가 처리해 이중 제재가 발생할 수 있음)
