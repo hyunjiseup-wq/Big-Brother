@@ -192,6 +192,65 @@ class DirectBanLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(release.await_args.kwargs["released_by_id"], 99)
 
 
+class ExternalModerationAuditTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def entry(action, *, entry_id=800, reason=None, before=None, after=None, extra=None):
+        actor = SimpleNamespace(id=99, display_name="외부제재봇", bot=True)
+        target = SimpleNamespace(id=50, display_name="대상유저", name="대상유저")
+        guild = SimpleNamespace(id=1, get_member=lambda _user_id: None)
+        return SimpleNamespace(
+            id=entry_id, action=action, guild=guild, target=target,
+            user=actor, user_id=actor.id, reason=reason,
+            created_at=bot.discord.utils.utcnow(),
+            before=before or SimpleNamespace(), after=after or SimpleNamespace(),
+            extra=extra,
+        )
+
+    async def test_external_bot_kick_is_recorded_with_actor(self):
+        entry = self.entry(bot.discord.AuditLogAction.kick, reason="반복 규정 위반")
+        with patch.object(bot.database, "record_sanction", new=AsyncMock()) as record:
+            handled = await bot._process_external_sanction_audit_entry(entry)
+        self.assertTrue(handled)
+        self.assertEqual(record.await_args.args[3:7], (
+            "KICK", "반복 규정 위반", "discord_audit", "discord-kick:50:800",
+        ))
+        self.assertEqual(record.await_args.kwargs["issued_by_id"], 99)
+        self.assertIn("외부제재봇", record.await_args.kwargs["issued_by_display"])
+
+    async def test_external_bot_message_delete_is_recorded_with_count_and_channel(self):
+        extra = SimpleNamespace(count=3, channel=SimpleNamespace(name="팀원찾기", mention="#팀원찾기"))
+        entry = self.entry(bot.discord.AuditLogAction.message_delete, extra=extra)
+        with patch.object(bot.database, "record_sanction", new=AsyncMock()) as record:
+            handled = await bot._process_external_sanction_audit_entry(entry)
+        self.assertTrue(handled)
+        self.assertEqual(record.await_args.args[3], "DELETE")
+        self.assertIn("메시지 3건 삭제", record.await_args.args[4])
+        self.assertEqual(record.await_args.args[5], "discord_audit")
+
+    async def test_external_bot_timeout_is_recorded_from_member_diff(self):
+        until = bot.discord.utils.utcnow() + bot.datetime.timedelta(hours=1)
+        entry = self.entry(
+            bot.discord.AuditLogAction.member_update,
+            after=SimpleNamespace(timed_out_until=until),
+        )
+        with patch.object(bot.database, "record_sanction", new=AsyncMock()) as record:
+            handled = await bot._process_external_sanction_audit_entry(entry)
+        self.assertTrue(handled)
+        self.assertEqual(record.await_args.args[3], "TIMEOUT")
+        self.assertEqual(record.await_args.args[5], "discord_audit")
+        self.assertAlmostEqual(record.await_args.kwargs["expires_at"], until.timestamp())
+
+    async def test_unrelated_member_update_is_ignored(self):
+        entry = self.entry(
+            bot.discord.AuditLogAction.member_update,
+            before=SimpleNamespace(nick="이전"), after=SimpleNamespace(nick="이후"),
+        )
+        with patch.object(bot.database, "record_sanction", new=AsyncMock()) as record:
+            handled = await bot._process_external_sanction_audit_entry(entry)
+        self.assertFalse(handled)
+        record.assert_not_awaited()
+
+
 class PermissionWarningTests(unittest.TestCase):
     def test_administrator_permission_is_flagged(self):
         permissions = SimpleNamespace(
@@ -200,6 +259,7 @@ class PermissionWarningTests(unittest.TestCase):
             moderate_members=True,
             kick_members=True,
             ban_members=True,
+            view_audit_log=True,
         )
         with patch.object(bot.config, "ALLOW_ADMINISTRATOR_PERMISSION", False):
             warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
@@ -212,6 +272,7 @@ class PermissionWarningTests(unittest.TestCase):
             moderate_members=True,
             kick_members=True,
             ban_members=True,
+            view_audit_log=True,
         )
         with patch.object(bot.config, "ALLOW_ADMINISTRATOR_PERMISSION", True):
             warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
@@ -226,7 +287,10 @@ class PermissionWarningTests(unittest.TestCase):
             ban_members=True,
         )
         warnings = bot.permission_warnings(SimpleNamespace(guild_permissions=permissions))
-        self.assertTrue(any("멤버 타임아웃" in warning and "멤버 추방" in warning for warning in warnings))
+        self.assertTrue(any(
+            "멤버 타임아웃" in warning and "멤버 추방" in warning and "감사 로그 보기" in warning
+            for warning in warnings
+        ))
 
     def test_least_privilege_configuration_has_no_warning(self):
         permissions = SimpleNamespace(
@@ -235,6 +299,7 @@ class PermissionWarningTests(unittest.TestCase):
             moderate_members=True,
             kick_members=True,
             ban_members=True,
+            view_audit_log=True,
         )
         self.assertEqual(
             bot.permission_warnings(SimpleNamespace(guild_permissions=permissions)), []

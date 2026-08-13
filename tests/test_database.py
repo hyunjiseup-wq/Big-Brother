@@ -38,6 +38,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_initialized_database_passes_integrity_check(self):
         await database.validate_database_integrity()
 
+    async def test_discord_audit_cursor_only_moves_forward(self):
+        self.assertIsNone(await database.get_discord_audit_cursor(1))
+        await database.advance_discord_audit_cursor(1, 500)
+        await database.advance_discord_audit_cursor(1, 400)
+        self.assertEqual(await database.get_discord_audit_cursor(1), 500)
+        await database.advance_discord_audit_cursor(1, 700)
+        self.assertEqual(await database.get_discord_audit_cursor(1), 700)
+
     async def test_corrupt_existing_database_is_rejected_before_initialization(self):
         corrupt_path = os.path.join(self.temp_dir.name, "corrupt.db")
         with open(corrupt_path, "wb") as file:

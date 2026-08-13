@@ -143,6 +143,7 @@ def permission_warnings(member) -> list[str]:
         "moderate_members": "멤버 타임아웃",
         "kick_members": "멤버 추방",
         "ban_members": "멤버 차단",
+        "view_audit_log": "감사 로그 보기",
     }
     missing = [label for attr, label in required.items() if not getattr(permissions, attr, False)]
     if missing:
@@ -155,6 +156,7 @@ _LEVEL_ORDER = {"MINOR": 1, "MODERATE": 2, "SEVERE": 3, "EXTREME": 4}
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.moderation = True
 
 # 명령어 접두사: Big Brother의 약자 "BB". "!BB 점수"처럼 띄어 써도 "!BB점수"처럼
 # 붙여 써도 되고, 대소문자도 구분하지 않는다.
@@ -1919,6 +1921,50 @@ async def kpi_report_task():
                 print(f"[kpi-report] {period.key} 게시 실패: {type(error).__name__}")
 
 
+_audit_sync_permission_warned: set[int] = set()
+
+
+async def _sync_guild_audit_log(guild: discord.Guild) -> int:
+    """Gateway 누락·재연결 공백을 마지막 영속 커서 이후 감사 로그로 보충한다."""
+    cursor = await database.get_discord_audit_cursor(int(guild.id))
+    try:
+        if cursor is None:
+            # 최초 도입 시 과거 전체를 다시 수집하지 않고 현재 끝을 기준점으로 잡는다.
+            async for entry in guild.audit_logs(limit=1):
+                await database.advance_discord_audit_cursor(guild.id, entry.id)
+            return 0
+
+        processed = 0
+        async for entry in guild.audit_logs(
+            limit=500, after=discord.Object(id=cursor), oldest_first=True,
+        ):
+            if await _process_external_sanction_audit_entry(entry):
+                processed += 1
+            await database.advance_discord_audit_cursor(guild.id, entry.id)
+        _audit_sync_permission_warned.discard(int(guild.id))
+        return processed
+    except discord.Forbidden:
+        if int(guild.id) not in _audit_sync_permission_warned:
+            print(
+                f"[discord-audit] 서버 {guild.id}: 감사 로그 보기 권한이 없어 "
+                "관리자·외부 봇 제재 보충 수집을 할 수 없습니다."
+            )
+            _audit_sync_permission_warned.add(int(guild.id))
+        return 0
+    except discord.HTTPException as error:
+        print(f"[discord-audit] 서버 {guild.id} 보충 수집 실패: {type(error).__name__}")
+        return 0
+
+
+@tasks.loop(seconds=120)
+async def discord_audit_sync_task():
+    """2분마다 감사 로그 공백을 보충해 봇 재연결 중 제재 누락을 막는다."""
+    for guild in bot.guilds:
+        processed = await _sync_guild_audit_log(guild)
+        if processed:
+            print(f"[discord-audit] 서버 {guild.id} 제재 이력 {processed}건을 보충했습니다.")
+
+
 # 매일 정해진 시각(한국 시간)에만 실행 — 시작 즉시 실행되는 hours= 방식과 달리
 # 봇을 재시작해도 감사가 곧바로 돌지 않아 무료 API 한도를 아낀다.
 _KST = datetime.timezone(datetime.timedelta(hours=9))
@@ -1947,6 +1993,8 @@ async def close():
         batch_audit_task.cancel()
     if kpi_report_task.is_running():
         kpi_report_task.cancel()
+    if discord_audit_sync_task.is_running():
+        discord_audit_sync_task.cancel()
 
     # ai_worker는 Queue.get()에서 계속 대기하므로 명시적으로 취소해야 정상 종료 시
     # "Task was destroyed but it is pending" 경고와 미완료 작업 잔존을 막을 수 있다.
@@ -2005,6 +2053,8 @@ async def on_ready():
         batch_audit_task.start()
     if KPI_REPORT_CHANNEL_ID and not kpi_report_task.is_running():
         kpi_report_task.start()
+    if not discord_audit_sync_task.is_running():
+        discord_audit_sync_task.start()
     for guild in bot.guilds:
         for warning in permission_warnings(guild.me):
             print(f"[permissions] 서버 {guild.id}: {warning}")
@@ -2314,6 +2364,149 @@ async def _recent_timeout_audit_context(guild: discord.Guild, user_id: int):
     except (discord.Forbidden, discord.HTTPException):
         pass
     return None, "Discord에서 관리자가 직접 변경 (감사 로그 처리자 확인 불가)"
+
+
+def _audit_target_display(guild: discord.Guild, target, target_id: int) -> str:
+    """감사 로그 대상이 캐시에 없어 Object로 와도 안정적인 사용자 표기를 만든다."""
+    member = guild.get_member(target_id) if hasattr(guild, "get_member") else None
+    if member is not None:
+        return _member_ledger_display(member, target_id)
+    name = getattr(target, "display_name", None) or getattr(target, "name", None)
+    account = str(target) if target is not None else ""
+    if name:
+        return f"{name} ({account})" if account and account != name else str(name)
+    if account and not account.startswith("<Object "):
+        return account
+    return f"Discord 사용자 {target_id}"
+
+
+def _audit_actor_context(entry) -> tuple[int | None, str | None, str]:
+    actor = getattr(entry, "user", None)
+    actor_id = getattr(entry, "user_id", None) or getattr(actor, "id", None)
+    actor_display = _member_ledger_display(actor, actor_id) if actor_id else None
+    actor_kind = "외부 봇" if getattr(actor, "bot", False) else "관리자"
+    return actor_id, actor_display, actor_kind
+
+
+def _audit_timeout_timestamp(value) -> float:
+    return value.timestamp() if value is not None and hasattr(value, "timestamp") else 0.0
+
+
+async def _process_external_sanction_audit_entry(entry) -> bool:
+    """관리자·다른 봇의 Discord 기본 제재 감사 항목을 원장에 반영한다."""
+    action = getattr(entry, "action", None)
+    supported = {
+        discord.AuditLogAction.ban,
+        discord.AuditLogAction.unban,
+        discord.AuditLogAction.kick,
+        discord.AuditLogAction.message_delete,
+        discord.AuditLogAction.message_bulk_delete,
+        discord.AuditLogAction.member_update,
+    }
+    if action not in supported:
+        return False
+
+    guild = getattr(entry, "guild", None)
+    target = getattr(entry, "target", None)
+    target_id = getattr(target, "id", None)
+    if guild is None or target_id is None:
+        return False
+
+    actor_id, actor_display, actor_kind = _audit_actor_context(entry)
+    own_user_id = getattr(getattr(bot, "user", None), "id", None)
+    if own_user_id is not None and actor_id == own_user_id:
+        # BB봇이 직접 실행한 조치는 검수/명령 처리 시 이미 원장에 기록한다.
+        return False
+
+    entry_id = int(getattr(entry, "id"))
+    issued_at = getattr(entry, "created_at", None)
+    issued_ts = issued_at.timestamp() if issued_at is not None else time.time()
+    display = _audit_target_display(guild, target, int(target_id))
+    reason = getattr(entry, "reason", None)
+
+    if action == discord.AuditLogAction.ban:
+        await database.record_sanction(
+            guild.id, target_id, display, "BAN",
+            reason or f"{actor_kind}가 Discord에서 차단 (사유 미입력)",
+            "discord_audit", f"discord-ban:{target_id}:{entry_id}",
+            issued_by_id=actor_id, issued_by_display=actor_display,
+            issued_at=issued_ts,
+        )
+        return True
+
+    if action == discord.AuditLogAction.unban:
+        await database.release_active_sanctions(
+            guild.id, target_id, "BAN",
+            reason or f"{actor_kind}가 Discord에서 차단 해제 (사유 미입력)",
+            released_by_id=actor_id, released_by_display=actor_display,
+            released_at=issued_ts,
+        )
+        return True
+
+    if action == discord.AuditLogAction.kick:
+        await database.record_sanction(
+            guild.id, target_id, display, "KICK",
+            reason or f"{actor_kind}가 Discord에서 추방 (사유 미입력)",
+            "discord_audit", f"discord-kick:{target_id}:{entry_id}",
+            issued_by_id=actor_id, issued_by_display=actor_display,
+            issued_at=issued_ts,
+        )
+        return True
+
+    if action in {
+        discord.AuditLogAction.message_delete,
+        discord.AuditLogAction.message_bulk_delete,
+    }:
+        extra = getattr(entry, "extra", None)
+        count = max(1, int(getattr(extra, "count", 1) or 1))
+        channel = getattr(extra, "channel", None)
+        channel_label = getattr(channel, "mention", None) or (
+            f"#{channel.name}" if getattr(channel, "name", None) else "채널 미확인"
+        )
+        detail = f"메시지 {count:,}건 삭제 · {channel_label}"
+        await database.record_sanction(
+            guild.id, target_id, display, "DELETE",
+            f"{reason} ({detail})" if reason else f"{actor_kind} 조치: {detail}",
+            "discord_audit", f"discord-delete:{target_id}:{entry_id}",
+            issued_by_id=actor_id, issued_by_display=actor_display,
+            issued_at=issued_ts,
+        )
+        return True
+
+    before_until = getattr(getattr(entry, "before", None), "timed_out_until", None)
+    after_until = getattr(getattr(entry, "after", None), "timed_out_until", None)
+    if before_until is None and after_until is None:
+        return False
+    before_ts = _audit_timeout_timestamp(before_until)
+    after_ts = _audit_timeout_timestamp(after_until)
+    if after_ts > issued_ts:
+        if before_ts > issued_ts:
+            await database.release_active_sanctions(
+                guild.id, target_id, "TIMEOUT", "타임아웃 기간 변경",
+                released_by_id=actor_id, released_by_display=actor_display,
+                released_at=issued_ts,
+            )
+        await database.record_sanction(
+            guild.id, target_id, display, "TIMEOUT",
+            reason or f"{actor_kind}가 Discord에서 타임아웃 적용 (사유 미입력)",
+            "discord_audit", f"discord-timeout:{target_id}:{int(after_ts)}",
+            issued_by_id=actor_id, issued_by_display=actor_display,
+            issued_at=issued_ts, expires_at=after_ts,
+        )
+    elif before_ts > 0:
+        await database.release_active_sanctions(
+            guild.id, target_id, "TIMEOUT",
+            reason or f"{actor_kind}가 Discord에서 타임아웃 해제 (사유 미입력)",
+            released_by_id=actor_id, released_by_display=actor_display,
+            released_at=issued_ts,
+        )
+    return True
+
+
+@bot.event
+async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
+    """실시간 감사 로그로 관리자·외부 봇의 Discord 기본 제재를 수집한다."""
+    await _process_external_sanction_audit_entry(entry)
 
 
 @bot.event

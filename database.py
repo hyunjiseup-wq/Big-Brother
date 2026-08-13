@@ -329,6 +329,15 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_sanction_sync_due "
             "ON sanction_sync_outbox(next_attempt_at, sanction_id)"
         )
+        # Discord 감사 로그 실시간 이벤트가 누락되거나 봇이 잠시 재연결돼도
+        # 마지막 확인 지점 이후의 관리자·외부 봇 제재를 다시 읽기 위한 커서다.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS discord_audit_cursors (
+                guild_id INTEGER PRIMARY KEY,
+                last_entry_id INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
 
         # 배치 감사의 커버리지 KPI. 감사 리포트 원문을 다시 파싱하지 않고 실행 단위의
         # 검토량·의심 감지·실패 채널 수를 장기 보존한다.
@@ -794,6 +803,32 @@ async def count_sanction_sync_pending(guild_id: int | None = None) -> int:
                 (int(guild_id),),
             )
         return int((await cursor.fetchone())[0])
+
+
+async def get_discord_audit_cursor(guild_id: int) -> int | None:
+    """마지막으로 보충 확인을 마친 Discord 감사 로그 항목 ID."""
+    async with _connect() as db:
+        row = await (await db.execute(
+            "SELECT last_entry_id FROM discord_audit_cursors WHERE guild_id = ?",
+            (int(guild_id),),
+        )).fetchone()
+        return int(row[0]) if row else None
+
+
+async def advance_discord_audit_cursor(guild_id: int, entry_id: int) -> None:
+    """감사 로그 커서를 뒤로 이동시키지 않고 원자적으로 전진시킨다."""
+    now = time.time()
+    async with _connect() as db:
+        await db.execute(
+            """INSERT INTO discord_audit_cursors (guild_id, last_entry_id, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(guild_id) DO UPDATE SET
+                 last_entry_id = MAX(last_entry_id, excluded.last_entry_id),
+                 updated_at = CASE WHEN excluded.last_entry_id > last_entry_id
+                                   THEN excluded.updated_at ELSE updated_at END""",
+            (int(guild_id), int(entry_id), now),
+        )
+        await db.commit()
 
 
 async def release_active_sanctions(
