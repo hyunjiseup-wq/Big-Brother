@@ -79,6 +79,25 @@ class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("유튜브 영상 링크", note)
         self.assertIn("본인 채널", note)
 
+    def test_suspicious_player_report_channel_receives_evidence_form_rule(self):
+        channel = SimpleNamespace(
+            id=1445049743150415923,
+            parent_id=None,
+            parent=None,
+            name="핵의심-신고",
+        )
+        note = moderator.get_channel_note(channel)
+        self.assertIn("게임 닉네임", note)
+        self.assertIn("레이드한 서버", note)
+        self.assertIn("의심 사유", note)
+        self.assertIn("오버롤", note)
+        prompt = moderator._user_prompt(
+            "닉네임: suspect / 서버: 서울 / 맵: 세관 / 사유: 벽 너머 선조준",
+            note,
+        )
+        self.assertIn("신고에 필요한 게임 내 정보", prompt)
+        self.assertIn("다른 Discord 서버 초대나 현실 위치 공개가 아니며", prompt)
+
     def test_invalid_level_is_not_silently_cached_as_none(self):
         with self.assertRaisesRegex(ValueError, "알 수 없는 위반 등급"):
             moderator._build_result(

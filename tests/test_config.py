@@ -83,6 +83,22 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("피싱·악성 링크", video_note)
         self.assertIn("다른 디스코드 서버 초대", video_note)
 
+    def test_suspicious_player_report_policy_allows_gameplay_evidence_fields(self):
+        report_note = config.CHANNEL_CONTEXT_NOTES[1445049743150415923]
+        for expected in (
+            "게임 닉네임",
+            "레이드한 서버",
+            "맵",
+            "의심 사유",
+            "오버롤",
+            "스크린샷",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, report_note)
+        self.assertIn("다른 Discord 서버 초대나 현실 위치 공개가 아니며", report_note)
+        self.assertIn("신고 양식 일부가 빠졌더라도", report_note)
+        self.assertIn("양식 보완은 관리자 안내 대상", report_note)
+
     def test_invalid_barter_context_settings_are_rejected(self):
         for name, value in (
             ("BARTER_CHANNEL_IDS", [123, "bad"]),
