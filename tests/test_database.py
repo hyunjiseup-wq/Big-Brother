@@ -105,14 +105,21 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await database.claim_review(review_id, 1))
         result = await database.resolve_review_as_false_positive(
             review_id, 1, 10, "hash", "safe message", 99, "정상 처리",
+            "게임 내 플리마켓 거래 설명이라 정상",
         )
         self.assertIsNotNone(result)
         rules = await database.list_false_positive_rules(1)
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0][1:3], (10, "safe message"))
+        self.assertEqual(rules[0][6], "게임 내 플리마켓 거래 설명이라 정상")
         self.assertFalse(await database.release_review(review_id, 1))
         examples = await database.get_moderation_training_examples(1)
         self.assertEqual(examples[0][:3], ("safe message", "normal", "NONE"))
+        async with database._connect() as db:
+            row = await (await db.execute(
+                "SELECT review_note FROM violation_log WHERE id = ?", (review_id,)
+            )).fetchone()
+        self.assertEqual(row[0], "게임 내 플리마켓 거래 설명이라 정상")
 
     async def test_review_preserves_learning_scope_and_thread_rules_can_be_migrated(self):
         review_id = await database.create_review_record(

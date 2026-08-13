@@ -146,6 +146,7 @@ class ConfigValidationTests(unittest.TestCase):
             ("SPLIT_MESSAGE_CONTEXT_ENABLED", "true"),
             ("REPLY_CONTEXT_ENABLED", "true"),
             ("REPLY_CONTEXT_MAX_CHARS", 0),
+            ("LEARNING_EXPLANATION_MAX_CHARS", 0),
             ("SPLIT_MESSAGE_SETTLE_SECONDS", -1),
             ("SPLIT_MESSAGE_WINDOW_SECONDS", 0),
             ("SPLIT_MESSAGE_MAX_MESSAGES", 1),

@@ -931,6 +931,16 @@ class ManualReviewSanctionEvidenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReviewCompletionCardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_learning_button_uses_required_explanation_modal(self):
+        modal = bot._LearningExplanationModal(
+            SimpleNamespace(), "ok", 10, 20, 30, review_id=40
+        )
+        self.assertIn("현재 채널", modal.title)
+        self.assertEqual(len(modal.children), 1)
+        field = modal.children[0]
+        self.assertTrue(field.required)
+        self.assertEqual(field.max_length, bot.config.LEARNING_EXPLANATION_MAX_CHARS)
+
     async def test_recent_card_is_edited_in_place(self):
         channel = SimpleNamespace(send=AsyncMock())
         message = SimpleNamespace(

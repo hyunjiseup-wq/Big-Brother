@@ -989,7 +989,8 @@ async def _repair_historical_thread_learning_scopes() -> int:
 
 async def _apply_review_action(guild: discord.Guild, log_message: discord.Message,
                                admin, action: str, channel_id: int, message_id: int,
-                               user_id: int, review_id: int = 0):
+                               user_id: int, review_id: int = 0,
+                               learning_explanation: str | None = None):
     """검수 버튼에 해당하는 실제 조치를 실행한다. 반환: (성공 여부, 결과/오류 설명)"""
     embed = log_message.embeds[0]
     level = _embed_field(embed, "위반 등급", "MODERATE")
@@ -997,6 +998,11 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
     reason_text = _embed_field(embed, "사유", "-")
     original_content = _embed_field(embed, "원문", "")
     reason = f"[{level}] 관리자 검수 확정({admin}) - {reason_text}"[:480]
+    learning_explanation = " ".join((learning_explanation or "").split())[
+        :config.LEARNING_EXPLANATION_MAX_CHARS
+    ] or None
+    if action in ("ok", "okg") and learning_explanation is None:
+        return False, "정상 학습 근거를 입력해야 합니다."
 
     member = guild.get_member(user_id)
     if (action in ("to1", "to24", "kick")
@@ -1152,11 +1158,13 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
                 learned = await learning.record_review_false_positive(
                     review_id, guild.id, channel_for_scope, admin.id,
                     action_label, server_wide=server_wide,
+                    learning_explanation=learning_explanation,
                 )
             else:
                 learned = await learning.record_false_positive(
                     guild.id, channel_for_scope, content_for_learning, level,
                     reason_text, admin.id, server_wide=server_wide,
+                    learning_explanation=learning_explanation,
                 )
         except Exception as e:
             print(f"[learning] 오탐 검수 저장 실패: {e}")
@@ -1165,6 +1173,7 @@ async def _apply_review_action(guild: discord.Guild, log_message: discord.Messag
             return await fail("학습할 원문을 찾지 못했습니다. 검수 로그를 확인해주세요.")
         scope_text = "서버 전체" if server_wide else "현재 채널"
         applied += f" · 오탐 학습됨 ({scope_text}, 규칙 #{learned['id'] if isinstance(learned, dict) else learned})"
+        applied += f"\n학습 근거: {learning_explanation}"
 
     if dm_text and not dm_ok:
         applied += " · DM 전달 실패"
@@ -1215,6 +1224,53 @@ async def _publish_review_completion(log_message: discord.Message,
         print(f"[review] 처리된 기존 카드 정리 실패: {type(e).__name__}")
         return "reposted"
     return "replaced"
+
+
+class _LearningExplanationModal(discord.ui.Modal):
+    """정상 학습을 확정하기 전에 관리자의 문맥 근거를 받는다."""
+
+    def __init__(self, log_message: discord.Message, action: str,
+                 channel_id: int, message_id: int, user_id: int, review_id: int = 0):
+        scope = "서버 전체" if action == "okg" else "현재 채널"
+        super().__init__(title=f"정상 학습 근거 · {scope}", timeout=300)
+        self.log_message = log_message
+        self.action = action
+        self.channel_id = channel_id
+        self.message_id = message_id
+        self.user_id = user_id
+        self.review_id = review_id
+        self.explanation = discord.ui.TextInput(
+            label="왜 정상이며 무엇을 학습해야 하나요?",
+            placeholder=(
+                "예: 답글 원문을 부정한 말이며, 계좌 거래 동의가 아니라 "
+                "게임 내 플리마켓 사용을 설명한 문맥임"
+            ),
+            style=discord.TextStyle.paragraph,
+            required=True,
+            min_length=2,
+            max_length=config.LEARNING_EXPLANATION_MAX_CHARS,
+        )
+        self.add_item(self.explanation)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        ok, text = await _apply_review_action(
+            interaction.guild, self.log_message, interaction.user,
+            self.action, self.channel_id, self.message_id, self.user_id,
+            self.review_id, learning_explanation=str(self.explanation.value),
+        )
+        if not ok:
+            await interaction.followup.send(f"⚠️ {text}", ephemeral=True)
+            return
+        embed = self.log_message.embeds[0]
+        _finalize_review_embed(embed, self.action, text, interaction.user)
+        card_status = await _publish_review_completion(self.log_message, embed)
+        status_note = {
+            "failed": "\n⚠️ 학습은 저장됐지만 검토 카드 화면을 갱신하지 못했습니다.",
+            "replaced": "\nℹ️ 오래된 검토 카드는 새 완료 카드로 교체했습니다.",
+            "reposted": "\nℹ️ 새 완료 카드를 게시했으며 기존 버튼은 재사용할 수 없습니다.",
+        }.get(card_status, "")
+        await interaction.followup.send(f"✅ 완료: {text}{status_note}", ephemeral=True)
 
 
 class _DangerConfirmView(discord.ui.View):
@@ -1288,6 +1344,12 @@ async def on_interaction(interaction: discord.Interaction):
     perms = getattr(interaction.user, "guild_permissions", None)
     if perms is None or not perms.administrator:
         await interaction.response.send_message("⛔ 검수 버튼은 관리자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    if action in ("ok", "okg"):
+        await interaction.response.send_modal(_LearningExplanationModal(
+            interaction.message, action, channel_id, message_id, user_id, review_id
+        ))
         return
 
     if action in ("kick", "ban"):
@@ -3179,12 +3241,13 @@ async def show_false_positive_rules(ctx, limit: int = 15):
         await ctx.send("등록된 오탐 학습 규칙이 없습니다.")
         return
     lines = []
-    for rule_id, scope_id, content, level, marked_by, _ in rows:
+    for rule_id, scope_id, content, level, marked_by, _, explanation in rows:
         scope = "서버 전체" if scope_id == 0 else f"<#{scope_id}>"
         snippet = " ".join((content or "").split())[:80]
+        explanation_text = f"\n  근거: {explanation[:180]}" if explanation else ""
         lines.append(
             f"`#{rule_id}` · {scope} · 이전 판단 `{level or 'UNKNOWN'}` · "
-            f"등록자 <@{marked_by}>\n> {snippet}"
+            f"등록자 <@{marked_by}>\n> {snippet}{explanation_text}"
         )
     embed = discord.Embed(
         title="오탐 학습 규칙",

@@ -143,6 +143,8 @@ async def init_db():
         # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
         # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
         await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
+        # 관리자 확정 근거. 원문/AI 사유와 분리해 인수인계와 학습 설명에 사용한다.
+        await _ensure_column(db, "violation_log", "review_note", "TEXT")
         # processing 상태는 자동으로 pending으로 되돌리지 않는다. 외부 제재 성공 직후
         # DB 확정 전에 프로세스가 종료됐을 수 있어 자동 재시도하면 중복 제재가 된다.
 
@@ -245,6 +247,7 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_false_positive_rule_recent "
             "ON false_positive_rules(guild_id, updated_at DESC)"
         )
+        await _ensure_column(db, "false_positive_rules", "learning_explanation", "TEXT")
 
         # Only administrator-confirmed outcomes become training labels. Message text is
         # deliberately not duplicated here; it remains subject to violation_log retention.
@@ -1746,24 +1749,27 @@ async def upsert_false_positive_rule(guild_id: int, scope_channel_id: int,
                                      content_hash: str, content: str,
                                      wrong_level: str | None, wrong_reason: str | None,
                                      source_channel_id: int | None,
-                                     marked_by: int | None) -> int:
+                                     marked_by: int | None,
+                                     learning_explanation: str | None = None) -> int:
     now = time.time()
     async with _connect() as db:
         await db.execute(
             """INSERT INTO false_positive_rules
                (guild_id, scope_channel_id, content_hash, content, wrong_level, wrong_reason,
-                source_channel_id, marked_by, active, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                source_channel_id, marked_by, active, created_at, updated_at,
+                learning_explanation)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                ON CONFLICT(guild_id, scope_channel_id, content_hash) DO UPDATE SET
                    content = excluded.content,
                    wrong_level = excluded.wrong_level,
                    wrong_reason = excluded.wrong_reason,
                    source_channel_id = excluded.source_channel_id,
                    marked_by = excluded.marked_by,
+                   learning_explanation = excluded.learning_explanation,
                    active = 1,
                    updated_at = excluded.updated_at""",
             (guild_id, scope_channel_id, content_hash, content, wrong_level, wrong_reason,
-             source_channel_id, marked_by, now, now),
+             source_channel_id, marked_by, now, now, learning_explanation),
         )
         cursor = await db.execute(
             """SELECT id FROM false_positive_rules
@@ -1778,7 +1784,8 @@ async def upsert_false_positive_rule(guild_id: int, scope_channel_id: int,
 async def resolve_review_as_false_positive(review_id: int, guild_id: int,
                                            scope_channel_id: int, content_hash: str,
                                            stored_content: str,
-                                           reviewer_id: int, action_taken: str):
+                                           reviewer_id: int, action_taken: str,
+                                           learning_explanation: str | None = None):
     """검수 완료와 오탐 규칙 저장을 한 트랜잭션으로 처리한다."""
     async with _connect() as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -1798,18 +1805,20 @@ async def resolve_review_as_false_positive(review_id: int, guild_id: int,
         await db.execute(
             """INSERT INTO false_positive_rules
                (guild_id, scope_channel_id, content_hash, content, wrong_level, wrong_reason,
-                source_channel_id, marked_by, active, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                source_channel_id, marked_by, active, created_at, updated_at,
+                learning_explanation)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                ON CONFLICT(guild_id, scope_channel_id, content_hash) DO UPDATE SET
                    content = excluded.content,
                    wrong_level = excluded.wrong_level,
                    wrong_reason = excluded.wrong_reason,
                    source_channel_id = excluded.source_channel_id,
                    marked_by = excluded.marked_by,
+                   learning_explanation = excluded.learning_explanation,
                    active = 1,
                    updated_at = excluded.updated_at""",
             (guild_id, scope_channel_id, content_hash, stored_content, wrong_level, wrong_reason,
-             source_channel_id, reviewer_id, now, now),
+             source_channel_id, reviewer_id, now, now, learning_explanation),
         )
         rule_cursor = await db.execute(
             """SELECT id FROM false_positive_rules
@@ -1820,9 +1829,9 @@ async def resolve_review_as_false_positive(review_id: int, guild_id: int,
         updated = await db.execute(
             """UPDATE violation_log
                SET review_status = 'false_positive', reviewed_at = ?, reviewed_by = ?,
-                   action_taken = ?, needs_review = 0
+                   action_taken = ?, review_note = ?, needs_review = 0
                WHERE id = ? AND guild_id = ? AND review_status = 'processing'""",
-            (now, reviewer_id, action_taken, review_id, guild_id),
+            (now, reviewer_id, action_taken, learning_explanation, review_id, guild_id),
         )
         if updated.rowcount != 1:
             await db.rollback()
@@ -1867,7 +1876,7 @@ async def migrate_false_positive_thread_scope(guild_id: int, source_channel_id: 
         await db.execute("BEGIN IMMEDIATE")
         cursor = await db.execute(
             """SELECT id, content_hash, content, wrong_level, wrong_reason, marked_by,
-                      created_at, updated_at
+                      created_at, updated_at, learning_explanation
                FROM false_positive_rules
                WHERE guild_id = ? AND source_channel_id = ?
                  AND scope_channel_id = ? AND active = 1""",
@@ -1880,17 +1889,22 @@ async def migrate_false_positive_thread_scope(guild_id: int, source_channel_id: 
 
         now = time.time()
         for (_, stored_hash, content, wrong_level, wrong_reason, marked_by,
-             created_at, updated_at) in rows:
+             created_at, updated_at, learning_explanation) in rows:
             await db.execute(
                 """INSERT INTO false_positive_rules
                    (guild_id, scope_channel_id, content_hash, content, wrong_level,
-                    wrong_reason, source_channel_id, marked_by, active, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    wrong_reason, source_channel_id, marked_by, active, created_at, updated_at,
+                    learning_explanation)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                    ON CONFLICT(guild_id, scope_channel_id, content_hash) DO UPDATE SET
                        active = 1,
+                       learning_explanation = COALESCE(
+                           excluded.learning_explanation,
+                           false_positive_rules.learning_explanation
+                       ),
                        updated_at = MAX(false_positive_rules.updated_at, excluded.updated_at)""",
                 (guild_id, parent_scope_id, stored_hash, content, wrong_level, wrong_reason,
-                 source_channel_id, marked_by, created_at, updated_at),
+                 source_channel_id, marked_by, created_at, updated_at, learning_explanation),
             )
 
         row_ids = [int(row[0]) for row in rows]
@@ -1924,7 +1938,8 @@ async def get_recent_false_positive_rules(guild_id: int, scope_channel_id: int,
                                           limit: int = 15):
     async with _connect() as db:
         cursor = await db.execute(
-            """SELECT id, scope_channel_id, content, wrong_level, updated_at
+            """SELECT id, scope_channel_id, content, wrong_level, updated_at,
+                      learning_explanation
                FROM false_positive_rules
                WHERE guild_id = ? AND active = 1
                  AND scope_channel_id IN (0, ?)
@@ -1938,7 +1953,8 @@ async def get_recent_false_positive_rules(guild_id: int, scope_channel_id: int,
 async def list_false_positive_rules(guild_id: int, limit: int = 20):
     async with _connect() as db:
         cursor = await db.execute(
-            """SELECT id, scope_channel_id, content, wrong_level, marked_by, updated_at
+            """SELECT id, scope_channel_id, content, wrong_level, marked_by, updated_at,
+                      learning_explanation
                FROM false_positive_rules
                WHERE guild_id = ? AND active = 1
                ORDER BY updated_at DESC LIMIT ?""",

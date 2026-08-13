@@ -336,6 +336,7 @@ REPLY_CONTEXT_MAX_CHARS = 1200
 FALSE_POSITIVE_PROMPT_EXAMPLES = 15      # 프롬프트에 포함할 최근 오탐 사례 수 (0 = 프롬프트 학습 비활성)
 FALSE_POSITIVE_EXAMPLE_MAX_CHARS = 120   # 사례 하나당 프롬프트에 넣을 원문 길이 제한
 FALSE_POSITIVE_REFRESH_SECONDS = 300     # 오탐 사례 목록을 DB에서 다시 읽는 주기(초)
+LEARNING_EXPLANATION_MAX_CHARS = 500     # 관리자가 정상 학습 시 입력하는 근거 최대 길이
 
 # ── AI 판단 장애 알림 ────────────────────────────────────────────────
 # Gemini와 Groq가 둘 다 실패하면 메시지는 안전하게 "위반 없음" 처리되지만(무고한 제재 방지),
@@ -705,6 +706,10 @@ def validate_config() -> None:
     if (FALSE_POSITIVE_PROMPT_EXAMPLES < 0 or FALSE_POSITIVE_EXAMPLE_MAX_CHARS <= 0
             or FALSE_POSITIVE_REFRESH_SECONDS <= 0):
         errors.append("오탐 학습 설정(FALSE_POSITIVE_*) 값이 올바르지 않습니다.")
+    if (isinstance(LEARNING_EXPLANATION_MAX_CHARS, bool)
+            or not isinstance(LEARNING_EXPLANATION_MAX_CHARS, int)
+            or not 10 <= LEARNING_EXPLANATION_MAX_CHARS <= 1000):
+        errors.append("LEARNING_EXPLANATION_MAX_CHARS는 10~1000의 정수여야 합니다.")
     if SPAM_WINDOW_SECONDS <= 0 or not 2 <= SPAM_REPEAT_THRESHOLD <= 20:
         errors.append("스팸 시간은 양수이고 반복 임계값은 2~20이어야 합니다.")
     if MIN_LENGTH_FOR_AI_CHECK < 0:

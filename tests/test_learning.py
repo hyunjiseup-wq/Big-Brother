@@ -42,6 +42,18 @@ class LearningTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await learning.is_known_false_positive(1, 10, "시발"))
         self.assertIsNone(await learning.get_prompt_examples(1, 10))
 
+    async def test_admin_explanation_makes_contextual_example_useful_without_auto_skip(self):
+        await learning.record_false_positive(
+            1, 10, "네", "MODERATE", "현금 거래 동조로 오판", 99,
+            learning_explanation=(
+                "답글 원문의 계좌 거래 질문을 부정하고 게임 내 플리마켓을 설명한 대화임"
+            ),
+        )
+        self.assertFalse(await learning.is_known_false_positive(1, 10, "네"))
+        examples = await learning.get_prompt_examples(1, 10)
+        self.assertEqual(examples[0]["content"], "네")
+        self.assertIn("플리마켓", examples[0]["administrator_explanation"])
+
     async def test_prompt_examples_are_sanitized_and_rule_can_be_removed(self):
         rule_id = await learning.record_false_positive(
             1, 10, "@everyone see https://example.com\x01", "MINOR", "wrong", 99,
