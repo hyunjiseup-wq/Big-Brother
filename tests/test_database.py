@@ -153,6 +153,24 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history[0]["release_reason"], "상황 종료")
         self.assertEqual(await database.count_kpi_sync_pending(), 1)
 
+    async def test_legacy_sanction_import_is_idempotent_and_preserves_actor(self):
+        values = dict(
+            guild_id=1, user_id=50, user_display="대상", action_type="BAN",
+            reason="과거 밴", dedupe_key="legacy-moderation:abc", status="released",
+            issued_at=100, released_at=200, issued_by_id=99,
+            issued_by_display="운영진", release_reason="이의제기 승인",
+        )
+        first_id, first_inserted = await database.import_sanction_record(**values)
+        second_id, second_inserted = await database.import_sanction_record(**values)
+        self.assertEqual(first_id, second_id)
+        self.assertTrue(first_inserted)
+        self.assertFalse(second_inserted)
+        self.assertEqual(await database.count_sanction_sync_pending(1), 1)
+        history = await database.get_sanction_history(1, 50)
+        self.assertEqual(history[0]["action_type"], "BAN")
+        self.assertEqual(history[0]["issued_by_id"], 99)
+        self.assertEqual(history[0]["release_reason"], "이의제기 승인")
+
     async def test_elapsed_timeout_is_marked_expired(self):
         sanction_id = await database.record_sanction(
             1, 50, "테스트유저", "TIMEOUT", "테스트", "review", "review:1",

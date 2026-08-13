@@ -719,6 +719,83 @@ async def record_sanction(
         return sanction_id
 
 
+async def import_sanction_record(
+    guild_id: int,
+    user_id: int,
+    user_display: str,
+    action_type: str,
+    reason: str,
+    dedupe_key: str,
+    *,
+    status: str,
+    issued_at: float,
+    expires_at: float | None = None,
+    released_at: float | None = None,
+    issued_by_id: int | None = None,
+    issued_by_display: str | None = None,
+    released_by_id: int | None = None,
+    released_by_display: str | None = None,
+    release_reason: str | None = None,
+) -> tuple[int, bool]:
+    """외부 제재 이력을 원형대로 한 번만 가져오고 사이트 동기화 큐에 등록한다."""
+    if status not in {"active", "released", "expired"}:
+        raise ValueError(f"지원하지 않는 가져오기 상태: {status}")
+    now = time.time()
+    key = str(dedupe_key)[:160]
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        inserted = await db.execute(
+            """INSERT OR IGNORE INTO sanction_records
+               (guild_id, user_id, user_display, action_type, reason, source, status,
+                issued_at, expires_at, released_at, issued_by_id, issued_by_display,
+                released_by_id, released_by_display, release_reason, review_id,
+                dedupe_key, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'legacy_import', ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       NULL, ?, ?, ?)""",
+            (
+                int(guild_id), int(user_id), str(user_display)[:120],
+                str(action_type)[:32], str(reason)[:1000], status,
+                float(issued_at), expires_at, released_at, issued_by_id,
+                str(issued_by_display)[:120] if issued_by_display else None,
+                released_by_id,
+                str(released_by_display)[:120] if released_by_display else None,
+                str(release_reason)[:1000] if release_reason else None,
+                key, now, now,
+            ),
+        )
+        row = await (await db.execute(
+            "SELECT id FROM sanction_records WHERE guild_id = ? AND dedupe_key = ?",
+            (int(guild_id), key),
+        )).fetchone()
+        if row is None:
+            await db.rollback()
+            raise RuntimeError("가져온 제재 기록 ID를 확인하지 못했습니다.")
+        sanction_id = int(row[0])
+        was_inserted = inserted.rowcount == 1
+        if was_inserted:
+            await db.execute(
+                """INSERT OR REPLACE INTO sanction_sync_outbox
+                   (sanction_id, guild_id, attempts, next_attempt_at, last_error, updated_at)
+                   VALUES (?, ?, 0, 0, NULL, ?)""",
+                (sanction_id, int(guild_id), now),
+            )
+        await db.commit()
+        return sanction_id, was_inserted
+
+
+async def count_sanction_sync_pending(guild_id: int | None = None) -> int:
+    """스태프 원장 사이트로 아직 전달되지 않은 제재 기록 수."""
+    async with _connect() as db:
+        if guild_id is None:
+            cursor = await db.execute("SELECT COUNT(*) FROM sanction_sync_outbox")
+        else:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM sanction_sync_outbox WHERE guild_id = ?",
+                (int(guild_id),),
+            )
+        return int((await cursor.fetchone())[0])
+
+
 async def release_active_sanctions(
     guild_id: int,
     user_id: int,
