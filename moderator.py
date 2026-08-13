@@ -706,6 +706,39 @@ def apply_ambiguous_emote_guard(
     )
 
 
+_SECURE_CONTAINER_SLANG_PATTERN = re.compile(r"빤스|팬티", re.IGNORECASE)
+_SECURE_CONTAINER_FALSE_POSITIVE_PATTERN = re.compile(
+    r"성적|음란|외설|선정적|속옷|부적절한\s*(?:단어|표현|콘텐츠)|가이드라인",
+    re.IGNORECASE,
+)
+_SECURE_CONTAINER_REAL_ABUSE_PATTERN = re.compile(
+    r"(?:벗|탈의|노출|야동|성희롱|성적\s*(?:요구|대상화)|몸|신체|가슴|엉덩|"
+    r"사진\s*(?:보여|보내|달라)|보여\s*(?:줘|주세요)|색깔|사이즈|입은|입어\s*(?:봐|줘))",
+    re.IGNORECASE,
+)
+_SECURE_CONTAINER_ABUSIVE_VERDICT_PATTERN = re.compile(
+    r"성희롱|모욕|괴롭|조롱|비하|상대(?:방|방의|에게)|특정\s*(?:인물|사용자|유저)",
+    re.IGNORECASE,
+)
+
+
+def apply_tarkov_security_container_guard(
+        result: "ModerationResult", content: str) -> "ModerationResult":
+    """타르코프 보안 컨테이너 은어를 단어만으로 성적 표현이라 본 오탐을 해제한다."""
+    if result.level == "NONE" or not _SECURE_CONTAINER_SLANG_PATTERN.search(content or ""):
+        return result
+    verdict_text = f"{result.rule_violated} {result.reason}"
+    if (not _SECURE_CONTAINER_FALSE_POSITIVE_PATTERN.search(verdict_text)
+            or _SECURE_CONTAINER_REAL_ABUSE_PATTERN.search(content or "")
+            or _SECURE_CONTAINER_ABUSIVE_VERDICT_PATTERN.search(verdict_text)):
+        return result
+    return ModerationResult(
+        "NONE", "NONE",
+        "빤스·팬티는 이 커뮤니티에서 타르코프 보안 컨테이너를 뜻하는 게임 은어임",
+        provider=result.provider,
+    )
+
+
 def _parse_json_response(raw_text: str) -> dict:
     cleaned = raw_text.replace("```json", "").replace("```", "").strip()
     return json.loads(cleaned)
@@ -943,6 +976,7 @@ async def classify_message(content: str, channel_note: str | None = None,
             )
             guarded = apply_casual_speech_guard(guarded, content)
             guarded = apply_ambiguous_emote_guard(guarded, content)
+            guarded = apply_tarkov_security_container_guard(guarded, content)
             guarded = apply_barter_verification_link_guard(guarded, content)
             return apply_tarkov_info_link_guard(guarded, content)
         except Exception as error:
@@ -1244,6 +1278,9 @@ async def classify_batch(messages: list[dict], backend: str = "auto",
             )
         result = apply_casual_speech_guard(result, messages[i].get("content", ""))
         result = apply_ambiguous_emote_guard(result, messages[i].get("content", ""))
+        result = apply_tarkov_security_container_guard(
+            result, messages[i].get("content", "")
+        )
         result = apply_barter_verification_link_guard(
             result, messages[i].get("content", "")
         )

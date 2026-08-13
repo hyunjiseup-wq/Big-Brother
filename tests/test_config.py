@@ -49,6 +49,11 @@ class ConfigValidationTests(unittest.TestCase):
         self.assertIn("부들부들", config.SERVER_RULES)
         self.assertIn("앞뒤 대화", config.SERVER_RULES)
 
+    def test_tarkov_security_container_slang_is_documented(self):
+        self.assertIn('"빤스"와 "팬티"', config.SERVER_RULES)
+        self.assertIn("보안 컨테이너", config.SERVER_RULES)
+        self.assertIn("실제 속옷", config.SERVER_RULES)
+
     def test_sherpa_lobby_allows_same_guild_training_channel_guidance(self):
         lobby_id = 1442471746660995113
         note = config.CHANNEL_CONTEXT_NOTES[lobby_id]

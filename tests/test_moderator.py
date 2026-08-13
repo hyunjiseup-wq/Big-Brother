@@ -66,8 +66,45 @@ class ModeratorBatchTests(unittest.IsolatedAsyncioTestCase):
             results = await moderator.classify_batch(messages, backend="ollama")
         self.assertEqual((results[0].level, results[0].rule_violated), ("NONE", "NONE"))
 
+    async def test_batch_clears_security_container_slang_false_positive(self):
+        messages = [{
+            "index": 0,
+            "author_ref": "user_1",
+            "content": "그래픽카드 먹으면 빤스에 넣으세요",
+        }]
+        response = [{
+            "index": 0,
+            "level": "MODERATE",
+            "rule_violated": "1",
+            "reason": "빤스라는 부적절한 성적 표현",
+        }]
+        with patch.object(
+            moderator, "_classify_batch_with_ollama", new=AsyncMock(return_value=response)
+        ):
+            results = await moderator.classify_batch(messages, backend="ollama")
+        self.assertEqual((results[0].level, results[0].rule_violated), ("NONE", "NONE"))
+
 
 class RealtimeResponseValidationTests(unittest.IsolatedAsyncioTestCase):
+    def test_security_container_slang_sexual_false_positive_is_cleared(self):
+        result = moderator.ModerationResult(
+            "MODERATE", "1", "팬티라는 부적절한 성적 표현", "ollama"
+        )
+        guarded = moderator.apply_tarkov_security_container_guard(
+            result, "레덱스 먹으면 팬티에 넣어"
+        )
+        self.assertEqual((guarded.level, guarded.rule_violated), ("NONE", "NONE"))
+        self.assertIn("보안 컨테이너", guarded.reason)
+
+    def test_security_container_slang_does_not_hide_real_sexual_request(self):
+        result = moderator.ModerationResult(
+            "SEVERE", "1", "상대방에게 속옷 사진을 요구하는 성희롱", "ollama"
+        )
+        guarded = moderator.apply_tarkov_security_container_guard(
+            result, "입은 팬티 사진 보여줘"
+        )
+        self.assertIs(guarded, result)
+
     def test_video_share_channel_receives_its_allow_rule(self):
         channel = SimpleNamespace(
             id=1409874543295856710,
