@@ -415,6 +415,7 @@ def build_sync_sanction(row: dict) -> dict:
         ),
         "released_by_display": row["released_by_display"],
         "release_reason": row["release_reason"],
+        "origin_key": row.get("dedupe_key"),
     }
 
 

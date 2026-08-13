@@ -945,7 +945,7 @@ _SANCTION_SYNC_COLUMNS = (
     "sanction_id", "guild_id", "user_id", "user_display", "action_type",
     "reason", "source", "status", "issued_at", "expires_at", "released_at",
     "issued_by_id", "issued_by_display", "released_by_id", "released_by_display",
-    "release_reason", "review_id", "sync_attempts",
+    "release_reason", "dedupe_key", "review_id", "sync_attempts",
 )
 
 
@@ -969,7 +969,7 @@ async def get_due_sanction_sync_records(limit: int = 50) -> list[dict]:
                       s.reason, s.source, s.status, s.issued_at, s.expires_at,
                       s.released_at, s.issued_by_id, s.issued_by_display,
                       s.released_by_id, s.released_by_display, s.release_reason,
-                      s.review_id, o.attempts
+                      s.dedupe_key, s.review_id, o.attempts
                FROM sanction_sync_outbox o JOIN sanction_records s
                  ON s.id = o.sanction_id AND s.guild_id = o.guild_id
                WHERE o.next_attempt_at <= ?

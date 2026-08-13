@@ -38,11 +38,13 @@ class KpiPeriodTests(unittest.TestCase):
             "released_at": None, "issued_by_id": 99,
             "issued_by_display": "관리자", "released_by_id": None,
             "released_by_display": None, "release_reason": None,
+            "dedupe_key": "legacy-moderation:source-record-1",
         }
         event = kpi.build_sync_sanction(row)
         self.assertEqual(event["user_id"], "50")
         self.assertEqual(event["reason"], "운영진 수동 경고")
         self.assertNotIn("123456", event["event_id"])
+        self.assertEqual(event["origin_key"], "legacy-moderation:source-record-1")
 
 
 class KpiDatabaseTests(unittest.IsolatedAsyncioTestCase):
