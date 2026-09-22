@@ -1,9 +1,11 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 set "PYTHONUTF8=1"
 title Discord AutoMod Bot
 cd /d "%~dp0"
+set "AUTOMOD_STOP_FILE=%~dp0.automod-stop-request"
+if exist "%AUTOMOD_STOP_FILE%" del /q "%AUTOMOD_STOP_FILE%" >nul 2>&1
 
 set "PYTHON=%LOCALAPPDATA%\DiscordAutoMod\venv-3.13\Scripts\python.exe"
 if not exist "%PYTHON%" (
@@ -23,12 +25,12 @@ if errorlevel 1 (
 
 if /i "%~1"=="--backup-db" (
     "%PYTHON%" -c "import asyncio, database; p=asyncio.run(database.create_database_backup()); print('Database backup created: '+str(p))"
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 
 if /i "%~1"=="--status" (
     "%PYTHON%" runtime_status.py
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 
 "%PYTHON%" -c "import asyncio, database; asyncio.run(database.init_db()); asyncio.run(database.validate_database_integrity())"
@@ -54,7 +56,7 @@ if /i "%~1"=="--check" (
 
 if /i "%~1"=="--check-network" (
     "%PYTHON%" network_check.py
-    exit /b %errorlevel%
+    exit /b !errorlevel!
 )
 
 if not "%~1"=="" (
@@ -65,10 +67,12 @@ if not "%~1"=="" (
 
 set /a RETRIES=0
 :loop
+if exist "%AUTOMOD_STOP_FILE%" goto stop_requested
 echo [%date% %time%] Starting bot...
 for /f %%T in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"') do set "BOT_STARTED_AT=%%T"
 "%PYTHON%" bot.py
 set "BOT_EXIT=%errorlevel%"
+if exist "%AUTOMOD_STOP_FILE%" goto stop_requested
 if "%BOT_EXIT%"=="0" goto stopped
 if "%BOT_EXIT%"=="3" goto duplicate
 
@@ -80,6 +84,11 @@ if %RETRIES% GEQ 5 goto failed
 echo [%date% %time%] Bot exited with code %BOT_EXIT%. Restarting in 10 seconds. (%RETRIES%/5 consecutive failures)
 timeout /t 10 /nobreak >nul
 goto loop
+
+:stop_requested
+del /q "%AUTOMOD_STOP_FILE%" >nul 2>&1
+echo [INFO] Bot stop request received. Automatic restart is disabled.
+exit /b 0
 
 :stopped
 echo [INFO] The bot stopped normally. Automatic restart is not required.

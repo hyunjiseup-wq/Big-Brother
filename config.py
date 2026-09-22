@@ -253,12 +253,13 @@ IMMEDIATE_TIMEOUT_MINUTES = 1440
 STRIKE_DECAY_DAYS = 30
 STRIKE_DECAY_RATIO = 0.5
 
-# 사용할 모델 (1차: Gemini, 2차 폴백: Groq)
+# 사용할 클라우드 모델. 실제 호출 순서는 REALTIME_PROVIDER_ORDER에서 정하며
+# 기본값은 로컬 Ollama -> Gemini -> Groq이다.
 GEMINI_MODEL = "gemini-2.5-flash"
 GROQ_MODEL = "openai/gpt-oss-120b"
 # 핵의심 신고 이미지 OCR·비전 분석용 멀티모달 모델.
 GEMINI_VISION_MODEL = "gemini-2.5-flash"
-GROQ_VISION_MODEL = "qwen/qwen3.6-27b"
+GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 
 # ── 킥/밴 자동 실행 제한 (커뮤니티 정책: 경고 2회 이후 제재는 운영진이 최종 결정) ──
 # 실제 서버 정책상 킥/밴처럼 되돌리기 힘든 조치는 운영진 확인 후 결정되어야 하므로,

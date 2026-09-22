@@ -743,6 +743,27 @@ class DetermineActionTests(unittest.TestCase):
             self.assertEqual(duration, bot.config.AUTO_ACTION_CEILING_TIMEOUT_MINUTES)
 
 
+class ManualReviewModeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_detected_violation_is_sent_to_review_without_applying_action(self):
+        message = _message()
+        with (
+            patch.object(bot.config, "MANUAL_REVIEW_MODE", True),
+            patch.object(
+                bot.learning,
+                "is_known_false_positive",
+                new=AsyncMock(return_value=False),
+            ),
+            patch.object(bot, "_handle_violation_review_only", new=AsyncMock()) as review,
+            patch.object(bot, "apply_action", new=AsyncMock()) as apply_action,
+            patch.object(bot.database, "add_points", new=AsyncMock()) as add_points,
+        ):
+            await bot.handle_violation(message, "SEVERE", "reason", "3", "groq")
+
+        review.assert_awaited_once()
+        apply_action.assert_not_awaited()
+        add_points.assert_not_awaited()
+
+
 class AutoModePointsTests(unittest.IsolatedAsyncioTestCase):
     """조치가 실제로 집행됐을 때만 누적 점수가 오르는지 확인한다."""
 
@@ -1170,6 +1191,18 @@ class GracefulShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bot._workers_started)
         close_http.assert_awaited_once_with()
         close_discord.assert_awaited_once_with(bot.bot)
+
+    async def test_stop_request_keeps_marker_until_runner_consumes_it(self):
+        with (
+            patch.object(bot.bot, "is_closed", return_value=False),
+            patch.object(bot.os.path, "exists", return_value=True),
+            patch.object(bot.os, "remove") as remove_marker,
+            patch.object(bot.bot, "close", new=AsyncMock()) as close_bot,
+        ):
+            await bot.stop_request_worker()
+
+        close_bot.assert_awaited_once_with()
+        remove_marker.assert_not_called()
 
 
 if __name__ == "__main__":

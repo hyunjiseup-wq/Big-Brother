@@ -21,6 +21,8 @@ discord-automod/
 ├── learning.py          # 관리자 오탐 확정 학습, 채널 범위 규칙, 예시 정제와 취소 처리
 ├── config.py             # 서버 규칙, 제재 단계, 모델/한도, 배치 감사 설정 (여기를 주로 수정)
 ├── run_bot.bat           # Windows 실행기 (환경/DB 점검, 재시작 횟수 제한)
+├── stop_bot.bat          # 해당 봇만 정상 종료하고 자동 재시작을 차단하는 Windows 종료기
+├── 작동중지.bat           # stop_bot.bat을 호출하는 한국어 바로가기
 ├── register_startup.bat  # Windows 시작프로그램 바로가기 등록
 ├── run_bot_hidden.vbs    # 자동 시작 시 콘솔 창 없이 봇 실행
 ├── 봇실행.bat             # run_bot.bat을 호출하는 한국어 바로가기
@@ -173,6 +175,10 @@ python -m pip install -r requirements.lock
 ## 실행
 
 - Windows: `run_bot.bat`을 더블클릭합니다.
+- Windows 종료: `작동중지.bat`을 더블클릭합니다. 먼저 Discord·AI·HTTP 연결을 정상적으로 정리하고,
+  15초 안에 응답하지 않을 때만 전용 가상환경에서 실행 중인 `bot.py` 프로세스를 종료합니다.
+  다른 Python 프로그램이나 터미널은 종료하지 않으며 자동 재시작 루프도 함께 중단됩니다.
+- 종료 대상 확인만 하기: `stop_bot.bat --check` (실제 프로세스나 연결은 변경하지 않음)
 - 설치 및 DB 설정 점검: `run_bot.bat --check` (스키마 변경 전 SQLite 무결성 검사 포함, 한글/공백 경로 지원)
   이 점검은 Python 패키지, SQLite 접근, 필수 토큰/API 키와 채널 ID 형식을 확인하며 Discord에는 로그인하지 않습니다.
 - 읽기 전용 외부 연결 점검: `run_bot.bat --check-network`
@@ -246,6 +252,10 @@ Discord에서 부모를 확인해 부모 채널 범위로 병합됩니다.
 - 실시간 기본 순서는 `.env`의 `REALTIME_PROVIDER_ORDER=ollama,gemini,groq`입니다.
   로컬 모델을 먼저 사용하고, Ollama 미설치·중단·타임아웃 때만 클라우드 무료 API로 넘어갑니다.
   클라우드를 우선하려면 `gemini,groq,ollama`로 바꿀 수 있습니다.
+- 현재 클라우드 모델은 텍스트 판단에 `gemini-2.5-flash`와 `openai/gpt-oss-120b`,
+  Groq 이미지 판단에 `qwen/qwen3.8-27b`를 사용합니다. `run_bot.bat --check-network`는
+  공식 모델 목록에 이 ID들이 실제로 존재하는지 읽기 전용으로 확인하며, 하나라도 사라지면 실패
+  종료 코드를 반환합니다.
 
 - **왜 삼중화하나**: Gemini와 Groq 무료 티어에는 요청 한도가 있습니다. 로컬 Ollama를 기본 판단망으로
   사용해 클라우드 사용량을 줄이고, 로컬 장애 때 두 클라우드 제공자를 순차적으로 사용합니다.

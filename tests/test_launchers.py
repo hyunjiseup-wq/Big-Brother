@@ -40,6 +40,11 @@ class BotLauncherTests(unittest.TestCase):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn("database.validate_database_integrity()", script)
 
+    def test_command_modes_propagate_the_real_child_exit_code(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn("setlocal EnableExtensions EnableDelayedExpansion", script)
+        self.assertEqual(script.count("exit /b !errorlevel!"), 3)
+
     def test_manual_database_backup_option_is_available(self):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn('if /i "%~1"=="--backup-db"', script)
@@ -70,6 +75,27 @@ class BotLauncherTests(unittest.TestCase):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
         self.assertIn("BOT_RUNTIME=BOT_STOPPED_AT-BOT_STARTED_AT", script)
         self.assertIn("if %BOT_RUNTIME% GEQ 300 set /a RETRIES=0", script)
+
+    def test_stop_request_prevents_automatic_restart(self):
+        script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
+        self.assertIn('set "AUTOMOD_STOP_FILE=%~dp0.automod-stop-request"', script)
+        self.assertIn('if exist "%AUTOMOD_STOP_FILE%" goto stop_requested', script)
+        self.assertLess(
+            script.index('if exist "%AUTOMOD_STOP_FILE%" goto stop_requested'),
+            script.index('if "%BOT_EXIT%"=="0" goto stopped'),
+        )
+
+    def test_stop_launcher_targets_only_the_dedicated_bot_python(self):
+        script = (ROOT / "stop_bot.ps1").read_text(encoding="utf-8")
+        self.assertIn('DiscordAutoMod\\venv-3.13\\Scripts\\python.exe', script)
+        self.assertIn("$_.CommandLine", script)
+        self.assertIn("$_.ExecutablePath", script)
+        self.assertNotIn("taskkill /im python.exe", script.casefold())
+        self.assertLess(script.index("AddSeconds(15)"), script.index("Stop-Process"))
+
+    def test_korean_stop_shortcut_calls_the_checked_launcher(self):
+        script = (ROOT / "작동중지.bat").read_text(encoding="utf-8")
+        self.assertIn('call "%~dp0stop_bot.bat" %*', script)
 
 
 if __name__ == "__main__":

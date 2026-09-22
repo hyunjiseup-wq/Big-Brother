@@ -5,6 +5,11 @@ import config
 
 
 class ConfigValidationTests(unittest.TestCase):
+    def test_current_cloud_models_are_not_deprecated(self):
+        self.assertEqual(config.GROQ_MODEL, "openai/gpt-oss-120b")
+        self.assertEqual(config.GROQ_VISION_MODEL, "qwen/qwen3.8-27b")
+        self.assertNotIn("qwen3.6", config.GROQ_VISION_MODEL)
+
     def test_user_facing_sanction_messages_are_disabled_by_default(self):
         self.assertFalse(config.USER_SANCTION_DM_ENABLED)
         self.assertFalse(config.MANUAL_REVIEW_USER_NOTICE_ENABLED)

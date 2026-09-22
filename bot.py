@@ -80,6 +80,9 @@ KPI_REPORT_CHANNEL_ID = (
 KPI_DASHBOARD_PUBLIC_URL = os.environ.get("KPI_DASHBOARD_PUBLIC_URL", "").strip()
 KPI_DASHBOARD_INGEST_URL = os.environ.get("KPI_DASHBOARD_INGEST_URL", "").strip()
 KPI_DASHBOARD_INGEST_TOKEN = os.environ.get("KPI_DASHBOARD_INGEST_TOKEN", "").strip()
+STOP_REQUEST_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".automod-stop-request"
+)
 
 
 def validate_runtime_environment() -> None:
@@ -2136,6 +2139,18 @@ async def batch_audit_task():
             print(f"[batch_audit_task] 길드 {guild.id} 감사 중 오류: {e}")
 
 
+async def stop_request_worker():
+    """BAT 종료 요청을 감지해 연결과 백그라운드 작업을 정상적으로 정리한다."""
+    while not bot.is_closed():
+        if os.path.exists(STOP_REQUEST_FILE):
+            print("[runtime] Stop request received; shutting down gracefully.")
+            # 마커는 run_bot.bat이 프로세스 종료 후 소비해야 비정상 종료 시에도
+            # 자동 재시작을 확실히 막을 수 있다. 직접 실행한 경우 stop_bot.ps1이 정리한다.
+            await bot.close()
+            return
+        await asyncio.sleep(0.5)
+
+
 @bot.event
 async def close():
     """진행 중인 자체 작업을 정리한 뒤 Discord와 공유 HTTP 연결을 닫는다."""
@@ -2152,7 +2167,11 @@ async def close():
 
     # ai_worker는 Queue.get()에서 계속 대기하므로 명시적으로 취소해야 정상 종료 시
     # "Task was destroyed but it is pending" 경고와 미완료 작업 잔존을 막을 수 있다.
-    pending = [task for task in tuple(_background_tasks) if not task.done()]
+    current_task = asyncio.current_task()
+    pending = [
+        task for task in tuple(_background_tasks)
+        if not task.done() and task is not current_task
+    ]
     for task in pending:
         task.cancel()
     if pending:
@@ -2201,6 +2220,7 @@ async def on_ready():
             _spawn(ai_retry_worker())
         if KPI_DASHBOARD_INGEST_URL and KPI_DASHBOARD_INGEST_TOKEN:
             _spawn(kpi_sync_worker())
+        _spawn(stop_request_worker())
         _workers_started = True
 
     if config.WATCHED_CHANNEL_IDS and not batch_audit_task.is_running():

@@ -13,3 +13,7 @@ archives/
 *.zip
 .pytest_cache/
 .ruff_cache/
+.automod-stop-request
+# 전체 터미널을 이동하던 폐기된 로컬 실험 파일은 운영 배포에 포함하지 않는다.
+console_window_mover.ps1
+console_window_mover.vbs
