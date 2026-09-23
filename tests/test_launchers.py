@@ -56,8 +56,8 @@ class BotLauncherTests(unittest.TestCase):
 
     def test_unknown_option_is_rejected_before_bot_loop(self):
         script = (ROOT / "run_bot.bat").read_text(encoding="utf-8")
-        self.assertIn('if not "%~1"==""', script)
         self.assertIn("exit /b 6", script)
+        self.assertLess(script.index("Unknown option"), script.index("database.init_db()"))
         self.assertLess(script.index("Unknown option"), script.index("set /a RETRIES=0"))
 
     def test_local_runtime_status_option_is_available(self):

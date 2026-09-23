@@ -5,7 +5,17 @@ set "PYTHONUTF8=1"
 title Discord AutoMod Bot
 cd /d "%~dp0"
 set "AUTOMOD_STOP_FILE=%~dp0.automod-stop-request"
-if exist "%AUTOMOD_STOP_FILE%" del /q "%AUTOMOD_STOP_FILE%" >nul 2>&1
+
+if "%~1"=="" goto arguments_ok
+if /i "%~1"=="--status" goto arguments_ok
+if /i "%~1"=="--check" goto arguments_ok
+if /i "%~1"=="--check-network" goto arguments_ok
+if /i "%~1"=="--backup-db" goto arguments_ok
+echo [ERROR] Unknown option: %~1
+echo Supported options: --check, --check-network, --backup-db, --status
+exit /b 6
+
+:arguments_ok
 
 set "PYTHON=%LOCALAPPDATA%\DiscordAutoMod\venv-3.13\Scripts\python.exe"
 if not exist "%PYTHON%" (
@@ -59,12 +69,8 @@ if /i "%~1"=="--check-network" (
     exit /b !errorlevel!
 )
 
-if not "%~1"=="" (
-    echo [ERROR] Unknown option: %~1
-    echo Supported options: --check, --check-network, --backup-db, --status
-    exit /b 6
-)
-
+rem Only an explicit start may clear an old stop request. Diagnostics must preserve it.
+if exist "%AUTOMOD_STOP_FILE%" del /q "%AUTOMOD_STOP_FILE%" >nul 2>&1
 set /a RETRIES=0
 :loop
 if exist "%AUTOMOD_STOP_FILE%" goto stop_requested
