@@ -76,7 +76,7 @@ set /a RETRIES=0
 if exist "%AUTOMOD_STOP_FILE%" goto stop_requested
 echo [%date% %time%] Starting bot...
 for /f %%T in ('powershell -NoProfile -Command "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"') do set "BOT_STARTED_AT=%%T"
-"%PYTHON%" bot.py
+"%PYTHON%" "%~dp0bot.py"
 set "BOT_EXIT=%errorlevel%"
 if exist "%AUTOMOD_STOP_FILE%" goto stop_requested
 if "%BOT_EXIT%"=="0" goto stopped

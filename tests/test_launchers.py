@@ -88,10 +88,10 @@ class BotLauncherTests(unittest.TestCase):
     def test_stop_launcher_targets_only_the_dedicated_bot_python(self):
         script = (ROOT / "stop_bot.ps1").read_text(encoding="utf-8")
         self.assertIn('DiscordAutoMod\\venv-3.13\\Scripts\\python.exe', script)
-        self.assertIn("$_.CommandLine", script)
-        self.assertIn("$_.ExecutablePath", script)
+        self.assertIn("$process.CommandLine", script)
+        self.assertIn("$process.ExecutablePath", script)
         self.assertNotIn("taskkill /im python.exe", script.casefold())
-        self.assertLess(script.index("AddSeconds(15)"), script.index("Stop-Process"))
+        self.assertLess(script.index("AddSeconds(15)"), script.index("Stop-VerifiedProcess $process"))
 
     def test_korean_stop_shortcut_calls_the_checked_launcher(self):
         script = (ROOT / "작동중지.bat").read_text(encoding="utf-8")
