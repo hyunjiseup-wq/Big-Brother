@@ -143,6 +143,11 @@ async def init_db():
         # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
         # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
         await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
+        await _ensure_column(db, "violation_log", "retry_queue_id", "INTEGER")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_retry_queue "
+            "ON violation_log(retry_queue_id) WHERE retry_queue_id IS NOT NULL"
+        )
         # 관리자 확정 근거. 원문/AI 사유와 분리해 인수인계와 학습 설명에 사용한다.
         await _ensure_column(db, "violation_log", "review_note", "TEXT")
         # processing 상태는 자동으로 pending으로 되돌리지 않는다. 외부 제재 성공 직후
@@ -1399,7 +1404,8 @@ async def create_review_record(
     level, reason, action_taken, provider="unknown", card_delivered=True,
     rule_violated="-", detection_source="realtime",
     channel_name=None, channel_group=None, learning_scope_channel_id=None,
-) -> int:
+    retry_id: int | None = None,
+) -> int | None:
     """
     검수 대기(pending) 레코드를 만들고 id를 돌려준다.
 
@@ -1410,9 +1416,22 @@ async def create_review_record(
 
     card_delivered=False면 pending이지만 실제 카드가 없는 상태로 기록된다
     (전송 실패 또는 배치 카드 상한 초과분). get_reviews_without_card로 조회 가능.
+    retry_id가 있으면 큐 완료까지 같은 트랜잭션으로 처리하며, 이미 완료한 ID는 None을 반환한다.
+    이 경우 카드 전송 전 중단도 보존하도록 card_delivered는 반드시 False로 시작한다.
     """
     async with _connect() as db:
         await db.execute("BEGIN IMMEDIATE")
+        if retry_id is not None:
+            queued = await (await db.execute(
+                "SELECT guild_id, channel_id, message_id FROM moderation_retry_queue WHERE id = ?",
+                (retry_id,),
+            )).fetchone()
+            if queued is None:
+                # 이미 다른 실행이 인계/완료했다. 카드나 검수를 다시 만들지 않는다.
+                return None
+            if tuple(queued) != (guild_id, channel_id, message_id):
+                raise ValueError("Retry queue identity mismatch")
+            card_delivered = False
         superseded_ids = []
         if message_id is not None:
             cursor = await db.execute(
@@ -1446,8 +1465,32 @@ async def create_review_record(
         for superseded_id in superseded_ids:
             await _enqueue_kpi_sync(db, superseded_id, guild_id)
         await _enqueue_kpi_sync(db, review_id, guild_id)
+        if retry_id is not None:
+            await db.execute("UPDATE violation_log SET retry_queue_id = ? WHERE id = ?",
+                             (retry_id, review_id))
+            await db.execute("DELETE FROM moderation_retry_queue WHERE id = ?", (retry_id,))
         await db.commit()
         return review_id
+
+
+async def mark_review_delivered(review_id: int, guild_id: int):
+    async with _connect() as db:
+        updated = await db.execute(
+            "UPDATE violation_log SET card_delivered = 1 WHERE id = ? AND guild_id = ?",
+            (review_id, guild_id),
+        )
+        if updated.rowcount == 1:
+            await _enqueue_kpi_sync(db, review_id, guild_id)
+        await db.commit()
+
+
+async def get_moderation_retry_id(guild_id: int, message_id: int) -> int | None:
+    async with _connect() as db:
+        row = await (await db.execute(
+            "SELECT id FROM moderation_retry_queue WHERE guild_id = ? AND message_id = ?",
+            (guild_id, message_id),
+        )).fetchone()
+        return int(row[0]) if row else None
 
 
 async def mark_review_delivery_failed(review_id: int, guild_id: int):

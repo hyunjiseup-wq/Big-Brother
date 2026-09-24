@@ -687,7 +687,8 @@ _PROVIDER_LABEL = {"gemini": "Gemini(1차)", "groq": "Groq(2차 폴백)",
 
 async def _handle_violation_review_only(message: discord.Message, level: str, reason_text: str,
                                         rule_violated: str, provider: str, points_to_add: float,
-                                        visual_context: dict | None = None):
+                                        visual_context: dict | None = None,
+                                        retry_id: int | None = None):
     """
     수동 검수 모드: 아무 조치도 하지 않고, "자동 모드였다면 어떤 조치가 나갔을지"를
     로그 채널에 올려 관리자가 봇의 판단 정확도를 검증할 수 있게 한다.
@@ -712,7 +713,10 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
             else getattr(message.channel, "name", None)
         ),
         learning_scope_channel_id=learning.channel_scope_id(message.channel),
+        **({"retry_id": retry_id} if retry_id is not None else {}),
     )
+    if review_id is None:
+        return
 
     embed = discord.Embed(
         title="🔍 위반 감지 — 수동 검수 모드 (조치 없음)",
@@ -738,6 +742,8 @@ async def _handle_violation_review_only(message: discord.Message, level: str, re
     embed.add_field(name="메시지 바로가기", value=message.jump_url, inline=False)
     view = _build_review_view(message.channel.id, message.id, message.author.id, review_id)
     delivered = await send_log(message.guild, embed, view=view)
+    if delivered and retry_id is not None:
+        await database.mark_review_delivered(review_id, message.guild.id)
     if not delivered:
         # 카드가 안 올라가면 관리자는 검수할 방법이 없다. 카드 없음 상태로 표시해
         # `!BB 검토대기`에서 별도로 확인하고 로그 채널 권한을 점검하게 한다.
@@ -1399,7 +1405,8 @@ async def on_interaction(interaction: discord.Interaction):
 
 async def handle_violation(message: discord.Message, level: str, reason_text: str,
                             rule_violated: str = "-", provider: str = "filter",
-                            visual_context: dict | None = None):
+                            visual_context: dict | None = None,
+                            retry_id: int | None = None):
     """위반으로 판정된 메시지에 대해 점수 부여 + 조치 실행 + 로그를 공통 처리한다."""
     if level == "NONE":
         return
@@ -1410,10 +1417,14 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
     except discord.NotFound:
         return
     except (discord.Forbidden, discord.HTTPException) as e:
+        if retry_id is not None:
+            raise
         print(f"[moderation] 제재 전 메시지 재확인 실패로 안전하게 보류: {e}")
         return
     if (latest.content != message.content
             or vision.attachment_fingerprint(latest) != vision.attachment_fingerprint(message)):
+        if retry_id is not None:
+            raise RuntimeError("Retry message changed; reclassification required")
         return
     message = latest
 
@@ -1426,10 +1437,11 @@ async def handle_violation(message: discord.Message, level: str, reason_text: st
     points_to_add = config.VIOLATION_LEVEL_POINTS.get(level, 0)
 
     # 수동 검수 모드: 감지 결과만 관리자에게 보고하고 여기서 끝낸다 (config.MANUAL_REVIEW_MODE 참고)
-    if config.MANUAL_REVIEW_MODE:
+    if config.MANUAL_REVIEW_MODE or retry_id is not None:
         await _handle_violation_review_only(
             message, level, reason_text, rule_violated, provider, points_to_add,
             visual_context=visual_context,
+            **({"retry_id": retry_id} if retry_id is not None else {}),
         )
         return
 
@@ -1647,10 +1659,7 @@ async def ai_worker(worker_id: int):
             cached = cache.get(message.content, context=cache_context)
             if cached is not None:
                 level, rule_violated, reason_text, provider = cached
-                await database.delete_moderation_retry_for_message(
-                    message.guild.id, message.id
-                )
-                await handle_violation(
+                await _handle_ai_verdict(
                     message, level, f"(캐시된 판단) {reason_text}",
                     rule_violated=rule_violated, provider=provider,
                     visual_context=visual_context,
@@ -1688,11 +1697,7 @@ async def ai_worker(worker_id: int):
             await _track_ai_outage(message.guild, result)
             if await _defer_ai_failure(message, result, f"worker-{worker_id}"):
                 continue
-            if result.provider != "none":
-                await database.delete_moderation_retry_for_message(
-                    message.guild.id, message.id
-                )
-            await handle_violation(
+            await _handle_ai_verdict(
                 message, result.level, result.reason, result.rule_violated,
                 provider=result.provider, visual_context=visual_context,
             )
@@ -1701,6 +1706,18 @@ async def ai_worker(worker_id: int):
         finally:
             _processing_keys.discard(processing_key)
             _message_queue.task_done()
+
+
+async def _handle_ai_verdict(message, *args, **kwargs):
+    """실시간 재판단이 보류 큐와 겹쳐도 동일한 원자적 검수 인계를 사용한다."""
+    if kwargs.get("provider") == "none":
+        # 재시도 기능을 끈 경우에도 기존 보류 건을 장애 결과로 완료하지 않는다.
+        return
+    retry_id = await database.get_moderation_retry_id(message.guild.id, message.id)
+    await handle_violation(message, *args, **kwargs,
+                           **({"retry_id": retry_id} if retry_id is not None else {}))
+    if retry_id is not None:
+        await database.delete_moderation_retry(retry_id)
 
 
 async def _defer_ai_failure(message: discord.Message, result, source: str) -> bool:
@@ -1833,12 +1850,13 @@ async def _ai_retry_worker_loop():
                 cached = cache.get(message.content, context=cache_context)
                 if cached is not None:
                     level, rule_violated, reason_text, provider = cached
-                    await database.delete_moderation_retry(retry_id)
                     await handle_violation(
                         message, level, f"(재검사·캐시된 판단) {reason_text}",
                         rule_violated=rule_violated, provider=provider,
                         visual_context=visual_context,
+                        retry_id=retry_id,
                     )
+                    await database.delete_moderation_retry(retry_id)
                     continue
 
                 fp_examples = await learning.get_prompt_examples(guild.id, message.channel)
@@ -1866,12 +1884,13 @@ async def _ai_retry_worker_loop():
                     message.content, result.level, result.rule_violated,
                     result.reason, result.provider, context=cache_context,
                 )
-                await database.delete_moderation_retry(retry_id)
                 await handle_violation(
                     message, result.level, f"(장애 복구 후 재판단) {result.reason}",
                     result.rule_violated, provider=result.provider,
                     visual_context=visual_context,
+                    retry_id=retry_id,
                 )
+                await database.delete_moderation_retry(retry_id)
             except Exception as error:
                 next_attempt = attempts + 1
                 await database.reschedule_moderation_retry(
