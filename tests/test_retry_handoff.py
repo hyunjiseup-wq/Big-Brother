@@ -3,6 +3,9 @@ import asyncio
 import os
 import tempfile
 import unittest
+import subprocess
+import sys
+from pathlib import Path
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -80,6 +83,51 @@ class RetryHandoffTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await self.handoff()
         self.assertEqual(await self.counts(), (1, 0, 0))
+
+    async def crash_at_commit(self, phase):
+        # Exercise the real implementation in a separate process. os._exit skips
+        # finally blocks, connection close and Python's normal shutdown cleanup.
+        script = r'''
+import asyncio, os, sys
+import aiosqlite
+import database
+database.DB_PATH = sys.argv[1]
+phase = sys.argv[2]
+original_commit = aiosqlite.Connection.commit
+async def crash_commit(connection):
+    if phase == 'before':
+        os._exit(73)
+    await original_commit(connection)
+    os._exit(74)
+aiosqlite.Connection.commit = crash_commit
+asyncio.run(database.create_review_record(
+    1, 5, 10, 100, 'evidence', 'MODERATE', 'reason', 'manual review',
+    retry_id=int(sys.argv[3]),
+))
+raise SystemExit(99)
+'''
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-B", "-c", script, database.DB_PATH, phase, str(self.retry_id)],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        self.assertEqual(result.returncode, 73 if phase == "before" else 74,
+                         result.stdout + result.stderr)
+        await database.validate_database_integrity()
+
+    async def test_process_crash_before_commit_keeps_retry_and_allows_recovery(self):
+        await self.crash_at_commit("before")
+        self.assertEqual(await self.counts(), (1, 0, 0))
+        await self.handoff()
+        self.assertEqual(await self.counts(), (0, 1, 1))
+
+    async def test_process_crash_after_commit_keeps_one_unposted_review(self):
+        await self.crash_at_commit("after")
+        self.assertEqual(await self.counts(), (0, 1, 1))
+        self.assertIsNone(await self.handoff())
+        self.assertEqual(await self.counts(), (0, 1, 1))
+        self.assertEqual(len(await database.get_reviews_without_card(1)), 1)
 
     async def test_wrong_queue_identity_is_rejected(self):
         await database.enqueue_moderation_retry(2, 10, 100, "offline", 0)
