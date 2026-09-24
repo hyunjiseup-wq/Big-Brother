@@ -1096,6 +1096,7 @@ class AiRetryWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         due_rows = [[(7, message.guild.id, message.channel.id, message.id, 0, "rate_limit")]]
         with (
+            patch.object(bot.bot, "wait_until_ready", new=AsyncMock()),
             patch.object(
                 bot.database, "get_due_moderation_retries",
                 new=AsyncMock(side_effect=due_rows + [asyncio.CancelledError()]),

@@ -1727,17 +1727,37 @@ def _ai_retry_delay(attempts: int) -> float:
 
 
 async def ai_retry_worker():
+    """일시적인 DB/Discord 오류가 재검사 작업을 영구 종료하지 않도록 감독한다."""
+    while True:
+        try:
+            await _ai_retry_worker_loop()
+        except asyncio.CancelledError:
+            # 수동 종료 요청은 재시작하지 않고 즉시 상위 종료 흐름으로 전달한다.
+            raise
+        except Exception as error:
+            # 예외 메시지에는 원문이나 연결 정보가 섞일 수 있어 유형만 기록한다.
+            print(f"[retry-worker] 재검사 작업 오류, 잠시 후 재개: {type(error).__name__}")
+            await asyncio.sleep(config.AI_RETRY_POLL_SECONDS)
+
+
+async def _ai_retry_worker_loop():
     """SQLite에 보류한 AI 전량 장애 메시지를 제공자 복구 후 다시 판단한다."""
     while True:
+        await bot.wait_until_ready()
         rows = await database.get_due_moderation_retries(config.AI_RETRY_BATCH_SIZE)
         if not rows:
             await asyncio.sleep(config.AI_RETRY_POLL_SECONDS)
             continue
 
         for retry_id, guild_id, channel_id, message_id, attempts, _ in rows:
+            await bot.wait_until_ready()
             guild = bot.get_guild(guild_id)
-            if guild is None:
-                await database.delete_moderation_retry(retry_id)
+            if guild is None or getattr(guild, "unavailable", False):
+                # 캐시 누락/일시 장애만으로 서버 탈퇴라고 단정하지 않는다.
+                await database.reschedule_moderation_retry(
+                    retry_id, attempts + 1, "discord_guild_unavailable",
+                    _ai_retry_delay(attempts + 1),
+                )
                 continue
             channel = guild.get_channel(channel_id) or bot.get_channel(channel_id)
             if channel is None:
