@@ -8,18 +8,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class StartupLauncherTests(unittest.TestCase):
     def test_startup_check_validates_target_workdir_and_arguments(self):
-        script = (ROOT / "register_startup.bat").read_text(encoding="utf-8")
+        script = (ROOT / "startup_shortcut.ps1").read_text(encoding="utf-8")
         self.assertIn("$actualTarget -ne $expectedTarget", script)
         self.assertIn("$actualWork -ne $expectedWork", script)
-        self.assertIn("$s.Arguments -ne $env:AUTOMOD_ARGUMENTS", script)
+        self.assertIn("$s.Arguments -ne $expectedArguments", script)
         self.assertIn("$s.WindowStyle -ne 7", script)
 
     def test_registration_sets_target_and_working_directory(self):
-        script = (ROOT / "register_startup.bat").read_text(encoding="utf-8")
-        self.assertIn("$s.TargetPath=$env:AUTOMOD_HOST", script)
-        self.assertIn("$s.Arguments=$env:AUTOMOD_ARGUMENTS", script)
-        self.assertIn("$s.WorkingDirectory=$env:AUTOMOD_WORKDIR", script)
-        self.assertIn("$s.WindowStyle=7", script)
+        script = (ROOT / "startup_shortcut.ps1").read_text(encoding="utf-8")
+        self.assertIn("$s.TargetPath = $expectedTarget", script)
+        self.assertIn("$s.Arguments = $expectedArguments", script)
+        self.assertIn("$s.WorkingDirectory = $expectedWork", script)
+        self.assertIn("$s.WindowStyle = 7", script)
 
     def test_hidden_launcher_uses_no_window_and_rotating_log(self):
         script = (ROOT / "run_bot_hidden.vbs").read_text(encoding="utf-8")

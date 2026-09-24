@@ -23,10 +23,12 @@ discord-automod/
 ├── run_bot.bat           # Windows 실행기 (환경/DB 점검, 재시작 횟수 제한)
 ├── stop_bot.bat          # 해당 봇만 정상 종료하고 자동 재시작을 차단하는 Windows 종료기
 ├── 작동중지.bat           # stop_bot.bat을 호출하는 한국어 바로가기
-├── register_startup.bat  # Windows 시작프로그램 바로가기 등록
+├── register_startup.bat  # Windows 시작프로그램 등록·조회·해제
+├── startup_shortcut.ps1 # 바로가기 소유권 확인 및 안전한 변경
 ├── run_bot_hidden.vbs    # 자동 시작 시 콘솔 창 없이 봇 실행
 ├── 봇실행.bat             # run_bot.bat을 호출하는 한국어 바로가기
 ├── 시작프로그램_등록.bat   # register_startup.bat을 호출하는 한국어 바로가기
+├── 시작프로그램_해제.bat   # 자동 시작만 해제 (실행 중인 봇은 유지)
 ├── tests/                # 필터·DB·폴백 사슬·배치 실패 처리 회귀 테스트
 ├── requirements.txt
 └── .env.example
@@ -202,6 +204,15 @@ python -m pip install -r requirements.lock
   시작하도록 등록할 수 있습니다. **현재 PC 운영 방침은 Windows 자동 시작을 사용하지 않고,
   필요할 때 `봇실행.bat`을 직접 실행하는 방식입니다.** 진단 출력은 `logs/bot_runtime.log`에 기록됩니다.
 - 자동 시작 상태만 확인: `register_startup.bat --check` (등록하거나 변경하지 않음)
+- 자동 시작 해제: `시작프로그램_해제.bat` 또는 `register_startup.bat --remove`.
+  실행 중인 봇은 중지하지 않습니다. 봇 종료는 `작동중지.bat`을 사용하세요.
+  같은 이름의 바로가기가 다른 프로그램이나 다른 설치 폴더를 가리키면 등록·해제를 거부합니다.
+  잘못된 옵션이나 추가 인자로 자동 시작이 등록되지 않습니다.
+- 자동 시작 도구 종료 코드: 0=성공(해제 시 이미 미등록인 경우 포함), 1=작업 실패,
+  2=조회 시 미등록, 3/4/5=실행 대상/작업 폴더/인수 불일치, 6=잘못된 옵션 또는 창 표시 설정.
+  `--check`는 바로가기 설정만 검사하며 봇의 실행 상태·API 연결을 검사하지 않습니다.
+- 예전 `BB Console Window Mover` 시작프로그램과 전역 창 이동 스크립트는 제거했습니다.
+  다른 터미널 창을 강제로 옮기지 않습니다. 새 창을 항상 2번 모니터에 배치하는 기능은 제공하지 않습니다.
 - 실행기는 오류 종료가 연속될 때만 최대 5회 재시작합니다. 정상 종료는 다시 실행하지 않으며,
   5분 이상 안정적으로 실행한 뒤 발생한 종료는 이전 실패 횟수와 합산하지 않습니다.
 - Linux/macOS: 활성화한 가상환경에서 `python bot.py`를 실행합니다.
