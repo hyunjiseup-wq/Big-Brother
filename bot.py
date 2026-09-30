@@ -1,20 +1,19 @@
 """
-디스코드 자동 제재 봇 메인 파일 (대규모 서버 + Gemini/Groq/로컬 Ollama 삼중화 버전).
+디스코드 AI 관리자 검수 봇 메인 파일 (로컬 Ollama/Gemini/Groq 폴백).
 
 흐름:
 1. 메시지 수신 -> filters.fast_check()로 1차 필터링 (정규식/금칙어/스팸, AI 호출 없음)
    - SKIP    : 정상 메시지, 즉시 종료
-   - DECIDED : 필터만으로 등급 확정, AI 호출 없이 바로 제재 처리
+   - DECIDED : 필터만으로 등급 확정, AI 호출 없이 공통 검수 처리
    - NEEDS_AI: 애매한 경우만 큐에 넣어 워커가 비동기로 AI 판단
 2. AI 판단 전, cache에서 동일/반복 문구의 기존 판단 결과가 있는지 먼저 확인
 3. moderator.classify_message()가 설정된 순서(기본 Ollama→Gemini→Groq)로 판단하고,
    모두 실패하면 메시지를 영속 재검사 큐에 보류 (무료 한도 소진 시 영구 무감시 방지)
-4. 위반 등급에 따라 점수 부여 (config.VIOLATION_LEVEL_POINTS)
-5. 누적 점수 -> config.STRIKE_THRESHOLDS 에 따라 조치 결정
-   단, 커뮤니티 정책상 킥/밴은 판단 주체(필터/Gemini/Groq/Ollama) 무관하게 자동 실행하지 않고
-   config.AUTO_ACTION_CEILING(기본 타임아웃)으로 항상 하향되며, 로그 채널에
-   "관리자 검토 필요"로 강조 표시됨 (!BB 검토대기 명령어로 목록 확인 가능)
-6. 조치 실행 (경고/삭제/타임아웃/킥/밴) + 로그 채널 기록 (판단 주체 포함)
+4. 현재 수동 검수 모드에서는 후보 기록과 관리자 카드만 생성하며 점수·제재를 적용하지 않음
+5. 관리자가 확정한 조치만 실행하고 성공한 제재만 점수와 이력에 반영
+6. 미전송 대기는 기간 제한 없는 요약과 관리자 DM 페이지로 확인 가능
+   재검사 결과는 설정 변경 여부와 무관하게 수동 검수로 인계
+   레거시 자동 모드 코드는 별도 분기이며 현재 운영 체제를 설명하는 기본 흐름이 아님
 
 대규모 트래픽 대응 포인트:
 - 모든 메시지를 AI에 보내지 않고 1차 필터로 대부분을 무료로 처리
@@ -3069,48 +3068,56 @@ async def show_rules(ctx):
 
 
 @bot.command(name="검토대기")
+@commands.guild_only()
 @commands.has_permissions(administrator=True)
 async def show_pending_reviews(ctx, hours: int = 72):
     """
-    관리자 검토가 필요한 두 종류를 함께 보여준다:
+    관리자 검토가 필요한 항목을 함께 보여준다:
     1. 정책상 킥/밴이 자동 실행되지 않고 타임아웃으로 하향된 건
     2. 검수 카드가 없는 대기 건 (카드 전송 실패 또는 배치 카드 상한 초과) — 카드가 없어
        버튼으로 처리할 수 없으므로, 여기서 드러나지 않으면 그대로 묻힌다.
     """
+    if hours < 1:
+        await ctx.send("조회 시간은 1 이상의 정수로 입력하세요.")
+        return
     rows = await database.get_pending_reviews(ctx.guild.id, hours=hours)
-    uncarded = await database.get_reviews_without_card(ctx.guild.id)
+    uncarded_page = await database.get_uncarded_review_page(ctx.guild.id)
+    uncarded = uncarded_page["rows"]
     stalled = await database.get_stale_processing_reviews(ctx.guild.id)
 
     if not rows and not uncarded and not stalled:
-        await ctx.send(f"✅ 최근 {hours}시간 내 관리자 검토가 필요한 건이 없습니다.")
+        await ctx.send(f"✅ 최근 {hours}시간 내 추가 검토 대상과 전체 기간의 미전송 대기·중단 의심 건이 없습니다. "
+                       "이미 카드가 게시된 수동 검수 대기는 제재 로그 채널에서 확인하세요.")
         return
 
     provider_label = {"gemini": "Gemini", "groq": "Groq", "ollama": "Ollama(로컬)",
                       "filter": "키워드 필터", "none": "판단 실패"}
     embed = discord.Embed(
-        title=f"⚠️ 관리자 검토 필요 목록 (최근 {hours}시간)",
-        description="정책상 킥/밴은 자동 실행하지 않고 타임아웃으로 대체 적용된 건들입니다. 직접 확인 후 필요시 수동으로 킥/밴 처리하세요.",
+        title="⚠️ 관리자 검토 필요 목록",
+        description=(f"추가 검토 대상은 최근 {hours}시간, 카드 미전송 대기·중단 의심은 전체 기간입니다. "
+                     "미전송 기록은 실제 카드가 이미 있을 수도 있으니 검수 번호를 먼저 대조하세요. "
+                     "이 명령은 조회만 하며 제재나 카드 재전송을 실행하지 않습니다."),
         color=discord.Color.gold(),
     )
     for user_id, level, reason, action, provider, created_at in rows[:10]:
         member = ctx.guild.get_member(user_id)
         who = member.mention if member else f"(ID: {user_id})"
         embed.add_field(
-            name=f"{who} — {level} ({provider_label.get(provider, provider)})",
-            value=f"{reason}\n적용된 조치: {action}",
+            name=f"{who} — {level} ({provider_label.get(provider, provider)})"[:120],
+            value=f"{(reason or '-')[:120]}\n기록된 조치: {(action or '-')[:40]}",
             inline=False,
         )
 
     if uncarded:
         lines = []
-        for review_id, user_id, channel_id, level, reason, _action, _created_at in uncarded[:5]:
+        for review_id, user_id, channel_id, level, reason, created_at, _message_id in uncarded:
             member = ctx.guild.get_member(user_id)
             who = member.mention if member else f"(ID: {user_id})"
-            lines.append(f"`#{review_id}` {who} · {level} · <#{channel_id}>\n> {(reason or '-')[:100]}")
+            lines.append(f"`#{review_id}` {who} · {level} · <#{channel_id}> · <t:{int(created_at)}:d>")
         embed.add_field(
-            name=f"🃏 카드 없는 대기 건 {len(uncarded)}개 (버튼 처리 불가)",
-            value=("검수 카드가 게시되지 못한 건들입니다. 로그 채널 권한/설정을 확인하거나 "
-                   "배치 카드 상한(BATCH_REVIEW_CARD_LIMIT)을 조정하세요.\n\n"
+            name=f"🃏 미전송 표시 대기 총 {uncarded_page['total']}건 (오래된 순 {len(uncarded)}건)",
+            value=("기간 제한 없이 집계합니다. `!BB 미전송검수 1`로 관리자 DM에서 "
+                   "사유·원문 링크를 확인하고 페이지를 넘길 수 있습니다.\n\n"
                    + "\n".join(lines))[:1024],
             inline=False,
         )
@@ -3121,13 +3128,56 @@ async def show_pending_reviews(ctx, hours: int = 72):
             who = member.mention if member else f"(ID: {user_id})"
             lines.append(f"`#{review_id}` {who} · {level} · <#{channel_id}> · {action}")
         embed.add_field(
-            name=f"⛔ 처리 중 중단 의심 {len(stalled)}건",
+            name=f"⛔ 처리 중 중단 의심 조회 {len(stalled)}건 (최대 10건)",
             value=("Discord 감사 로그와 대상 상태를 먼저 확인하세요. 제재가 적용되지 않은 것이 "
                    "확실한 건만 `!BB 검토복구 <번호>`로 복구할 수 있습니다.\n"
                    + "\n".join(lines))[:1024],
             inline=False,
         )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.command(name="미전송검수")
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def show_uncarded_reviews(ctx, page: int = 1):
+    """전체 기간의 미전송 pending 기록을 관리자 DM에서 5건씩 확인한다."""
+    if page < 1:
+        await ctx.send("페이지는 1 이상의 정수로 입력하세요. 예: `!BB 미전송검수 1`")
+        return
+    result = await database.get_uncarded_review_page(ctx.guild.id, page=page)
+    if result["total"] == 0:
+        await ctx.send("✅ 전체 기간에 미전송 표시로 남은 대기 검수가 없습니다.")
+        return
+    if page > result["pages"]:
+        await ctx.send(f"페이지 범위를 벗어났습니다. 1~{result['pages']} 중 선택하세요.")
+        return
+    embed = discord.Embed(
+        title="🃏 미전송 표시 검수 — 관리자 조회",
+        description=(f"전체 {result['total']}건 · {page}/{result['pages']}페이지 · 오래된 순\n"
+                     "자동 제재·카드 재전송은 하지 않습니다. 미전송 표시라도 실제 카드가 있을 수 있으므로 "
+                     "기존 카드와 검수 번호를 대조하세요. 목록은 처리 상황에 따라 변경될 수 있습니다."),
+        color=discord.Color.gold(),
+    )
+    for review_id, user_id, channel_id, level, reason, created_at, message_id in result["rows"]:
+        link = (f"[원문 열기](https://discord.com/channels/{ctx.guild.id}/{channel_id}/{message_id})"
+                if message_id else "원문 메시지 ID 없음")
+        reason_text = discord.utils.escape_markdown(reason or "사유 없음")[:650]
+        embed.add_field(
+            name=f"검수 #{review_id} · {level}"[:120],
+            value=(f"사용자 ID: `{user_id}` · 채널 ID: `{channel_id}`\n"
+                   f"감지 시각: <t:{int(created_at)}:F>\n{link}\n사유: {reason_text}"),
+            inline=False,
+        )
+    if page < result["pages"]:
+        embed.set_footer(text=f"다음 페이지: 서버에서 !BB 미전송검수 {page + 1}")
+    try:
+        await ctx.author.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except (discord.Forbidden, discord.HTTPException):
+        await ctx.send("⚠️ 관리자 DM을 열 수 없습니다. 서버 DM 수신 설정을 확인하세요. "
+                       "검수 상세 정보는 이 채널에 게시하지 않았습니다.")
+        return
+    await ctx.send("✅ 미전송 검수 목록을 관리자 DM으로 전달했습니다.")
 
 
 @bot.command(name="검토복구")

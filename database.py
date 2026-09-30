@@ -143,6 +143,11 @@ async def init_db():
         # card_delivered: 이 검수 건에 대해 관리자가 누를 수 있는 카드가 실제로 게시됐는지.
         # 0이면 pending이지만 카드가 없다(전송 실패 또는 배치 카드 상한 초과). 기존 행은 1로 둔다.
         await _ensure_column(db, "violation_log", "card_delivered", "INTEGER NOT NULL DEFAULT 1")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_violation_uncarded_pending "
+            "ON violation_log(guild_id, created_at, id) "
+            "WHERE review_status = 'pending' AND card_delivered = 0"
+        )
         await _ensure_column(db, "violation_log", "retry_queue_id", "INTEGER")
         await db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_review_retry_queue "
@@ -1519,6 +1524,30 @@ async def get_reviews_without_card(guild_id: int, hours: int = 168, limit: int =
             (guild_id, since, limit),
         )
         return await cursor.fetchall()
+
+
+async def get_uncarded_review_page(guild_id: int, page: int = 1, page_size: int = 5) -> dict:
+    """미전송 대기 건을 기간 제한 없이 오래된 순으로 조회한다. 읽기만 수행한다."""
+    if page < 1 or not 1 <= page_size <= 10:
+        raise ValueError("page must be positive and page_size must be between 1 and 10")
+    async with _connect() as db:
+        # 전체 수와 페이지가 한 SQLite 스냅샷을 보도록 읽기 트랜잭션을 사용한다.
+        await db.execute("BEGIN")
+        total = int((await (await db.execute(
+            "SELECT COUNT(*) FROM violation_log WHERE guild_id = ? "
+            "AND review_status = 'pending' AND card_delivered = 0", (guild_id,),
+        )).fetchone())[0])
+        pages = (total + page_size - 1) // page_size
+        rows = []
+        if page <= pages:
+            rows = await (await db.execute(
+                "SELECT id, user_id, channel_id, level, reason, created_at, message_id "
+                "FROM violation_log WHERE guild_id = ? "
+                "AND review_status = 'pending' AND card_delivered = 0 "
+                "ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?",
+                (guild_id, page_size, (page - 1) * page_size),
+            )).fetchall()
+        return {"total": total, "page": page, "pages": pages, "rows": rows}
 
 
 async def claim_review(review_id: int, guild_id: int) -> bool:
